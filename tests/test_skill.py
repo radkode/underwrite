@@ -41,5 +41,42 @@ class ReviewModeContract(unittest.TestCase):
         self.assertIn("audience{mode: branch|review, why}", text)
 
 
+class ActionDeliveryContract(unittest.TestCase):
+    def skill(self):
+        return SKILL.read_text(encoding="utf-8")
+
+    def waiting_rule(self):
+        text = self.skill()
+        start_anchor = "**Waiting on the reviewer.**"
+        end_anchor = "**Resolving a flag.**"
+        self.assertIn(start_anchor, text)
+        self.assertIn(end_anchor, text)
+        start = text.index(start_anchor)
+        end = text.index(end_anchor, start)
+        return text[start:end]
+
+    def test_await_returns_the_oldest_unacknowledged_action(self):
+        rule = self.waiting_rule()
+        self.assertIn("oldest action that has not been acknowledged", rule)
+        self.assertNotIn("start at `seq`", rule)
+        self.assertNotIn("returned `handled_seq`", rule)
+
+    def test_http_failures_are_visible(self):
+        text = self.skill()
+        self.assertNotIn("curl -s ", text)
+        self.assertIn("curl -fsS", text)
+        self.assertIn("exits\nnon-zero on a 4xx or 5xx response", text)
+
+    def test_navigation_replay_is_not_claimed_safe_without_a_receipt(self):
+        rule = self.waiting_rule()
+        self.assertIn("does not yet carry a\ndurable receipt for navigation", rule)
+        self.assertIn("stop and ask rather than moving twice", rule)
+
+    def test_a_terminal_action_does_not_jump_the_queue(self):
+        text = self.skill()
+        self.assertIn("handle and acknowledge the older\nqueued action first", text)
+        self.assertIn("do not apply this one again", text)
+
+
 if __name__ == "__main__":
     unittest.main()

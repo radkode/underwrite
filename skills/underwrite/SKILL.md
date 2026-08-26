@@ -159,7 +159,7 @@ look identical on disk, so the controls stay disabled until you say you are park
 before and after anything slow:
 
 ```bash
-curl -s -X POST $URL/status -H 'Content-Type: application/json' \
+curl -fsS -X POST $URL/status -H 'Content-Type: application/json' \
   -d '{"phase":"working","text":"running the repo verification","beat":2}'
 ```
 
@@ -205,46 +205,49 @@ ending the turn silently. Run this in the background too, so the harness wakes y
 the reviewer acts:
 
 ```bash
-curl -s "$(python3 -c "import json;print(json.load(open('$R/serve.json'))['url'])")/await"
+curl -fsS "$(python3 -c "import json;print(json.load(open('$R/serve.json'))['url'])")/await"
 ```
 
-`<seq>` is the seq of the last action you durably handled. Read `handled_seq` from
-`GET /state` at the start of every sitting; it is 0 when nothing has been handled. Do not
-start at `seq` or `produced_seq`: those name the latest action recorded, including calls
-made while no walk was listening. The reply is `{seq, n, action, note}` where action is
-`accept`, `drop`, `decide`, `note`, `next`, `back`, or `skip`. A reply of
+`/await` always returns the oldest action that has not been acknowledged. The reply is
+`{seq, n, action, note}` where action is `accept`, `drop`, `decide`, `note`, `next`,
+`back`, or `skip`. A reply of
 `{"timeout": true}` means nobody acted; say so and park again. The terminal accepts the
 same answers in words, so a closed browser never strands the walk.
 
 After the action's effect is durable, acknowledge that exact reply before parking again:
 
 ```bash
-curl -s -X POST $URL/ack -H 'Content-Type: application/json' -d '{"seq":<seq>}'
+curl -fsS -X POST $URL/ack -H 'Content-Type: application/json' -d '{"seq":<seq>}'
 ```
 
-Only a 200 response advances `handled_seq`. If handling fails, do not acknowledge the
-action; stop with the failure visible. The next sitting will receive it again.
+Use the `seq` from the reply. A successful request advances `handled_seq`; `curl` exits
+non-zero on a 4xx or 5xx response. If handling fails, do not acknowledge the action; stop
+with the failure visible. The next sitting will receive it again.
 
 Delivery is at least once. If the same `seq` returns after a restart, reconcile it against
 the beat, session, and git or review state before acting. When its durable effect already
-exists, acknowledge it without repeating it. In particular, never advance navigation
-twice for one `seq`.
+exists, acknowledge it without repeating it. The flat-file session does not yet carry a
+durable receipt for navigation. If a redelivered `next`, `back`, or `skip` has no
+unambiguous effect to reconcile, stop and ask rather than moving twice or guessing.
 
 **Resolving a flag.** The reviewer accepts or drops it in the same beat, from the page or
 in words. A click has already reached the server, which flipped the beat's `state` and
-recorded their words as `call`. An answer in words has reached nothing, so post it
-yourself and let the same code do the same work:
+recorded their words as `call`. An answer in words has reached nothing. Before posting
+it, read `/state`; if `seq` and `handled_seq` differ, handle and acknowledge the older
+queued action first. Then post the answer yourself and let the same code do the same work:
 
 ```bash
-curl -s -X POST $URL/act -H 'Content-Type: application/json' \
+curl -fsS -X POST $URL/act -H 'Content-Type: application/json' \
   -d '{"n":5,"action":"accept","note":"yes, pin it"}'
 ```
 
 The same goes for a note on any beat. The server owns `state` and `call` on both paths, so
 never write either by hand: a beat resolved in words and edited by hand stays `flag` on
 disk, and the Phase 4 check for an accept that landed nothing never fires on it. The reply
-carries the `seq` it recorded. Finish its effect, acknowledge it, then park after the
-returned `handled_seq`.
+carries the `seq` it recorded. Finish its effect and acknowledge that seq. If the ack
+fails because an older action is still pending, do not apply this one again: handle and
+acknowledge the older action, then acknowledge this already-applied seq and call `/await`
+again.
 
 On accept, in `branch` mode, where the fix goes depends on whether the PR can still take
 it:
@@ -284,7 +287,7 @@ When the flag itself is a decision whose words complete the work and do not need
 the PR audience as a finding, post `decide` and let the server move the beat to `decided`:
 
 ```bash
-curl -s -X POST $URL/act -H 'Content-Type: application/json' \
+curl -fsS -X POST $URL/act -H 'Content-Type: application/json' \
   -d '{"n":5,"action":"decide","note":"stays as is, the cost lands on the caller"}'
 ```
 
