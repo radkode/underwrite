@@ -226,12 +226,13 @@ class Parking(SessionTest):
     def test_it_returns_the_oldest_unseen_action(self):
         for _ in range(3):
             self.session.act(None, "next", "")
-        self.assertEqual(self.session.wait(0, 0.1)["seq"], 1)
-        self.assertEqual(self.session.wait(1, 0.1)["seq"], 2)
+        self.assertEqual(self.session.wait(0.1)["seq"], 1)
+        self.session.ack(1)
+        self.assertEqual(self.session.wait(0.1)["seq"], 2)
 
     def test_it_waits_the_whole_timeout_when_nobody_acts(self):
         started = time.monotonic()
-        self.assertIsNone(self.session.wait(0, 0.2))
+        self.assertIsNone(self.session.wait(0.2))
         self.assertGreaterEqual(time.monotonic() - started, 0.2)
 
     def test_a_blank_line_in_the_log_does_not_fake_a_timeout(self):
@@ -244,8 +245,9 @@ class Parking(SessionTest):
         )
         session = self.open_session()
         self.assertEqual(session.seq, 1)
+        session.ack(1)
         started = time.monotonic()
-        self.assertIsNone(session.wait(1, 0.2))
+        self.assertIsNone(session.wait(0.2))
         self.assertGreaterEqual(time.monotonic() - started, 0.2)
 
     def test_nobody_parked_means_nobody_is_listening(self):
@@ -255,7 +257,7 @@ class Parking(SessionTest):
         """The page used to infer this from the agent's own status text, which an agent
         that died mid-walk leaves standing, so a click went nowhere and looked broken."""
         seen = []
-        waiter = threading.Thread(target=lambda: self.session.wait(0, 5.0))
+        waiter = threading.Thread(target=lambda: self.session.wait(5.0))
         waiter.start()
         for _ in range(100):
             if self.session.snapshot()["listening"]:
@@ -268,23 +270,140 @@ class Parking(SessionTest):
         self.assertFalse(self.session.snapshot()["listening"])
 
     def test_a_park_that_times_out_stops_listening(self):
-        self.session.wait(0, 0.05)
+        self.session.wait(0.05)
         self.assertFalse(self.session.snapshot()["listening"])
 
     def test_an_already_satisfied_park_never_claims_to_listen(self):
         """seq is already ahead, so wait returns without parking at all."""
         self.session.act(None, "next", "")
-        self.assertIsNotNone(self.session.wait(0, 5.0))
+        self.assertIsNotNone(self.session.wait(5.0))
         self.assertFalse(self.session.snapshot()["listening"])
 
     def test_it_wakes_as_soon_as_someone_acts(self):
         woke = []
-        waiter = threading.Thread(target=lambda: woke.append(self.session.wait(0, 5.0)))
+        waiter = threading.Thread(target=lambda: woke.append(self.session.wait(5.0)))
         waiter.start()
         time.sleep(0.05)
         self.session.act(None, "next", "")
         waiter.join(5.0)
         self.assertEqual(woke[0]["action"], "next")
+
+
+class Acknowledging(SessionTest):
+    def test_a_new_session_persists_zero_before_accepting_actions(self):
+        stored = json.loads((self.root / "ack.json").read_text(encoding="utf-8"))
+        self.assertEqual(stored, {"version": 1, "handled_seq": 0})
+
+    def test_an_unhandled_action_is_replayed_after_restart(self):
+        self.session.act(None, "next", "")
+
+        resumed = self.open_session()
+
+        self.assertEqual(resumed.handled_seq, 0)
+        self.assertEqual(resumed.wait(0.1)["seq"], 1)
+
+    def test_an_acknowledgement_survives_restart(self):
+        self.session.act(None, "next", "")
+        self.assertEqual(self.session.ack(1), {"handled_seq": 1})
+
+        resumed = self.open_session()
+
+        self.assertEqual(resumed.handled_seq, 1)
+        self.assertIsNone(resumed.wait(0.05))
+
+    def test_acknowledgements_cannot_skip_an_unhandled_action(self):
+        self.session.act(None, "next", "")
+        self.session.act(None, "skip", "")
+
+        with self.assertRaises(ValueError):
+            self.session.ack(2)
+
+        self.assertEqual(self.session.ack(1), {"handled_seq": 1})
+        self.assertEqual(self.session.ack(2), {"handled_seq": 2})
+
+    def test_retrying_the_latest_acknowledgement_is_idempotent(self):
+        self.session.act(None, "next", "")
+        self.session.ack(1)
+
+        self.assertEqual(self.session.ack(1), {"handled_seq": 1})
+
+    def test_a_late_retry_cannot_regress_the_cursor(self):
+        self.session.act(None, "next", "")
+        self.session.act(None, "skip", "")
+        self.session.ack(1)
+        self.session.ack(2)
+
+        self.assertEqual(self.session.ack(1), {"handled_seq": 2})
+
+    def test_an_acknowledgement_cannot_name_an_unproduced_action(self):
+        with self.assertRaises(ValueError):
+            self.session.ack(1)
+
+    def test_a_failed_ack_write_does_not_advance_the_cursor(self):
+        self.session.act(None, "next", "")
+
+        with mock.patch.object(serve.os, "replace", side_effect=OSError("no space")):
+            with self.assertRaises(OSError):
+                self.session.ack(1)
+
+        self.assertEqual(self.session.handled_seq, 0)
+
+    def test_legacy_actions_are_migrated_as_already_handled(self):
+        (self.root / "ack.json").unlink()
+        (self.root / "decisions.jsonl").write_text(
+            json.dumps({"seq": 1, "n": None, "action": "next", "note": ""}) + "\n",
+            encoding="utf-8",
+        )
+
+        resumed = self.open_session()
+
+        self.assertEqual(resumed.handled_seq, 1)
+        self.assertIsNone(resumed.wait(0.05))
+
+    def test_a_missing_ack_is_rejected_after_cursor_aware_actions(self):
+        self.session.act(None, "next", "")
+        (self.root / "ack.json").unlink()
+
+        with self.assertRaisesRegex(ValueError, "missing from a cursor-aware session"):
+            self.open_session()
+
+    def test_an_unknown_action_delivery_version_is_rejected(self):
+        (self.root / "decisions.jsonl").write_text(
+            json.dumps({
+                "seq": 1, "n": None, "action": "next", "note": "",
+                "delivery_version": 2,
+            }) + "\n",
+            encoding="utf-8",
+        )
+
+        with self.assertRaisesRegex(ValueError, "unsupported action delivery version: 2"):
+            self.open_session()
+
+    def test_an_ack_file_that_is_not_an_object_is_rejected(self):
+        (self.root / "ack.json").write_text("[]", encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "must be a JSON object"):
+            self.open_session()
+
+    def test_an_ack_file_with_the_wrong_version_is_rejected(self):
+        (self.root / "ack.json").write_text(
+            json.dumps({"version": 2, "handled_seq": 0}), encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "version must be 1"):
+            self.open_session()
+
+    def test_an_ack_file_cannot_be_ahead_of_the_action_log(self):
+        (self.root / "ack.json").write_text(
+            json.dumps({"version": 1, "handled_seq": 1}), encoding="utf-8")
+
+        with self.assertRaisesRegex(ValueError, "ahead of produced seq 0"):
+            self.open_session()
+
+    def test_snapshot_names_the_produced_and_handled_cursors(self):
+        self.session.act(None, "next", "")
+
+        self.assertEqual(self.session.snapshot()["produced_seq"], 1)
+        self.assertEqual(self.session.snapshot()["handled_seq"], 0)
 
 
 class LettingGo(SessionTest):
@@ -293,22 +412,22 @@ class LettingGo(SessionTest):
 
     def test_a_park_ends_when_the_client_is_gone(self):
         started = time.monotonic()
-        self.assertIsNone(self.session.wait(0, 30.0, gone=lambda: True))
+        self.assertIsNone(self.session.wait(30.0, gone=lambda: True))
         self.assertLess(time.monotonic() - started, 1.0)
 
     def test_it_stops_listening_once_the_client_is_gone(self):
-        self.session.wait(0, 30.0, gone=lambda: True)
+        self.session.wait(30.0, gone=lambda: True)
         self.assertFalse(self.session.snapshot()["listening"])
 
     def test_a_live_client_still_waits_the_whole_timeout(self):
         started = time.monotonic()
-        self.assertIsNone(self.session.wait(0, 0.3, gone=lambda: False))
+        self.assertIsNone(self.session.wait(0.3, gone=lambda: False))
         self.assertGreaterEqual(time.monotonic() - started, 0.3)
 
     def test_an_action_still_wins_over_the_liveness_check(self):
         woke = []
         waiter = threading.Thread(
-            target=lambda: woke.append(self.session.wait(0, 30.0, gone=lambda: False)))
+            target=lambda: woke.append(self.session.wait(30.0, gone=lambda: False)))
         waiter.start()
         time.sleep(0.05)
         self.session.act(None, "next", "")
@@ -342,7 +461,8 @@ class ATornLog(SessionTest):
         """A live server used to answer every /await with a 500 once this landed."""
         self.tear()
         session = self.open_session()
-        self.assertIsNone(session.wait(1, 0.05))
+        session.ack(1)
+        self.assertIsNone(session.wait(0.05))
 
     def test_the_next_decision_does_not_fuse_onto_it(self):
         """The torn line stays where it is. What matters is that the next record gets
@@ -464,8 +584,7 @@ class HotReload(SessionTest):
 
 
 class PathParsing(unittest.TestCase):
-    """Route and query come off the raw path by hand, and both decide which of the
-    seven routes a request reaches."""
+    """The route comes off the raw path by hand and decides what a request reaches."""
 
     def handler(self, path):
         handler = serve.Handler.__new__(serve.Handler)
@@ -480,23 +599,6 @@ class PathParsing(unittest.TestCase):
 
     def test_the_root_survives_being_stripped(self):
         self.assertEqual(self.handler("/").route(), "/")
-
-    def test_after_is_read_from_the_only_parameter(self):
-        self.assertEqual(self.handler("/await?after=7").query("after"), 7)
-
-    def test_after_is_read_from_among_several(self):
-        self.assertEqual(self.handler("/await?t=1&after=7").query("after"), 7)
-
-    def test_no_after_starts_from_the_beginning(self):
-        self.assertEqual(self.handler("/await").query("after"), 0)
-
-    def test_an_after_that_is_not_a_number_does_not_raise(self):
-        """It arrives from the page, so a 500 here is a walk that stops parking."""
-        self.assertEqual(self.handler("/await?after=abc").query("after"), 0)
-
-    def test_a_parameter_that_merely_ends_in_after_is_not_it(self):
-        self.assertEqual(self.handler("/await?nafter=7").query("after"), 0)
-
 
 class Served(SessionTest):
     """A live server on an ephemeral port, plus the three ways to talk to it."""
@@ -557,12 +659,35 @@ class Requests(Served):
         self.assertEqual(status, 200)
         self.assertEqual(self.beat(1)["state"], "decided")
 
+    def test_an_ack_over_http_advances_the_handled_cursor(self):
+        self.session.act(None, "next", "")
+
+        status, body = self.post("/ack", {"seq": 1})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(json.loads(body), {"handled_seq": 1})
+        self.assertEqual(json.loads(self.get("/state")[1])["handled_seq"], 1)
+
+    def test_an_ack_cannot_skip_the_oldest_unhandled_action(self):
+        self.session.act(None, "next", "")
+        self.session.act(None, "skip", "")
+
+        status, body = self.post("/ack", {"seq": 2})
+
+        self.assertEqual(status, 400)
+        self.assertIn("oldest unhandled action is 1", body)
+
+    def test_an_ack_requires_a_non_negative_integer(self):
+        for seq in (None, True, "1", 1.5, -1):
+            with self.subTest(seq=seq):
+                self.assertEqual(self.post("/ack", {"seq": seq})[0], 400)
+
     def test_a_content_length_that_is_not_a_number_answers_400(self):
         self.assertIn("400", self.raw(
             "POST /status HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Length: abc\r\n\r\n"))
 
     def test_a_json_body_that_is_not_an_object_answers_400(self):
-        for route in ("/status", "/act"):
+        for route in ("/status", "/act", "/ack"):
             with self.subTest(route=route):
                 self.assertEqual(self.post(route, [])[0], 400)
 
@@ -665,6 +790,17 @@ class Forgery(Served):
         self.assertIn("403", answer)
         self.assertEqual(self.session.status["phase"], "starting")
 
+    def test_a_cross_origin_post_cannot_acknowledge_an_action(self):
+        self.session.act(None, "next", "")
+        answer = self.send_raw(
+            "POST", "/ack",
+            {"Host": "127.0.0.1:%d" % self.port, "Origin": "https://evil.example",
+             "Content-Type": "text/plain"},
+            json.dumps({"seq": 1}),
+        )
+        self.assertIn("403", answer)
+        self.assertEqual(self.session.handled_seq, 0)
+
     def test_the_page_resolves_a_flag_from_its_own_origin(self):
         host = "127.0.0.1:%d" % self.port
         answer = self.send_raw(
@@ -737,7 +873,7 @@ class Streaming(Served):
         from nothing else: an agent that died mid-walk leaves its last status standing."""
         fh = self.stream()[1]
         self.frames(fh)
-        waiter = threading.Thread(target=lambda: self.session.wait(0, 5.0))
+        waiter = threading.Thread(target=lambda: self.session.wait(5.0))
         waiter.start()
         self.assertTrue(self.frames(fh)[0]["listening"])
         self.session.act(None, "next", "")
@@ -774,26 +910,62 @@ class Awaiting(Served):
 
     def test_it_answers_with_the_action_that_landed(self):
         self.session.act(1, "accept", "yes")
-        status, body = self.get("/await?after=0")
+        status, body = self.get("/await")
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["action"], "accept")
 
-    def test_after_skips_what_the_walk_already_saw(self):
+    def test_a_caller_cursor_cannot_skip_an_unhandled_action(self):
+        self.session.act(None, "next", "")
+
+        self.assertEqual(json.loads(self.get("/await?after=1")[1])["action"], "next")
+
+    def test_it_redelivers_until_ack_then_exposes_the_next_action(self):
         self.session.act(None, "next", "")
         self.session.act(None, "skip", "")
-        self.assertEqual(json.loads(self.get("/await?after=1")[1])["action"], "skip")
+
+        self.assertEqual(json.loads(self.get("/await")[1])["action"], "next")
+        self.assertEqual(json.loads(self.get("/await")[1])["action"], "next")
+        self.post("/ack", {"seq": 1})
+        self.assertEqual(json.loads(self.get("/await")[1])["action"], "skip")
+
+    def test_an_ack_that_finishes_before_wait_starts_cannot_redeliver(self):
+        self.session.act(None, "next", "")
+        self.session.act(None, "skip", "")
+        original_wait = self.session.wait
+        entered = threading.Barrier(2)
+        release = threading.Event()
+
+        def delayed_wait(*args, **kwargs):
+            entered.wait(5.0)
+            if not release.wait(5.0):
+                raise RuntimeError("test did not release await")
+            return original_wait(*args, **kwargs)
+
+        self.session.wait = delayed_wait
+        self.addCleanup(setattr, self.session, "wait", original_wait)
+        answers = []
+        walk = threading.Thread(target=lambda: answers.append(self.get("/await")))
+        walk.start()
+        entered.wait(5.0)
+        try:
+            self.assertEqual(self.post("/ack", {"seq": 1})[0], 200)
+        finally:
+            release.set()
+        walk.join(10.0)
+
+        self.assertEqual(json.loads(answers[0][1])["seq"], 2)
 
     def test_nothing_new_answers_a_timeout_rather_than_hanging_up(self):
         """The walk is told a timeout means nobody acted, and reparks. A dropped
         connection instead would end the walk."""
         with mock.patch.object(serve, "AWAIT_TIMEOUT", 0.05):
-            self.assertEqual(json.loads(self.get("/await?after=0")[1]), {"timeout": True})
+            self.assertEqual(json.loads(self.get("/await")[1]), {"timeout": True})
 
     def test_a_park_wakes_the_moment_the_page_acts(self):
         with mock.patch.object(serve, "AWAIT_TIMEOUT", 10.0):
             answers = []
             walk = threading.Thread(
-                target=lambda: answers.append(self.get("/await?after=0")))
+                target=lambda: answers.append(self.get("/await")))
             walk.start()
             time.sleep(0.1)
             self.post("/act", {"n": 1, "action": "accept", "note": "yes"})
@@ -859,6 +1031,52 @@ class Lifecycle(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.root, True)
+
+    def test_an_offline_action_survives_restart_until_it_is_acknowledged(self):
+        (self.root / "beats").mkdir()
+        (self.root / "session.json").write_text(
+            json.dumps({"repo": "acme/widget"}), encoding="utf-8")
+
+        def start():
+            proc = subprocess.Popen(
+                [sys.executable, str(SCRIPTS / "serve.py"), str(self.root)],
+                stdout=subprocess.PIPE, text=True,
+            )
+            self.addCleanup(proc.stdout.close)
+            self.addCleanup(proc.kill)
+            return proc, proc.stdout.readline().strip()
+
+        def stop(proc):
+            proc.send_signal(signal.SIGTERM)
+            proc.wait(timeout=10)
+
+        first, url = start()
+        request = urllib.request.Request(
+            url + "/act", data=b'{"action":"next"}', method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            self.assertEqual(json.loads(response.read())["seq"], 1)
+        stop(first)
+
+        second, url = start()
+        with urllib.request.urlopen(url + "/state", timeout=5) as response:
+            state = json.loads(response.read())
+        self.assertEqual((state["produced_seq"], state["handled_seq"]), (1, 0))
+        with urllib.request.urlopen(url + "/await", timeout=5) as response:
+            self.assertEqual(json.loads(response.read())["action"], "next")
+        request = urllib.request.Request(
+            url + "/ack", data=b'{"seq":1}', method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(request, timeout=5) as response:
+            self.assertEqual(json.loads(response.read()), {"handled_seq": 1})
+        stop(second)
+
+        third, url = start()
+        with urllib.request.urlopen(url + "/state", timeout=5) as response:
+            self.assertEqual(json.loads(response.read())["handled_seq"], 1)
+        stop(third)
 
     def test_it_prints_a_url_writes_serve_json_and_cleans_up_on_sigterm(self):
         (self.root / "beats").mkdir()

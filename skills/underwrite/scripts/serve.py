@@ -3,7 +3,8 @@
 Serve an underwrite session so the page and the walk stay in step, both ways.
 
 Page to agent: POST /act carries the reviewer's action, and the agent parks on
-/await until one arrives.
+/await until one arrives. POST /ack advances the durable consumer cursor only
+after the walk has incorporated that action.
 
 Agent to page: POST /status carries what the agent is doing right now, which is
 the half that files alone cannot express. "Applying your accept", "running
@@ -23,7 +24,6 @@ import argparse
 import json
 import os
 import queue
-import re
 import select
 import signal
 import socket
@@ -80,6 +80,7 @@ MAX_STATUS_TEXT = 2000
 HEARTBEAT = 20.0
 WATCH_INTERVAL = 0.5
 LOOPBACK = {"127.0.0.1", "localhost", "::1", "[::1]"}
+CURSOR_VERSION = 1
 
 
 def host_only(header):
@@ -100,6 +101,15 @@ def ends_mid_line(path):
         return False  # missing or empty, so there is nothing to run into
 
 
+def fsync_directory(path):
+    """Persist a renamed or newly created directory entry."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def write_json(path, data):
     """Write through a temp sibling, so a reader never sees a half-written beat.
 
@@ -113,6 +123,7 @@ def write_json(path, data):
             fh.flush()
             os.fsync(fh.fileno())
         os.replace(tmp, path)
+        fsync_directory(path.parent)
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -130,7 +141,9 @@ class Session:
         self.status = {"phase": "starting", "text": "waiting for the walk to begin"}
         self.stop = threading.Event()
         self.waiting = 0
-        self.seq = max((r.get("seq", 0) for r in self.records()), default=0)
+        records = self.records()
+        self.seq = max((r.get("seq", 0) for r in records), default=0)
+        self.handled_seq = self.read_handled_seq(records)
 
     def records(self):
         """Every decision on disk that still reads as one.
@@ -151,10 +164,43 @@ class Session:
             if not line.strip():
                 continue
             try:
-                out.append(json.loads(line))
+                record = json.loads(line)
+                if isinstance(record, dict):
+                    out.append(record)
             except json.JSONDecodeError:
                 continue
         return out
+
+    def read_handled_seq(self, records):
+        path = self.root / "ack.json"
+        versions = [r["delivery_version"] for r in records if "delivery_version" in r]
+        unknown = [
+            version
+            for version in versions
+            if type(version) is not int or version != CURSOR_VERSION
+        ]
+        if unknown:
+            raise ValueError(f"unsupported action delivery version: {unknown[0]!r}")
+        if not path.exists():
+            if versions:
+                raise ValueError("ack.json is missing from a cursor-aware session")
+            # Legacy actions cannot be safely replayed, so migration starts after them.
+            handled = self.seq
+            write_json(path, {"version": CURSOR_VERSION, "handled_seq": handled})
+            return handled
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            raise ValueError("ack.json must be a JSON object")
+        if type(data.get("version")) is not int or data["version"] != CURSOR_VERSION:
+            raise ValueError(f"ack.json version must be {CURSOR_VERSION}")
+        handled = data.get("handled_seq")
+        if isinstance(handled, bool) or not isinstance(handled, int) or handled < 0:
+            raise ValueError("ack.json handled_seq must be a non-negative integer")
+        if handled > self.seq:
+            raise ValueError(
+                f"ack.json handled_seq {handled} is ahead of produced seq {self.seq}"
+            )
+        return handled
 
     def load(self):
         return rr().load(self.root, self.css_path)
@@ -164,7 +210,7 @@ class Session:
             (p.name, p.stat().st_mtime_ns) for p in (self.root / "beats").glob("*.json")
         )
         session = (self.root / "session.json").stat().st_mtime_ns
-        return f"{self.seq}:{session}:{hash(tuple(stamps))}"
+        return f"{self.seq}:{self.handled_seq}:{session}:{hash(tuple(stamps))}"
 
     # ---- pub/sub -------------------------------------------------------
 
@@ -174,6 +220,8 @@ class Session:
         return {
             "rev": self.fingerprint(),
             "seq": self.seq,
+            "produced_seq": self.seq,
+            "handled_seq": self.handled_seq,
             "status": self.status,
             "listening": self.waiting > 0,
         }
@@ -237,27 +285,61 @@ class Session:
             # seq advances only once the record is on disk; a failed append that had
             # already bumped it would leave every later /await unable to match.
             seq = self.seq + 1
-            record = {"seq": seq, "n": n, "action": action, "note": note}
+            record = {
+                "seq": seq,
+                "n": n,
+                "action": action,
+                "note": note,
+                "delivery_version": CURSOR_VERSION,
+            }
             # Start a line of our own when the previous append was cut short, or the
             # two fuse into one line that parses as neither and both are lost.
             opener = "\n" if ends_mid_line(self.decisions) else ""
+            new_log = not self.decisions.exists()
             with self.decisions.open("a", encoding="utf-8") as fh:
                 fh.write(opener + json.dumps(record) + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
+            if new_log:
+                fsync_directory(self.decisions.parent)
             self.seq = seq
             self.cond.notify_all()
         self.set_status({"phase": "working", "text": f"picking up your {action}"})
         return record
 
-    def wait(self, after, timeout, gone=None):
-        """Block until an action newer than `after` lands. None on timeout.
+    def ack(self, seq):
+        """Durably acknowledge exactly the oldest action the walk has not handled."""
+        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
+            raise ValueError("seq must be a non-negative integer")
+        with self.cond:
+            if seq <= self.handled_seq:
+                return {"handled_seq": self.handled_seq}
+            oldest = self.tail(self.handled_seq)
+            if oldest is None:
+                raise ValueError("there is no unhandled action to acknowledge")
+            if seq != oldest.get("seq"):
+                raise ValueError(
+                    f"oldest unhandled action is {oldest.get('seq')}, not {seq}"
+                )
+            write_json(
+                self.root / "ack.json",
+                {"version": CURSOR_VERSION, "handled_seq": seq},
+            )
+            self.handled_seq = seq
+        self.publish()
+        return {"handled_seq": self.handled_seq}
+
+    def wait(self, timeout, gone=None):
+        """Block until an action newer than the handled cursor lands.
 
         Both edges of the park are published, because whether anyone is here to take
         the next call is the one thing the page cannot infer from the files. The count
         is kept under `cond` rather than `lock`, which is the documented order.
         """
         with self.cond:
-            if self.seq > after:
-                return self.tail(after)
+            found = self.tail(self.handled_seq)
+            if found is not None:
+                return found
             self.waiting += 1
             self.publish()
             deadline = time.monotonic() + timeout
@@ -269,8 +351,9 @@ class Session:
                     if left <= 0:
                         return None
                     self.cond.wait(min(WAIT_SLICE, left))
-                    if self.seq > after:
-                        return self.tail(after)
+                    found = self.tail(self.handled_seq)
+                    if found is not None:
+                        return found
             finally:
                 self.waiting -= 1
                 self.publish()
@@ -362,10 +445,6 @@ class Handler(BaseHTTPRequestHandler):
     def route(self):
         return self.path.split("?", 1)[0].rstrip("/") or "/"
 
-    def query(self, key, default=0):
-        found = re.search(rf"[?&]{key}=(\d+)", self.path)
-        return int(found.group(1)) if found else default
-
     def do_GET(self):
         if self.forged():
             return self.send(403, json.dumps({"error": "not a loopback request"}))
@@ -390,7 +469,7 @@ class Handler(BaseHTTPRequestHandler):
                     json.dumps({**self.session.snapshot(), "beats": len(beats), "problems": problems}),
                 )
             if route == "/await":
-                found = self.session.wait(self.query("after"), AWAIT_TIMEOUT, self.client_gone)
+                found = self.session.wait(AWAIT_TIMEOUT, self.client_gone)
                 return self.send(200, json.dumps(found or {"timeout": True}))
             if route == "/favicon.ico":
                 return self.send(204, b"", "image/x-icon")
@@ -404,7 +483,7 @@ class Handler(BaseHTTPRequestHandler):
             self.close_connection = True
             return self.send(403, "not a loopback request", "text/plain")
         route = self.route()
-        if route not in ("/act", "/status"):
+        if route not in ("/act", "/status", "/ack"):
             return self.send(404, json.dumps({"error": "no such route"}))
         try:
             length = int(self.headers.get("Content-Length") or 0)
@@ -422,6 +501,8 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("body must be a JSON object")
             if route == "/status":
                 return self.send(200, json.dumps(self.session.set_status(payload)))
+            if route == "/ack":
+                return self.send(200, json.dumps(self.session.ack(payload.get("seq"))))
             action = payload.get("action")
             if action not in ACTIONS:
                 raise ValueError(f"action must be one of {', '.join(ACTIONS)}")
@@ -494,7 +575,10 @@ def main():
         sys.exit(f"serve: this session is already being served at {running}")
 
     css_path = Path(args.css).expanduser() if args.css else rr().default_css()
-    Handler.session = Session(root, css_path)
+    try:
+        Handler.session = Session(root, css_path)
+    except (OSError, ValueError, json.JSONDecodeError) as err:
+        sys.exit(f"serve: {err}")
     threading.Thread(target=Handler.session.watch, daemon=True).start()
 
     try:

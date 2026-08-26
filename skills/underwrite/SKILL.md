@@ -199,17 +199,30 @@ ending the turn silently. Run this in the background too, so the harness wakes y
 the reviewer acts:
 
 ```bash
-curl -s "$(python3 -c "import json;print(json.load(open('$R/serve.json'))['url'])")/await?after=<seq>"
+curl -s "$(python3 -c "import json;print(json.load(open('$R/serve.json'))['url'])")/await"
 ```
 
-`<seq>` is the seq of the last action you handled. Start a new session at 0, and a
-resumed one at the `seq` that `GET /state` reports, because everything at or below it
-belongs to the previous sitting: `decisions.jsonl` outlives the server, so parking at 0
-on a resume hands you that sitting's first action back as though it were fresh. The reply is
-`{seq, n, action, note}` where action is `accept`, `drop`, `decide`, `note`, `next`,
-`back`, or `skip`. A reply of `{"timeout": true}` means nobody acted; say so and park
-again. The terminal accepts the same answers in words, so a closed browser never strands
-the walk.
+`<seq>` is the seq of the last action you durably handled. Read `handled_seq` from
+`GET /state` at the start of every sitting; it is 0 when nothing has been handled. Do not
+start at `seq` or `produced_seq`: those name the latest action recorded, including calls
+made while no walk was listening. The reply is `{seq, n, action, note}` where action is
+`accept`, `drop`, `decide`, `note`, `next`, `back`, or `skip`. A reply of
+`{"timeout": true}` means nobody acted; say so and park again. The terminal accepts the
+same answers in words, so a closed browser never strands the walk.
+
+After the action's effect is durable, acknowledge that exact reply before parking again:
+
+```bash
+curl -s -X POST $URL/ack -H 'Content-Type: application/json' -d '{"seq":<seq>}'
+```
+
+Only a 200 response advances `handled_seq`. If handling fails, do not acknowledge the
+action; stop with the failure visible. The next sitting will receive it again.
+
+Delivery is at least once. If the same `seq` returns after a restart, reconcile it against
+the beat, session, and git or review state before acting. When its durable effect already
+exists, acknowledge it without repeating it. In particular, never advance navigation
+twice for one `seq`.
 
 **Resolving a flag.** The reviewer accepts or drops it in the same beat, from the page or
 in words. A click has already reached the server, which flipped the beat's `state` and
@@ -224,7 +237,8 @@ curl -s -X POST $URL/act -H 'Content-Type: application/json' \
 The same goes for a note on any beat. The server owns `state` and `call` on both paths, so
 never write either by hand: a beat resolved in words and edited by hand stays `flag` on
 disk, and the Phase 4 check for an accept that landed nothing never fires on it. The reply
-carries the `seq` it recorded, so park past that one rather than re-reading your own action.
+carries the `seq` it recorded. Finish its effect, acknowledge it, then park after the
+returned `handled_seq`.
 
 On accept, in `branch` mode, where the fix goes depends on whether the PR can still take
 it:
@@ -338,9 +352,16 @@ session.json     repo, number, title, head, date, status, cursor, facts[], audie
 beats/01.json    n, tier, state, claim, where, slots{}, diff[], call, landed, branch
 pr.diff          the saved diff
 decisions.jsonl  append-only, one line per reviewer action, written by the server
+ack.json         version, handled_seq of the last durably handled action; server-owned
 serve.json       url and pid of the running server, removed when it exits
 report.html      rendered, regenerable, throwaway
 ```
+
+An older session with decisions but no `ack.json` starts with its prior actions marked
+handled. Replaying them could duplicate commits, and the old format cannot say which one
+was still pending. New actions carry a delivery version in `decisions.jsonl`. If a
+cursor-aware session later loses `ack.json`, the server refuses to guess whether those
+actions were handled. Actions recorded after the cursor exists are delivered until acked.
 
 `state` is one of `clean`, `flag`, `unverified`, `accepted`, `dropped`, `decided`. The
 first three are what a beat opens with; the last three are what a flag becomes after the
