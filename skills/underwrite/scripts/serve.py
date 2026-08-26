@@ -81,6 +81,7 @@ HEARTBEAT = 20.0
 WATCH_INTERVAL = 0.5
 LOOPBACK = {"127.0.0.1", "localhost", "::1", "[::1]"}
 CURSOR_VERSION = 1
+ACTION_FIELDS = ("seq", "n", "action", "note")
 
 
 def host_only(header):
@@ -126,6 +127,11 @@ def write_json(path, data):
         fsync_directory(path.parent)
     finally:
         tmp.unlink(missing_ok=True)
+
+
+def public_action(record):
+    """The delivery contract, without storage-only migration fields."""
+    return {key: record.get(key) for key in ACTION_FIELDS}
 
 
 class Session:
@@ -210,7 +216,7 @@ class Session:
             (p.name, p.stat().st_mtime_ns) for p in (self.root / "beats").glob("*.json")
         )
         session = (self.root / "session.json").stat().st_mtime_ns
-        return f"{self.seq}:{self.handled_seq}:{session}:{hash(tuple(stamps))}"
+        return f"{self.seq}:{session}:{hash(tuple(stamps))}"
 
     # ---- pub/sub -------------------------------------------------------
 
@@ -220,7 +226,6 @@ class Session:
         return {
             "rev": self.fingerprint(),
             "seq": self.seq,
-            "produced_seq": self.seq,
             "handled_seq": self.handled_seq,
             "status": self.status,
             "listening": self.waiting > 0,
@@ -337,7 +342,7 @@ class Session:
         is kept under `cond` rather than `lock`, which is the documented order.
         """
         with self.cond:
-            found = self.tail(self.handled_seq)
+            found = self.tail(self.handled_seq) if self.seq > self.handled_seq else None
             if found is not None:
                 return found
             self.waiting += 1
@@ -351,7 +356,11 @@ class Session:
                     if left <= 0:
                         return None
                     self.cond.wait(min(WAIT_SLICE, left))
-                    found = self.tail(self.handled_seq)
+                    found = (
+                        self.tail(self.handled_seq)
+                        if self.seq > self.handled_seq
+                        else None
+                    )
                     if found is not None:
                         return found
             finally:
@@ -470,7 +479,10 @@ class Handler(BaseHTTPRequestHandler):
                 )
             if route == "/await":
                 found = self.session.wait(AWAIT_TIMEOUT, self.client_gone)
-                return self.send(200, json.dumps(found or {"timeout": True}))
+                return self.send(
+                    200,
+                    json.dumps(public_action(found) if found else {"timeout": True}),
+                )
             if route == "/favicon.ico":
                 return self.send(204, b"", "image/x-icon")
         except (OSError, json.JSONDecodeError) as err:
@@ -514,7 +526,7 @@ class Handler(BaseHTTPRequestHandler):
             return self.send(400, str(err), "text/plain")
         except OSError as err:
             return self.send(500, str(err), "text/plain")
-        self.send(200, json.dumps(record))
+        self.send(200, json.dumps(public_action(record)))
 
 
 class Server(ThreadingHTTPServer):

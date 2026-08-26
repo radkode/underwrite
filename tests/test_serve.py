@@ -235,6 +235,13 @@ class Parking(SessionTest):
         self.assertIsNone(self.session.wait(0.2))
         self.assertGreaterEqual(time.monotonic() - started, 0.2)
 
+    def test_an_idle_park_does_not_reread_the_action_log(self):
+        with mock.patch.object(self.session, "records", wraps=self.session.records) as records:
+            with mock.patch.object(serve, "WAIT_SLICE", 0.001):
+                self.assertIsNone(self.session.wait(0.01))
+
+        records.assert_not_called()
+
     def test_a_blank_line_in_the_log_does_not_fake_a_timeout(self):
         """seq came from a line count while tail skipped blanks, so a single blank
         line put seq past the highest record and every park answered instantly.
@@ -310,6 +317,14 @@ class Acknowledging(SessionTest):
 
         self.assertEqual(resumed.handled_seq, 1)
         self.assertIsNone(resumed.wait(0.05))
+
+    def test_an_acknowledgement_does_not_change_rendered_content(self):
+        self.session.act(None, "next", "")
+        revision = self.session.fingerprint()
+
+        self.session.ack(1)
+
+        self.assertEqual(self.session.fingerprint(), revision)
 
     def test_acknowledgements_cannot_skip_an_unhandled_action(self):
         self.session.act(None, "next", "")
@@ -399,11 +414,13 @@ class Acknowledging(SessionTest):
         with self.assertRaisesRegex(ValueError, "ahead of produced seq 0"):
             self.open_session()
 
-    def test_snapshot_names_the_produced_and_handled_cursors(self):
+    def test_snapshot_names_the_action_and_handled_cursors_once(self):
         self.session.act(None, "next", "")
 
-        self.assertEqual(self.session.snapshot()["produced_seq"], 1)
-        self.assertEqual(self.session.snapshot()["handled_seq"], 0)
+        snapshot = self.session.snapshot()
+        self.assertEqual(snapshot["seq"], 1)
+        self.assertEqual(snapshot["handled_seq"], 0)
+        self.assertNotIn("produced_seq", snapshot)
 
 
 class LettingGo(SessionTest):
@@ -600,6 +617,7 @@ class PathParsing(unittest.TestCase):
     def test_the_root_survives_being_stripped(self):
         self.assertEqual(self.handler("/").route(), "/")
 
+
 class Served(SessionTest):
     """A live server on an ephemeral port, plus the three ways to talk to it."""
 
@@ -650,8 +668,11 @@ class Served(SessionTest):
 class Requests(Served):
     def test_an_accept_over_http_resolves_the_flag(self):
         status, body = self.post("/act", {"n": 1, "action": "accept", "note": "yes"})
+        action = json.loads(body)
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body)["seq"], 1)
+        self.assertEqual(action["seq"], 1)
+        self.assertEqual(set(action), set(serve.ACTION_FIELDS))
+        self.assertEqual(self.decisions()[0]["delivery_version"], serve.CURSOR_VERSION)
         self.assertEqual(self.beat(1)["state"], "accepted")
 
     def test_a_decide_over_http_resolves_the_flag(self):
@@ -678,9 +699,12 @@ class Requests(Served):
         self.assertIn("oldest unhandled action is 1", body)
 
     def test_an_ack_requires_a_non_negative_integer(self):
+        self.session.act(None, "next", "")
         for seq in (None, True, "1", 1.5, -1):
             with self.subTest(seq=seq):
-                self.assertEqual(self.post("/ack", {"seq": seq})[0], 400)
+                status, body = self.post("/ack", {"seq": seq})
+                self.assertEqual(status, 400)
+                self.assertIn("seq must be a non-negative integer", body)
 
     def test_a_content_length_that_is_not_a_number_answers_400(self):
         self.assertIn("400", self.raw(
@@ -911,8 +935,10 @@ class Awaiting(Served):
     def test_it_answers_with_the_action_that_landed(self):
         self.session.act(1, "accept", "yes")
         status, body = self.get("/await")
+        action = json.loads(body)
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body)["action"], "accept")
+        self.assertEqual(action["action"], "accept")
+        self.assertEqual(set(action), set(serve.ACTION_FIELDS))
 
     def test_a_caller_cursor_cannot_skip_an_unhandled_action(self):
         self.session.act(None, "next", "")
@@ -942,7 +968,7 @@ class Awaiting(Served):
             return original_wait(*args, **kwargs)
 
         self.session.wait = delayed_wait
-        self.addCleanup(setattr, self.session, "wait", original_wait)
+        self.addCleanup(self.session.__dict__.pop, "wait", None)
         answers = []
         walk = threading.Thread(target=lambda: answers.append(self.get("/await")))
         walk.start()
@@ -953,6 +979,8 @@ class Awaiting(Served):
             release.set()
         walk.join(10.0)
 
+        self.assertFalse(walk.is_alive())
+        self.assertEqual(len(answers), 1)
         self.assertEqual(json.loads(answers[0][1])["seq"], 2)
 
     def test_nothing_new_answers_a_timeout_rather_than_hanging_up(self):
@@ -1062,7 +1090,7 @@ class Lifecycle(unittest.TestCase):
         second, url = start()
         with urllib.request.urlopen(url + "/state", timeout=5) as response:
             state = json.loads(response.read())
-        self.assertEqual((state["produced_seq"], state["handled_seq"]), (1, 0))
+        self.assertEqual((state["seq"], state["handled_seq"]), (1, 0))
         with urllib.request.urlopen(url + "/await", timeout=5) as response:
             self.assertEqual(json.loads(response.read())["action"], "next")
         request = urllib.request.Request(
