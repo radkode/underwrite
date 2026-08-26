@@ -98,7 +98,13 @@ in parallel:
 | author is the authenticated user, no other reviewers, no other collaborators | `branch` |
 | otherwise | `review` |
 
-Write `session.json` with the facts and the audience decision before walking anything.
+Write the decision as `audience{mode: branch|review, why}` in `session.json`, for example:
+
+```json
+{"audience":{"mode":"review","why":"the PR has another reviewer"}}
+```
+
+Write `session.json` with the facts and that audience object before walking anything.
 
 ## Phase 1: orient
 
@@ -268,19 +274,24 @@ If verification fails, do not commit and do not set `landed`. Rewrite the `FIX` 
 what is now owed, say so, and stop. Phase 4 will refuse to render an accepted beat that
 landed nothing.
 
-In `review` mode, or when the flag is a decision rather than a patch, there is no commit
-to name, so post `decide` instead and let the server move the beat to `decided`:
+In `review` mode, keep the beat `accepted` after the reviewer accepts a finding. A finding
+intended for the PR audience stays accepted even when its recommended fix is a policy
+choice rather than code, because the GitHub review comment is what delivers it. Nothing
+lands per beat until Phase 4 posts the single review, so no review URL exists yet by
+design. The review audience alone never changes an accepted finding to `decided`.
+
+When the flag itself is a decision whose words complete the work and do not need to reach
+the PR audience as a finding, post `decide` and let the server move the beat to `decided`:
 
 ```bash
 curl -s -X POST $URL/act -H 'Content-Type: application/json' \
   -d '{"n":5,"action":"decide","note":"stays as is, the cost lands on the caller"}'
 ```
 
-Post it whether the beat is still an open flag or the reviewer already clicked Accept: the
-answer is the same, and `decided` is what says the answer was a call rather than a patch.
-Without it the beat sits `accepted` with nothing landed, which Phase 4 refuses to render
-clean and no legal edit can fix. The decision itself is the artifact, so a `decided` beat
-with no `call` fails validation the same way an accepted one with no `landed` does.
+Post it whether the beat is still an open flag or the reviewer already clicked Accept.
+`decided` says the answer itself is the artifact, independent of audience mode. A finding
+that belongs in the GitHub review is not such a decision. A `decided` beat with no `call`
+fails validation the same way an accepted one with no `landed` does.
 
 If the working tree is dirty, say so and stop rather than stashing. Never push and never
 open a PR unasked.
@@ -339,8 +350,21 @@ gh api repos/<owner>/<repo>/pulls/<n>/reviews --method POST --input $R/review.fi
 A 422 here means the audience call was wrong upstream. Go back and fix it. Do not
 downgrade the event to make the command succeed.
 
-Write the outcome, the branch or review URL, and `status` back into `session.json`, and set
-each accepted beat's `landed` to the review URL so every beat still names what carried it.
+Capture the successful response's review URL. Write the outcome, review URL, and `status`
+back into `session.json`, and set each accepted beat's `landed` to that URL.
+Add one `lands[]` entry with `state: landed`, what the review delivered, and the same URL
+in `where`.
+
+Then re-render the report with final delivery checks:
+
+```bash
+$S/scripts/render-report.py $R --final
+```
+
+Exit 2 now means the review posted but its write-back is incomplete. Fix the session and
+run the command again. Once it passes, re-publish the updated artifact so the page the
+reviewer keeps shows the review URL and What lands. If Artifact is unavailable, run the
+same command with `--standalone` and report the updated local file.
 
 ## Session state
 
@@ -348,7 +372,7 @@ each accepted beat's `landed` to the review URL so every beat still names what c
 repo, so it never shows up in `git status`. `mkdir -p` it on first write.
 
 ```
-session.json     repo, number, title, head, date, status, cursor, facts[], audience{}, plan[], lands[], footer
+session.json     repo, number, title, head, date, status, cursor, facts[], audience{mode: branch|review, why}, plan[], lands[], footer
 beats/01.json    n, tier, state, claim, where, slots{}, diff[], call, landed, branch
 pr.diff          the saved diff
 decisions.jsonl  append-only, one line per reviewer action, written by the server
@@ -371,9 +395,9 @@ lines, classified on the first character. `lands[]` entries are
 `{state: landed|ready|open, what, where}`.
 
 `landed` names what an accepted beat became: a short SHA in `branch` mode, the review URL
-in `review` mode, with `branch` beside it when there is one. An accepted beat that names
-nothing does not render clean, because the reviewer said yes and nothing shows for it. A
-`decided` beat never carries one; its `call` is what it became.
+in `review` mode, with `branch` beside it when there is one. An accepted review beat may
+omit it only in the pre-POST render. The `--final` render rejects every accepted beat that
+still names nothing. A `decided` beat never carries one; its `call` is what it became.
 
 These accumulate into a review history. When a later session touches the same paths, read
 the prior sessions for context.

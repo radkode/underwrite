@@ -79,9 +79,23 @@ class BeatValidation(unittest.TestCase):
         ))
         self.assertIn("landed 961eb58 but state is 'flag'", problems[0])
 
-    def test_review_mode_does_not_demand_a_commit_per_beat(self):
+    def test_review_mode_allows_an_unlanded_accept_before_the_post(self):
         """Phase 4 renders before it posts, so nothing has landed yet by design."""
         self.assertEqual(rr.validate(beat(state="accepted"), "review"), [])
+
+    def test_a_final_review_requires_every_accept_to_name_the_post(self):
+        problems = rr.validate(beat(state="accepted"), "review", final=True)
+        self.assertIn("accepted, nothing landed", problems[0])
+
+    def test_a_final_review_accept_naming_the_post_is_shippable(self):
+        self.assertEqual(
+            rr.validate(
+                beat(state="accepted", landed="https://example.test/review/2"),
+                "review",
+                final=True,
+            ),
+            [],
+        )
 
     def test_every_beat_needs_a_what(self):
         problems = rr.validate(beat(slots={"proof": "a.ts:1"}))
@@ -539,6 +553,57 @@ class RenderCli(unittest.TestCase):
         self.assertEqual(done.returncode, 2)
         self.assertIn("clean with no proof", done.stderr)
         self.assertIn("unproven", self.page())
+
+    def test_a_review_accept_is_allowed_before_post_but_not_in_the_final_report(self):
+        self.session({
+            "repo": "acme/widget",
+            "audience": {"mode": "review", "why": "another reviewer owns the PR"},
+        })
+        self.put(beat(n=1, state="accepted"))
+
+        self.assertEqual(self.run_cli().returncode, 0)
+        final = self.run_cli("--final")
+
+        self.assertEqual(final.returncode, 2)
+        self.assertIn("accepted, nothing landed", final.stderr)
+
+    def test_a_final_review_with_its_url_exits_zero(self):
+        review_url = "https://example.test/review/2"
+        self.session({
+            "repo": "acme/widget",
+            "audience": {"mode": "review", "why": "another reviewer owns the PR"},
+            "lands": [{
+                "state": "landed",
+                "what": "one accepted finding",
+                "where": review_url,
+            }],
+        })
+        self.put(beat(n=1, state="accepted", landed=review_url))
+
+        done = self.run_cli("--final")
+
+        self.assertEqual(done.returncode, 0)
+        self.assertIn("What lands", self.page())
+        self.assertIn(review_url, self.page())
+
+    def test_a_malformed_audience_is_reported_without_crashing(self):
+        self.session({"repo": "acme/widget", "audience": "review"})
+        self.put(beat(n=1))
+
+        done = self.run_cli()
+
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("session audience must be an object", done.stderr)
+        self.assertIn("acme/widget", self.page())
+
+    def test_an_audience_object_requires_a_known_mode(self):
+        self.session({"repo": "acme/widget", "audience": {"why": "other reviewers"}})
+        self.put(beat(n=1))
+
+        done = self.run_cli()
+
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("session audience mode must be branch or review", done.stderr)
 
     def test_a_cursor_that_disagrees_with_the_beats_exits_2(self):
         """The one problem no per-beat check can see: a beat that never got written

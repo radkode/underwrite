@@ -1,0 +1,45 @@
+#!/usr/bin/env python3
+"""Contract tests for the prompt-owned parts of the underwrite workflow."""
+import unittest
+from pathlib import Path
+
+
+SKILL = Path(__file__).resolve().parent.parent / "skills" / "underwrite" / "SKILL.md"
+
+
+class ReviewModeContract(unittest.TestCase):
+    def skill(self):
+        return SKILL.read_text(encoding="utf-8")
+
+    def test_review_findings_stay_accepted_until_the_review_is_posted(self):
+        text = self.skill()
+        for anchor in (
+            "In `review` mode",
+            "If the working tree is dirty",
+        ):
+            with self.subTest(anchor=anchor):
+                self.assertIn(anchor, text)
+        start = text.index("In `review` mode")
+        end = text.index("If the working tree is dirty", start)
+        rule = text[start:end]
+
+        self.assertIn("keep the beat `accepted`", rule)
+        self.assertIn("When the flag itself is a decision", rule)
+        review_rule, decision_rule = rule.split("When the flag itself is a decision", 1)
+        self.assertNotIn("post `decide`", review_rule)
+        self.assertIn("post `decide`", decision_rule)
+
+    def test_review_delivery_has_a_final_validation_and_publish_step(self):
+        text = self.skill()
+        self.assertIn("render-report.py $R --final", text)
+        self.assertIn("Add one `lands[]` entry", text)
+        self.assertIn("re-render the report", text)
+        self.assertIn("re-publish the updated artifact", text)
+
+    def test_the_audience_shape_is_explicit(self):
+        text = self.skill()
+        self.assertIn("audience{mode: branch|review, why}", text)
+
+
+if __name__ == "__main__":
+    unittest.main()

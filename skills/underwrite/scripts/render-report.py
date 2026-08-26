@@ -165,7 +165,7 @@ def md(text):
     return re.sub(r"`([^`]+)`", r"<code>\1</code>", out)
 
 
-def validate(beat, mode="branch"):
+def validate(beat, mode="branch", final=False):
     """Return a list of problems. Empty means the beat is shippable."""
     problems = []
     n = beat.get("n", "?")
@@ -181,11 +181,9 @@ def validate(beat, mode="branch"):
         problems.append(f"beat {n}: no what")
     if state in ("clean", "accepted") and not slots.get("proof"):
         problems.append(f"beat {n}: {state} with no proof")
-    # An accepted flag naming nothing it landed is the gap this page used to hide: the
-    # reviewer said yes, and either the commit never happened or it never got written
-    # back. In review mode nothing lands per beat until the review is posted, so the
-    # rule would otherwise fire on every beat at the render that precedes the POST.
-    if mode == "branch" and state == "accepted" and not beat.get("landed"):
+    # Review mode renders once before the POST. Its delivered report has the same
+    # obligation as branch mode, with the review URL in place of a commit.
+    if (mode == "branch" or final) and state == "accepted" and not beat.get("landed"):
         problems.append(f"beat {n}: accepted, nothing landed")
     # The escape from that rule, for the flag whose answer is a call rather than a patch.
     # Then the words are the whole artifact, and a decided beat with none of them is the
@@ -330,7 +328,8 @@ def body_html(session, beats, problems_by_n, live=False):
             f'<span class="where">{md(l.get("where", ""))}</span></div>'
             for l in session["lands"]
         )
-        hint = session.get("audience", {}).get("why", "")
+        audience = session.get("audience")
+        hint = audience.get("why", "") if isinstance(audience, dict) else ""
         parts.append(
             '<section class="sec"><div class="sec-head"><h2>What lands</h2>'
             f'<span class="hint">{md(hint)}</span></div>'
@@ -384,7 +383,7 @@ def render(session, beats, css, problems_by_n, live=False):
     return "\n".join(parts)
 
 
-def load(root, css_path):
+def load(root, css_path, final=False):
     """Read a session off disk. Returns (session, beats, problems_by_n, problems)."""
     session = json.loads((root / "session.json").read_text(encoding="utf-8"))
     beats = [
@@ -394,9 +393,20 @@ def load(root, css_path):
     css = css_path.read_text(encoding="utf-8")
 
     problems_by_n, problems = {}, []
-    mode = (session.get("audience") or {}).get("mode", "branch")
+    audience = session.get("audience")
+    if audience is None:
+        mode = "branch"
+    elif not isinstance(audience, dict):
+        problems.append("session audience must be an object")
+        session["audience"] = {}
+        mode = "branch"
+    else:
+        mode = audience.get("mode")
+        if mode not in ("branch", "review"):
+            problems.append("session audience mode must be branch or review")
+            mode = "branch"
     for beat in beats:
-        found = validate(beat, mode)
+        found = validate(beat, mode, final)
         if found:
             problems_by_n[beat.get("n")] = found
             problems += found
@@ -434,12 +444,19 @@ def main():
         action="store_true",
         help="include the polling and decision controls (serve.py uses this)",
     )
+    ap.add_argument(
+        "--final",
+        action="store_true",
+        help="require every accepted beat to name its commit or posted review",
+    )
     args = ap.parse_args()
 
     root = Path(args.session_dir).expanduser()
     css_path = Path(args.css).expanduser() if args.css else default_css()
     try:
-        session, beats, css, problems_by_n, all_problems = load(root, css_path)
+        session, beats, css, problems_by_n, all_problems = load(
+            root, css_path, args.final
+        )
     except (OSError, json.JSONDecodeError) as err:
         sys.exit(f"render-report: {err}")
 
