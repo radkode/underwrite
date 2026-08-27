@@ -3,6 +3,7 @@
 
 import importlib.util
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -42,7 +43,7 @@ class SessionCtlCase(unittest.TestCase):
         (self.root / "session.json").write_text(json.dumps(SESSION), encoding="utf-8")
         (self.root / "beats" / "01.json").write_text(json.dumps(FLAG), encoding="utf-8")
 
-    def invoke(self, *args, value=None, stdin=None):
+    def invoke(self, *args, value=None, stdin=None, env=None):
         if value is not None:
             stdin = json.dumps(value)
         return subprocess.run(
@@ -50,6 +51,7 @@ class SessionCtlCase(unittest.TestCase):
             input=stdin,
             text=True,
             capture_output=True,
+            env=env,
         )
 
     def success(self, *args, value=None):
@@ -213,6 +215,171 @@ class ApplyingAndRecovering(SessionCtlCase):
         state = self.success("reconcile", self.root)
         self.assertEqual(state["handled_seq"], second["seq"])
         self.assertIsNone(state["head"])
+
+
+class TargetCommands(SessionCtlCase):
+    def setUp(self):
+        super().setUp()
+        (self.root / "beats" / "01.json").unlink()
+        self.init()
+        self.repo = self.root / "worktree"
+        subprocess.run(["git", "init", str(self.repo)], check=True, capture_output=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "config", "user.name", "Underwrite Test"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "config", "user.email", "test@example.test"],
+            check=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "config", "commit.gpgsign", "false"],
+            check=True,
+        )
+        (self.repo / "base.txt").write_text("base\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "base.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "commit", "-m", "base"],
+            check=True,
+            capture_output=True,
+        )
+        subprocess.run(
+            ["git", "-C", str(self.repo), "branch", "-M", "feature"], check=True
+        )
+        self.head = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        self.metadata = {
+            "number": 7,
+            "state": "open",
+            "merged_at": None,
+            "base": {
+                "ref": "main",
+                "sha": "a" * 40,
+                "repo": {
+                    "full_name": "acme/widget",
+                    "clone_url": "https://example.test/acme/widget.git",
+                },
+            },
+            "head": {
+                "ref": "feature",
+                "sha": self.head,
+                "repo": {"id": 123, "full_name": "acme/widget"},
+            },
+        }
+        diff = self.root / "captured.diff"
+        metadata = self.root / "captured.json"
+        diff.write_text("diff\n", encoding="utf-8")
+        metadata.write_text(json.dumps(self.metadata), encoding="utf-8")
+        self.store().freeze_target(
+            {
+                "version": 1,
+                "kind": "github_pr",
+                "repo": "acme/widget",
+                "number": 7,
+                "state": "open",
+                "merged_at": None,
+                "base_sha": "a" * 40,
+                "head_sha": self.head,
+                "head_repo_id": 123,
+                "head_repo": "acme/widget",
+                "head_ref": "feature",
+                "merge_base_sha": "c" * 40,
+                "changed_files": 1,
+            },
+            diff,
+            metadata,
+        )
+
+    def gh(self, metadata):
+        binary = self.root / "bin"
+        binary.mkdir(exist_ok=True)
+        script = binary / "gh"
+        script.write_text(
+            "#!/usr/bin/env python3\nprint(%r)\n" % json.dumps(metadata),
+            encoding="utf-8",
+        )
+        script.chmod(0o755)
+        return dict(os.environ, PATH=f"{binary}:{os.environ.get('PATH', '')}")
+
+    def test_check_pr_uses_exit_two_for_target_movement(self):
+        exact = self.invoke("check-pr", self.root, env=self.gh(self.metadata))
+        self.assertEqual(exact.returncode, 0, exact.stderr)
+        self.assertEqual(json.loads(exact.stdout)["head_sha"], self.head)
+
+        moved = json.loads(json.dumps(self.metadata))
+        moved["head"]["sha"] = "d" * 40
+        changed = self.invoke("check-pr", self.root, env=self.gh(moved))
+        self.assertEqual(changed.returncode, 2)
+        self.assertIn("head_sha changed", changed.stderr)
+
+    def test_check_worktree_and_commit_land_use_the_recorded_position(self):
+        pinned = self.success("pin-branch", self.root, "feature")
+        self.assertEqual(pinned["delivery_branch"], "feature")
+        checked = self.success("check-worktree", self.root, self.repo)
+        self.assertEqual(checked["head_sha"], self.head)
+        store = self.store()
+        store.put_beat(FLAG)
+        action = store.produce("accept-1", 1, "accept", "yes")
+        (self.repo / "fix.txt").write_text("fix\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "fix.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "commit", "-m", "fix"],
+            check=True,
+            capture_output=True,
+        )
+        artifact = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+
+        landed = self.success(
+            "land",
+            self.root,
+            action["seq"],
+            1,
+            artifact,
+            "--kind",
+            "commit",
+            "--branch",
+            "feature",
+            "--repo-root",
+            self.repo,
+        )
+
+        self.assertEqual(landed["artifact"], artifact)
+        self.assertEqual(
+            self.success("check-worktree", self.root, self.repo)["head_sha"], artifact
+        )
+
+    def test_review_receipt_returns_only_a_response_for_the_frozen_head(self):
+        marker = self.success("review-marker", self.root)["marker"]
+        response = self.root / "response.json"
+        response.write_text(
+            json.dumps({
+                "id": 17,
+                "commit_id": self.head,
+                "body": marker,
+                "user": {"login": "reviewer"},
+                "state": "COMMENTED",
+                "html_url": "https://example.test/r/1",
+            }),
+            encoding="utf-8",
+        )
+
+        receipt = self.success(
+            "review-receipt", self.root, response, "--actor", "reviewer"
+        )
+
+        self.assertEqual(receipt["url"], "https://example.test/r/1")
+        self.assertEqual(receipt["commit_id"], self.head)
+        self.assertEqual(receipt["marker"], marker)
+        self.assertEqual(receipt["state"], "COMMENTED")
 
 
 class Failures(SessionCtlCase):

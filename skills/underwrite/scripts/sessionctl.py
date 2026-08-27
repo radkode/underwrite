@@ -13,6 +13,15 @@ if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
 from session_store import SessionStore, StoreError  # noqa: E402
+from pr_snapshot import (  # noqa: E402
+    TargetMoved,
+    capture,
+    check,
+    check_commit,
+    check_worktree,
+    review_identity,
+    review_receipt,
+)
 
 
 class Usage(argparse.ArgumentParser):
@@ -57,6 +66,31 @@ def parser():
     init.add_argument("session")
     init.add_argument("--handled-seq", type=int)
 
+    snapshot_pr = commands.add_parser("snapshot-pr")
+    snapshot_pr.add_argument("session")
+    snapshot_pr.add_argument("repo")
+    snapshot_pr.add_argument("pr", type=int)
+
+    check_pr = commands.add_parser("check-pr")
+    check_pr.add_argument("session")
+    check_pr.add_argument("--require-open", action="store_true")
+
+    check_tree = commands.add_parser("check-worktree")
+    check_tree.add_argument("session")
+    check_tree.add_argument("repo_root")
+
+    pin_branch = commands.add_parser("pin-branch")
+    pin_branch.add_argument("session")
+    pin_branch.add_argument("branch")
+
+    marker = commands.add_parser("review-marker")
+    marker.add_argument("session")
+
+    receipt = commands.add_parser("review-receipt")
+    receipt.add_argument("session")
+    receipt.add_argument("source")
+    receipt.add_argument("--actor", required=True)
+
     for name in ("put-session", "patch-session", "put-beat"):
         command = commands.add_parser(name)
         command.add_argument("session")
@@ -86,6 +120,7 @@ def parser():
     land.add_argument("--kind", choices=("commit", "review"), required=True)
     land.add_argument("--branch")
     land.add_argument("--entry")
+    land.add_argument("--repo-root")
 
     fail = commands.add_parser("fail")
     fail.add_argument("session")
@@ -118,7 +153,25 @@ def run(args):
         store.export_json()
         return store.reconcile()
 
-    if args.command == "put-session":
+    if args.command == "snapshot-pr":
+        store = SessionStore(args.session)
+        result = capture(store, args.repo, args.pr)
+    elif args.command == "check-pr":
+        store = SessionStore(args.session)
+        return check(store, require_open=args.require_open)
+    elif args.command == "check-worktree":
+        store = SessionStore(args.session)
+        return check_worktree(store, args.repo_root)
+    elif args.command == "pin-branch":
+        store = SessionStore(args.session)
+        result = store.pin_branch(args.branch)
+    elif args.command == "review-marker":
+        store = SessionStore(args.session)
+        return review_identity(store)
+    elif args.command == "review-receipt":
+        store = SessionStore(args.session)
+        return review_receipt(store, args.source, args.actor)
+    elif args.command == "put-session":
         document = object_input(args.source, "session")
         store = SessionStore(args.session)
         result = store.put_session(document)
@@ -148,6 +201,17 @@ def run(args):
     elif args.command == "land":
         entry = object_input(args.entry, "land entry") if args.entry else None
         store = SessionStore(args.session)
+        if args.kind == "commit" and "target" in store.snapshot()[0]:
+            if not args.repo_root:
+                raise StoreError("PR commit delivery requires --repo-root")
+            check_commit(
+                store,
+                args.repo_root,
+                args.seq,
+                args.beat,
+                args.artifact,
+                args.branch,
+            )
         result = store.land(
             args.seq,
             args.beat,
@@ -191,6 +255,9 @@ def main(argv=None):
         result = run(args)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
+    except TargetMoved as error:
+        print(f"sessionctl: {error}", file=sys.stderr)
+        return 2
     except (OSError, sqlite3.Error, json.JSONDecodeError, StoreError) as error:
         print(f"sessionctl: {error}", file=sys.stderr)
         return 1

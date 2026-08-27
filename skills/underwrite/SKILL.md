@@ -71,15 +71,37 @@ Resolve the target from the argument: a number is a PR, a name is a branch
 `git diff HEAD~1`). If the working directory is not a repository, ask which one before
 anything else; every `git` and `gh` call below has to run inside it.
 
-Check for an existing session first at `$R`. If one exists and is unfinished, show where
-it left off and offer to resume. Compare the recorded head SHA against the current one and
-say so if the PR has moved.
+Check for an existing session first at `$R`. For a PR session, verify its frozen target
+before offering to resume:
 
-Otherwise tell the reviewer you are ingesting (it is the expensive step), then run these
-in parallel:
+```bash
+$S/scripts/sessionctl.py check-pr "$R"
+```
 
-- `gh pr view <n> --json title,body,author,headRefOid,files,commits,comments,reviews,state,mergedAt,reviewRequests`
-- `gh pr diff <n>`, saved to `$R/pr.diff` for anchor validation later
+Exit 2 means its base, head, or lifecycle moved. Stop and reconcile into a supervised
+replacement session. Never refresh the target or diff inside the existing session. An
+operational failure exits 1 and also blocks resumption until it is understood.
+
+Otherwise tell the reviewer you are ingesting (it is the expensive step). For a PR,
+initialize the store and capture its exact base and head before starting any contextual
+reads:
+
+```bash
+mkdir -p "$R"
+$S/scripts/sessionctl.py init "$R"
+$S/scripts/sessionctl.py snapshot-pr "$R" <owner/repo> <n>
+```
+
+`snapshot-pr` reads both SHAs and the head repository and ref from one GitHub response,
+fetches the exact base commit and the base repository's `refs/pull/<n>/head` into a fresh
+bare repository, verifies both fetched commits, and saves a local three-dot diff. It reads
+the PR again before freezing the target. Exit 2 means the PR moved during capture; repeat
+the new capture. It never uses a GitHub-rendered diff, whose successful response does not
+prove completeness.
+
+After the snapshot is frozen, run these contextual reads in parallel:
+
+- Read `$R/pr.json`, then `gh pr view <n> --json title,body,author,files,commits,comments,reviews,state,mergedAt,reviewRequests`
 - `gh api user --jq .login` and `gh api repos/<owner>/<repo>/collaborators --jq length`
 - `git log -20 --format='%h %s' -- <touched paths>`
 - Prior work in the same area: pull `(#NNNN)` numbers out of that log's squash-merge
@@ -90,23 +112,28 @@ in parallel:
   repo's commit and branch conventions again in Phase 4.
 - The linked issue, if the body references one
 
+Run `check-pr` again after those reads. The contextual data is usable only while the
+frozen base and head still match.
+
 **Decide the audience now** and write it through the session store:
 
 | condition | mode |
 | --- | --- |
 | merged | `branch` |
-| author is the authenticated user, no other reviewers, no other collaborators | `branch` |
+| open, its head repository exists, author is the authenticated user, no other reviewers, no other collaborators | `branch` |
 | otherwise | `review` |
 
-Create the store once, then send the complete session object to `put-session` on stdin:
+For a PR, add the audience and other session facts with `patch-session`; the immutable
+target already owns its repo, number, base, and head:
 
 ```bash
-mkdir -p "$R"
-$S/scripts/sessionctl.py init "$R"
-$S/scripts/sessionctl.py put-session "$R" - <<'JSON'
-{"repo":"owner/repo","audience":{"mode":"review","why":"the PR has another reviewer"}}
+$S/scripts/sessionctl.py patch-session "$R" - <<'JSON'
+{"audience":{"mode":"review","why":"the PR has another reviewer"}}
 JSON
 ```
+
+For a branch or working-tree target, initialize the store and send its complete session
+object to `put-session` as before.
 
 The decision is `audience{mode: branch|review, why}`, for example:
 
@@ -293,16 +320,47 @@ A finding about code in an open PR belongs in that PR. Opening a sibling branch 
 PR that is still taking commits splits the change in two and leaves the reviewer to
 reconcile them.
 
-Then apply the patch, run the repo's verification, and commit. One commit per accepted
-flag, conventional subject, the `FIX` line as the body.
+For a PR target, run `sessionctl.py check-pr "$R"` immediately before checkout or patch
+application. Exit 2 stops the effect and requires a supervised replacement session. Check
+out the frozen head, not the current branch tip. For a merged PR's first accept, create
+the fixes branch there and pin its exact name before editing:
+
+```bash
+$S/scripts/sessionctl.py pin-branch "$R" <fixes-branch>
+```
+
+An exact retry is safe, but a different name is refused. Then prove the local position:
+
+```bash
+$S/scripts/sessionctl.py check-worktree "$R" "$PWD"
+```
+
+For an open PR this also requires its frozen head repository to exist and the local branch
+to match its frozen head ref. For a merged PR it requires the pinned fixes branch to begin
+at the frozen head. After earlier accepted flags, it requires local `HEAD` to equal the
+latest commit already recorded by this session. Apply the patch and run the repo's
+verification.
+Run both `check-pr` and `check-worktree` again immediately before the commit, because
+verification can be long enough for either the PR or local branch to move. One commit per
+accepted flag, conventional subject, the `FIX` line as the body.
+
+```bash
+$S/scripts/sessionctl.py check-pr "$R"
+$S/scripts/sessionctl.py check-worktree "$R" "$PWD"
+```
 
 Record the result with one idempotent operation, which updates the beat and the session's
 `lands[]` together:
 
 ```bash
-$S/scripts/sessionctl.py land "$R" <seq> <beat> <short-sha> \
-  --kind commit --branch <branch>
+SHA=$(git rev-parse HEAD)
+$S/scripts/sessionctl.py land "$R" <seq> <beat> "$SHA" \
+  --kind commit --branch <branch> --repo-root "$PWD"
 ```
+
+For a frozen PR, `land` requires the full SHA and proves that it is the worktree's current
+`HEAD`, has exactly the prior recorded position as its sole parent, and is on the delivery
+branch. An exact retry returns the recorded receipt without depending on later local work.
 
 Then acknowledge the action, confirm in one line, and advance:
 
@@ -362,7 +420,12 @@ report the local `$R/report.html` path instead.
 
 **Branch mode.** The commits already exist from Phase 3. Report the branch and
 `git log --oneline`, and offer to push and open a PR. Do not do either unasked. A session
-with no accepted flags leaves no branch at all, which is correct.
+with no accepted flags leaves no branch at all, which is correct. For a PR target, run
+`sessionctl.py check-pr "$R"` and `sessionctl.py check-worktree "$R" "$PWD"` once more
+immediately before any requested push. For an open PR, push `HEAD` to the exact frozen
+`head_repo` and `head_ref`, never to an inferred upstream. The push may intentionally
+advance that PR after the check; any later work belongs in a replacement session tied to
+the new head.
 
 **Review mode.** Build the payload at `$R/review.json`, never inside the repo being
 reviewed:
@@ -370,6 +433,7 @@ reviewed:
 ```json
 {
   "body": "...",
+  "commit_id": "<frozen target.head_sha>",
   "event": "COMMENT",
   "comments": [{"path": "src/auth/session.go", "line": 88, "side": "RIGHT", "body": "..."}]
 }
@@ -380,23 +444,51 @@ anchors before anything else, because GitHub rejects the whole review if one anc
 outside the diff:
 
 ```bash
-$S/scripts/validate-anchors.py --diff $R/pr.diff --payload $R/review.json --out $R/review.fixed.json
+$S/scripts/validate-anchors.py --session "$R" --payload $R/review.json --out $R/review.fixed.json
 ```
 
 Exit 2 means anchors were snapped or folded into the body. Report what moved in one line
-and carry on; a bad anchor must never cost the session's work. Show the final payload, get
-one explicit yes, then:
+and carry on; a bad anchor must never cost the session's work. Session mode reads and
+hashes the same diff bytes it validates, requires the payload's full `commit_id` to match
+the frozen head, requires a final `COMMENT`, `APPROVE`, or `REQUEST_CHANGES` event, and
+adds the session's stable hidden delivery marker to the body. Show the final payload and
+get one explicit yes. Recheck the open target after that yes,
+immediately before the only GitHub side effect:
 
 ```bash
-gh api repos/<owner>/<repo>/pulls/<n>/reviews --method POST --input $R/review.fixed.json
+set -e
+ACTOR=$(gh api user --jq .login)
+$S/scripts/sessionctl.py check-pr "$R" --require-open
+gh api repos/<owner>/<repo>/pulls/<n>/reviews --method POST \
+  --input "$R/review.fixed.json" > "$R/review-response.json"
+$S/scripts/sessionctl.py review-receipt "$R" "$R/review-response.json" \
+  --actor "$ACTOR"
 ```
+
+`review-receipt` requires exactly one non-pending review with the frozen commit, stable
+delivery marker, and authenticated actor, then returns its URL. A transport failure or
+5xx has an unknown outcome. Reconcile every page of reviews before retrying:
+
+```bash
+gh api --paginate --slurp repos/<owner>/<repo>/pulls/<n>/reviews \
+  > "$R/review-candidates.json"
+$S/scripts/sessionctl.py review-receipt "$R" "$R/review-candidates.json" \
+  --actor "$ACTOR"
+```
+
+One exact match proves the delivery landed. More than one is a conflict. No match is not
+permission to post immediately: allow for API visibility, repeat the read, then re-run the
+final target check and obtain approval before a retry. Never match only `commit_id` and
+never blindly post the review twice. The receipt includes the review state. `DISMISSED`
+proves the post happened but is no longer an active delivery: preserve that receipt, stop
+for supervised handling, and do not retry or mark the pending beats landed.
 
 A 422 here means the audience call was wrong upstream. Audience mode is frozen once an
 accept is recorded, so stop and create a supervised replacement session with the correct
 audience. Do not reclassify the pending delivery or downgrade the event to make the
 command succeed.
 
-Capture the successful response's review URL. Write one land-entry JSON object with
+Use the verified response's review URL. Write one land-entry JSON object with
 `state: landed`, what the review delivered, and that URL in `where`. Run
 `sessionctl.py reconcile "$R"` to obtain each pending accepted beat's `beat_n` and
 `cause_seq`, then record the same URL for each:
@@ -407,7 +499,14 @@ $S/scripts/sessionctl.py land "$R" <cause_seq> <beat_n> <review-url> \
 ```
 
 The shared entry is added to `lands[]` only once. Persist the outcome, review URL, and
-`status` as one `patch-session` object.
+`status` as one `patch-session` object. Once that observed external effect is recorded,
+run `check-pr` again. Exit 2 now means the review was posted to the frozen commit but the
+PR moved during submission. Report it as posted but stale and stop before any new effect;
+never discard the durable landing receipt.
+
+```bash
+$S/scripts/sessionctl.py check-pr "$R"
+```
 
 Then re-render the report with final delivery checks:
 
@@ -427,21 +526,31 @@ and report the updated local file.
 repo, so it never shows up in `git status`. `mkdir -p` it on first write.
 
 ```
-session.sqlite3  authoritative versioned session, beats, actions, receipts, and delivery
-.session.lock    cross-process initialization and export lock
+session.sqlite3  authoritative versioned session, target identity, actions, and delivery
+.session.lock    cross-process initialization, snapshot, and export lock
 session.json     derived compatibility export of the session document
 beats/01.json    derived compatibility export of one beat
 decisions.jsonl  derived compatibility export of reviewer actions
 ack.json         derived compatibility export of handled_seq
-pr.diff          saved review input
+pr.json          GitHub PR metadata captured with the target
+pr.diff          frozen local three-dot diff, hash-bound to the target
 serve.json       running server URL and pid, removed when it exits
 report.html      rendered, regenerable, throwaway
 ```
 
 All mutations go through `sessionctl.py` or the server's `/act` endpoint. All reads used
-for a later mutation go through `get-session` or `get-beat`. JSON files are exports for
-older tooling and inspection. The renderer reads SQLite whenever it exists, and a later
-`$S/scripts/sessionctl.py export "$R"` repairs missing or corrupt exports.
+for a later mutation go through `get-session` or `get-beat`. `session.json`, `beats/`,
+`decisions.jsonl`, and `ack.json` are compatibility exports. The renderer reads SQLite
+whenever it exists, and a later `$S/scripts/sessionctl.py export "$R"` repairs missing or
+corrupt compatibility exports.
+`check-pr` verifies the frozen diff and the current PR identity; an exact `snapshot-pr`
+replay can repair `pr.diff` only while GitHub still names the same frozen target.
+
+`target` is a write-once `{version, kind, repo, number, state, merged_at, base_sha,
+head_sha, head_repo_id, head_repo, head_ref, merge_base_sha, changed_files, diff_sha256,
+diff_bytes}` object. Generic session writes cannot add, remove, or alter it. A target must
+be frozen before the first beat or action. A merged PR's top-level `delivery_branch` is
+also write-once through `pin-branch` before its first local change.
 
 An unversioned legacy action log with no `ack.json` imports as handled because replaying
 it could duplicate a commit. A cursor-aware log with a missing, corrupt, or impossible
@@ -465,10 +574,11 @@ reviewer answers, `decided` being the yes that resolves in words rather than a c
 lines, classified on the first character. `lands[]` entries are
 `{state: landed|ready|open, what, where}`.
 
-`landed` names what an accepted beat became: a short SHA in `branch` mode, the review URL
-in `review` mode, with `branch` beside it when there is one. An accepted review beat may
-omit it only in the pre-POST render. The `--final` render rejects every accepted beat that
-still names nothing. A `decided` beat never carries one; its `call` is what it became.
+`landed` names what an accepted beat became: a commit SHA in `branch` mode, the review URL
+in `review` mode, with `branch` beside it when there is one. A frozen PR records the full
+SHA so the local-history guard can resolve it without ambiguity. An accepted review beat
+may omit it only in the pre-POST render. The `--final` render rejects every accepted beat
+that still names nothing. A `decided` beat never carries one; its `call` is what it became.
 
 These accumulate into a review history. When a later session touches the same paths, read
 the prior sessions for context.
