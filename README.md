@@ -77,16 +77,20 @@ terminal                     browser
 --------                     -------
 presents beat 5    ------>   beat 5 appears, FLAG, expanded
 (parked on /await)           [ accept ]  [ drop ]  [ your words ]
-                   <------   POST /act
+                   <------   POST /act with stable action and session IDs
+SQLite commits the call and its application receipt
 writes the patch
 runs verification
-commits 961eb58    ------>   beat 5 flips to ACCEPTED
+commits 961eb58
+records the landing ------>  beat 5 shows ACCEPTED and 961eb58
 presents beat 6    ------>   beat 6 arrives
 ```
 
 The server is loopback-only and takes no path from any request: every read and write is a
 fixed name inside the session directory. Loopback is not authentication on its own, so it
 also refuses a request whose Host is not loopback, or whose Origin is not the page's own.
+Each session has a durable identity, so a browser retry cannot land in another session if
+an operating system later reuses the same loopback port.
 
 ## Session state
 
@@ -95,13 +99,22 @@ never shows up in `git status`. They are resumable, which matters because the la
 that most need underwriting are the ones nobody finishes in one sitting.
 
 ```
-session.json     facts, audience, plan, status, cursor, what lands
-beats/01.json    one file per beat, written as it is walked
-pr.diff          the saved diff
+session.sqlite3  authoritative versioned session, beats, action queue, and receipts
+session.json     derived compatibility export
+beats/01.json    derived compatibility export of one beat
+decisions.jsonl  derived compatibility export of reviewer actions
+ack.json         derived compatibility export of the handled cursor
+pr.diff          saved review input
 report.html      rendered, regenerable
 ```
 
-The three scripts are Python 3 stdlib, no dependencies. `serve.py` runs the walk.
+The scripts are Python 3 stdlib, with no dependencies. `serve.py` runs the walk and
+`sessionctl.py` is the only command-line mutation path. SQLite commits a reviewer action
+with its local beat change, deduplicates retries by action ID, and stores navigation as an
+absolute application receipt. A crash before commit changes nothing; a crash after commit
+resumes from the stored result without moving twice. JSON is regenerated from SQLite and
+is never authoritative once the database exists.
+
 `render-report.py` turns a session into the page and validates it on the way through: a
 flag with no fix, a clean beat with no proof, a proof naming no command, or a beat you
 accepted that landed nothing gets an `UNPROVEN` chip and exit 2. Review mode permits that

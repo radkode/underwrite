@@ -67,7 +67,15 @@ class BeatValidation(unittest.TestCase):
         self.assertIn("accepted, nothing landed", problems[0])
 
     def test_accepted_naming_what_it_landed_is_shippable(self):
-        self.assertEqual(rr.validate(beat(state="accepted", landed="961eb58")), [])
+        self.assertEqual(
+            rr.validate(beat(
+                state="accepted",
+                landed="961eb58",
+                delivery_kind="commit",
+                branch="jacek/fix",
+            )),
+            [],
+        )
 
     def test_landing_something_on_a_beat_nobody_resolved_is_not_shippable(self):
         """A decision given in words reached no server, so the state never moved. The
@@ -90,12 +98,31 @@ class BeatValidation(unittest.TestCase):
     def test_a_final_review_accept_naming_the_post_is_shippable(self):
         self.assertEqual(
             rr.validate(
-                beat(state="accepted", landed="https://example.test/review/2"),
+                beat(
+                    state="accepted",
+                    landed="https://example.test/review/2",
+                    delivery_kind="review",
+                ),
                 "review",
                 final=True,
             ),
             [],
         )
+
+    def test_a_landing_must_match_the_audience(self):
+        branch = rr.validate(beat(
+            state="accepted",
+            landed="https://example.test/review/2",
+            delivery_kind="review",
+        ))
+        review = rr.validate(
+            beat(state="accepted", landed="abc1234", delivery_kind="commit"),
+            "review",
+            final=True,
+        )
+
+        self.assertIn("expected commit delivery", branch[0])
+        self.assertIn("expected review delivery", review[0])
 
     def test_every_beat_needs_a_what(self):
         problems = rr.validate(beat(slots={"proof": "a.ts:1"}))
@@ -578,13 +605,32 @@ class RenderCli(unittest.TestCase):
                 "where": review_url,
             }],
         })
-        self.put(beat(n=1, state="accepted", landed=review_url))
+        self.put(beat(
+            n=1,
+            state="accepted",
+            landed=review_url,
+            delivery_kind="review",
+        ))
 
         done = self.run_cli("--final")
 
         self.assertEqual(done.returncode, 0)
         self.assertIn("What lands", self.page())
         self.assertIn(review_url, self.page())
+
+    def test_legacy_landed_beats_infer_the_delivery_kind(self):
+        self.put(beat(
+            n=1, state="accepted", landed="abc1234", branch="jacek/fix"
+        ))
+        self.assertEqual(self.run_cli("--final").returncode, 0)
+
+        review_url = "https://example.test/review/2"
+        self.session({
+            "repo": "acme/widget",
+            "audience": {"mode": "review", "why": "another reviewer owns the PR"},
+        })
+        self.put(beat(n=1, state="accepted", landed=review_url))
+        self.assertEqual(self.run_cli("--final").returncode, 0)
 
     def test_a_malformed_audience_is_reported_without_crashing(self):
         self.session({"repo": "acme/widget", "audience": "review"})
@@ -621,6 +667,18 @@ class RenderCli(unittest.TestCase):
         self.assertIn("render-report:", done.stderr)
         self.assertFalse((self.root / "report.html").exists())
 
+    def test_the_database_wins_over_corrupt_legacy_exports(self):
+        self.put(beat(n=1))
+        store = rr.SessionStore(self.root)
+        store.put_session(dict(store.snapshot()[0], title="authoritative"))
+        (self.root / "session.json").write_text("{ stale", encoding="utf-8")
+        (self.root / "beats" / "01.json").write_text("{ stale", encoding="utf-8")
+
+        done = self.run_cli()
+
+        self.assertEqual(done.returncode, 0)
+        self.assertIn("authoritative", self.page())
+
     def test_a_usage_error_exits_1_rather_than_naming_a_beat_to_fix(self):
         """argparse spends 2 on this, and 2 already means "rendered, go fix a beat".
         A mistyped flag sent the walk looking for a page that was never written."""
@@ -647,6 +705,45 @@ class RenderCli(unittest.TestCase):
         self.assertIn('data-action="note"', self.page())
         self.run_cli()
         self.assertNotIn("data-action", self.page())
+
+    def test_live_reuses_an_action_id_until_the_request_succeeds(self):
+        self.put(beat(n=1))
+        self.run_cli("--live")
+
+        page = self.page()
+        self.assertIn("underwrite.pending-action", page)
+        self.assertIn("session_id: sessionId", page)
+        self.assertIn("pending.session_id !== sessionId", page)
+        self.assertIn("sessionId !== incomingSessionId", page)
+        self.assertIn("location.reload()", page)
+        self.assertIn("pending && !sameAction(pending, fresh)", page)
+        self.assertIn("retry the saved", page)
+        self.assertIn("if (pending && state.head_id === pending.id)", page)
+        self.assertIn("sent.status >= 400 && sent.status < 500", page)
+        self.assertIn("sendAction(pending)", page)
+        self.assertIn("!connected || !usable || awaitingSeq !== null", page)
+        self.assertIn("body: JSON.stringify(payload)", page)
+        response_guard = page.index("if (!sent.ok)")
+        self.assertGreater(page.index("remember(null)", response_guard), response_guard)
+
+    def test_live_first_sync_and_content_swaps_preserve_drafts(self):
+        self.put(beat(n=1))
+        self.run_cli("--live")
+
+        page = self.page()
+        self.assertIn("const drafts = new Map", page)
+        self.assertIn("note.value = drafts.get(row.dataset.acts)", page)
+        self.assertIn("requestSwap(state.rev)", page)
+        self.assertIn("if (!response.ok)", page)
+        self.assertIn("rev = targetRev", page)
+        self.assertIn("rev !== desiredRev", page)
+        self.assertIn("restorePending()", page)
+        self.assertIn(
+            "enable(!sending && connected && usable && awaitingSeq === null)", page
+        )
+        self.assertIn("enable(connected && usable && awaitingSeq === null)", page)
+        self.assertIn("receipt.seq > observedSeq", page)
+        self.assertIn("observedSeq >= awaitingSeq", page)
 
     def test_out_puts_the_page_where_it_is_told(self):
         self.put(beat(n=1))

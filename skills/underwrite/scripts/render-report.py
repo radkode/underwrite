@@ -2,7 +2,7 @@
 """
 Render an underwrite session into a self-contained report page.
 
-Reads <session-dir>/session.json and <session-dir>/beats/*.json, inlines
+Reads the authoritative session database, falling back to legacy JSON, inlines
 assets/report.css, and writes one HTML file that makes no external requests.
 
 Output is a body fragment, which is what the Artifact tool wants. Pass
@@ -20,8 +20,15 @@ import argparse
 import html
 import json
 import re
+import sqlite3
 import sys
 from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from session_store import SessionStore, StoreError
 
 SLOTS = ("what", "why", "proof", "risk", "prior", "fix")
 STATES = ("clean", "flag", "unverified", "accepted", "dropped", "decided")
@@ -67,40 +74,194 @@ LIVE_JS = """<script>
 (() => {
   const live = document.getElementById('live');
   const body = document.getElementById('live-body');
-  let rev = null, known = new Set(), usable = false, sending = false;
+  const pendingKey = 'underwrite.pending-action';
+  let rev = null, known = new Set(), usable = false, connected = false, sessionId = null;
+  let sending = false, pending = null;
+  let desiredRev = null, swapPromise = null, swapRetry = null, resumedPending = false;
+  let retryWhenIdle = false;
+  let observedSeq = 0, awaitingSeq = null;
+
+  try { pending = JSON.parse(sessionStorage.getItem(pendingKey)); } catch (_) {}
+  if (!pending || typeof pending.id !== 'string'
+      || typeof pending.session_id !== 'string') {
+    pending = null;
+    try { sessionStorage.removeItem(pendingKey); } catch (_) {}
+  }
+
+  function remember(value) {
+    pending = value;
+    try {
+      if (value) sessionStorage.setItem(pendingKey, JSON.stringify(value));
+      else sessionStorage.removeItem(pendingKey);
+    } catch (_) {}
+  }
 
   const beatIds = () => new Set([...document.querySelectorAll('.beat')].map(d => d.dataset.n));
   const openIds = () => new Set([...document.querySelectorAll('.beat[open]')].map(d => d.dataset.n));
+
+  const rowKey = value => value.n === null ? 'walk' : String(value.n);
+  const sameAction = (left, right) => left.session_id === right.session_id
+    && left.n === right.n
+    && left.action === right.action && left.note === right.note;
+  const actionRow = value => [...document.querySelectorAll('.acts')]
+    .find(row => row.dataset.acts === rowKey(value));
+
+  function showMessage(value, text) {
+    const row = actionRow(value);
+    const msg = row && row.querySelector('.act-msg');
+    if (msg) msg.textContent = text;
+  }
+
+  function restorePending() {
+    if (!pending || pending.session_id !== sessionId) return;
+    const row = actionRow(pending);
+    const note = row && row.querySelector('.note');
+    if (note) note.value = pending.note || '';
+    showMessage(pending, 'retry pending ' + pending.action);
+  }
 
   // Acting mid-action races the walk, so the controls close while one is running. They
   // stay open when no walk is listening: the call is appended either way, and a page
   // that goes dead the moment nobody is home is how a session looks broken when it is
   // only unattended.
   function applyState(state) {
+    const incomingSessionId = typeof state.session_id === 'string' && state.session_id
+      ? state.session_id : null;
+    if (!incomingSessionId) {
+      usable = false;
+      enable(false);
+      return;
+    }
+    if (sessionId && sessionId !== incomingSessionId) {
+      remember(null);
+      sessionId = null;
+      usable = false;
+      enable(false);
+      location.reload();
+      return;
+    }
+    sessionId = incomingSessionId;
+    if (pending && pending.session_id !== sessionId) remember(null);
     const status = state.status || {};
     const phase = status.phase || 'working';
     const listening = state.listening !== false;
-    usable = listening ? phase === 'parked' : true;
+    const queued = state.seq !== state.handled_seq;
+    observedSeq = state.seq;
+    if (awaitingSeq !== null && observedSeq >= awaitingSeq) awaitingSeq = null;
+    if (pending && state.head_id === pending.id) remember(null);
+    usable = !queued && (listening ? phase === 'parked' : true);
     live.className = 'live ' + (listening ? phase : 'away');
     live.textContent = listening
       ? (status.text || phase)
       : 'no walk is listening, your call is saved for whenever one returns';
-    if (!sending) enable(usable);
+    if (!sending) enable(connected && usable && awaitingSeq === null);
   }
 
   const enable = on => document.querySelectorAll('.act, .note')
     .forEach(el => el.disabled = !on);
 
-  async function swap() {
+  async function swap(targetRev) {
+    const response = await fetch('./fragment');
+    if (!response.ok) throw new Error(await response.text() || response.status);
+    const fragment = await response.text();
     const open = openIds();
-    body.innerHTML = await (await fetch('./fragment')).text();
+    const drafts = new Map([...document.querySelectorAll('.acts')].map(row => {
+      const note = row.querySelector('.note');
+      return [row.dataset.acts, note ? note.value : null];
+    }));
+    const focused = document.activeElement && document.activeElement.closest('.acts');
+    const focusKey = focused ? focused.dataset.acts : null;
+    const selection = document.activeElement && document.activeElement.classList.contains('note')
+      ? [document.activeElement.selectionStart, document.activeElement.selectionEnd]
+      : null;
+    body.innerHTML = fragment;
     document.querySelectorAll('.beat').forEach(d => {
       if (open.has(d.dataset.n)) d.open = true;
       if (!known.has(d.dataset.n)) d.classList.add('is-new');
     });
+    document.querySelectorAll('.acts').forEach(row => {
+      const note = row.querySelector('.note');
+      if (note && drafts.has(row.dataset.acts) && drafts.get(row.dataset.acts) !== null) {
+        note.value = drafts.get(row.dataset.acts) || '';
+      }
+      if (note && row.dataset.acts === focusKey) {
+        note.focus();
+        if (selection) note.setSelectionRange(selection[0], selection[1]);
+      }
+    });
     known = beatIds();
     wire();
-    enable(usable);
+    restorePending();
+    enable(!sending && connected && usable && awaitingSeq === null);
+    rev = targetRev;
+  }
+
+  function requestSwap(targetRev) {
+    desiredRev = targetRev;
+    if (swapPromise || rev === desiredRev) return;
+    enable(false);
+    swapPromise = swap(desiredRev)
+      .catch(() => {})
+      .finally(() => {
+        swapPromise = null;
+        if (connected && rev !== desiredRev) {
+          clearTimeout(swapRetry);
+          swapRetry = setTimeout(() => requestSwap(desiredRev), 250);
+        }
+      });
+  }
+
+  async function sendAction(payload) {
+    if (sending || !connected || !usable || awaitingSeq !== null
+        || payload.session_id !== sessionId) return false;
+    remember(payload);
+    sending = true;
+    enable(false);
+    showMessage(payload, 'sending');
+    let rejected = false;
+    try {
+      const sent = await fetch('./act', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      if (!sent.ok) {
+        const detail = (await sent.text()).trim() || sent.status;
+        rejected = sent.status >= 400 && sent.status < 500;
+        if (rejected) remember(null);
+        throw new Error(detail);
+      }
+      const receipt = await sent.json();
+      awaitingSeq = Number.isInteger(receipt.seq) && receipt.seq > observedSeq
+        ? receipt.seq : null;
+      remember(null);
+      showMessage(payload, '');
+    } catch (err) {
+      showMessage(
+        payload,
+        rejected || (pending && pending.id === payload.id)
+          ? 'not sent, ' + err.message : 'saved'
+      );
+    } finally {
+      sending = false;
+      enable(connected && usable && awaitingSeq === null);
+      if (retryWhenIdle) {
+        retryWhenIdle = false;
+        resumePending();
+      }
+    }
+    return true;
+  }
+
+  function resumePending() {
+    if (!pending || pending.session_id !== sessionId || resumedPending
+        || !connected || !usable || awaitingSeq !== null) return;
+    if (sending) {
+      retryWhenIdle = true;
+      return;
+    }
+    resumedPending = true;
+    sendAction(pending);
   }
 
   async function act(button) {
@@ -108,38 +269,34 @@ LIVE_JS = """<script>
     const n = row.dataset.acts;
     const note = row.querySelector('.note');
     const msg = row.querySelector('.act-msg');
-    sending = true;
-    enable(false);
-    msg.textContent = 'sending';
-    try {
-      const sent = await fetch('./act', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          n: n === 'walk' ? null : +n,
-          action: button.dataset.action,
-          note: note ? note.value.trim() : '',
-        }),
-      });
-      if (!sent.ok) throw new Error((await sent.text()).trim() || sent.status);
-      msg.textContent = '';
-    } catch (err) {
-      msg.textContent = 'not sent, ' + err.message;
-      enable(true);
+    const fresh = {
+      id: crypto.randomUUID(),
+      session_id: sessionId,
+      n: n === 'walk' ? null : +n,
+      action: button.dataset.action,
+      note: note ? note.value.trim() : '',
+    };
+    if (pending && !sameAction(pending, fresh)) {
+      msg.textContent = 'retry the saved ' + pending.action + ' first';
+      restorePending();
+      return;
     }
-    sending = false;
+    await sendAction(pending || fresh);
   }
 
   const wire = () => document.querySelectorAll('.act').forEach(b => b.onclick = () => act(b));
 
   const stream = new EventSource('./events');
   stream.onmessage = event => {
+    connected = true;
     const state = JSON.parse(event.data);
     applyState(state);
-    if (rev !== null && state.rev !== rev) swap();
-    rev = state.rev;
+    resumePending();
+    requestSwap(state.rev);
   };
   stream.onerror = () => {
+    connected = false;
+    resumedPending = false;
     live.className = 'live down';
     live.textContent = 'reconnecting';
     enable(false);
@@ -185,6 +342,17 @@ def validate(beat, mode="branch", final=False):
     # obligation as branch mode, with the review URL in place of a commit.
     if (mode == "branch" or final) and state == "accepted" and not beat.get("landed"):
         problems.append(f"beat {n}: accepted, nothing landed")
+    if state == "accepted" and beat.get("landed"):
+        expected_delivery = "commit" if mode == "branch" else "review"
+        if beat.get("delivery_kind") != expected_delivery:
+            problems.append(
+                f"beat {n}: landed as {beat.get('delivery_kind')!r}, "
+                f"expected {expected_delivery} delivery"
+            )
+        elif expected_delivery == "commit" and not beat.get("branch"):
+            problems.append(f"beat {n}: commit delivery has no branch")
+        elif expected_delivery == "review" and beat.get("branch"):
+            problems.append(f"beat {n}: review delivery unexpectedly names a branch")
     # The escape from that rule, for the flag whose answer is a call rather than a patch.
     # Then the words are the whole artifact, and a decided beat with none of them is the
     # same silence the rule above exists to catch.
@@ -385,11 +553,15 @@ def render(session, beats, css, problems_by_n, live=False):
 
 def load(root, css_path, final=False):
     """Read a session off disk. Returns (session, beats, problems_by_n, problems)."""
-    session = json.loads((root / "session.json").read_text(encoding="utf-8"))
-    beats = [
-        json.loads(p.read_text(encoding="utf-8"))
-        for p in sorted((root / "beats").glob("*.json"))
-    ]
+    legacy = not (root / "session.sqlite3").exists()
+    if not legacy:
+        session, beats = SessionStore(root).snapshot()
+    else:
+        session = json.loads((root / "session.json").read_text(encoding="utf-8"))
+        beats = [
+            json.loads(p.read_text(encoding="utf-8"))
+            for p in sorted((root / "beats").glob("*.json"))
+        ]
     css = css_path.read_text(encoding="utf-8")
 
     problems_by_n, problems = {}, []
@@ -405,6 +577,11 @@ def load(root, css_path, final=False):
         if mode not in ("branch", "review"):
             problems.append("session audience mode must be branch or review")
             mode = "branch"
+    if legacy:
+        expected_delivery = "commit" if mode == "branch" else "review"
+        for beat in beats:
+            if beat.get("state") == "accepted" and beat.get("landed"):
+                beat.setdefault("delivery_kind", expected_delivery)
     for beat in beats:
         found = validate(beat, mode, final)
         if found:
@@ -417,7 +594,7 @@ def load(root, css_path, final=False):
 
 
 def default_css():
-    return Path(__file__).resolve().parent.parent / "assets" / "report.css"
+    return HERE.parent / "assets" / "report.css"
 
 
 class Usage(argparse.ArgumentParser):
@@ -457,7 +634,7 @@ def main():
         session, beats, css, problems_by_n, all_problems = load(
             root, css_path, args.final
         )
-    except (OSError, json.JSONDecodeError) as err:
+    except (OSError, sqlite3.Error, StoreError, json.JSONDecodeError) as err:
         sys.exit(f"render-report: {err}")
 
     out = Path(args.out).expanduser() if args.out else root / "report.html"

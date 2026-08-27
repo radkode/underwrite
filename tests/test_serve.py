@@ -25,6 +25,7 @@ import time
 import unittest
 import urllib.error
 import urllib.request
+import uuid
 from pathlib import Path
 from unittest import mock
 
@@ -61,7 +62,13 @@ class SessionTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root, True)
         (self.root / "beats").mkdir()
         (self.root / "session.json").write_text(
-            json.dumps({"repo": "acme/widget", "number": 1, "cursor": 2}), encoding="utf-8"
+            json.dumps({
+                "repo": "acme/widget",
+                "number": 1,
+                "cursor": 2,
+                "audience": {"mode": "branch", "why": "the author owns the branch"},
+            }),
+            encoding="utf-8",
         )
         for beat in (FLAG, CLEAN):
             self.put(beat)
@@ -86,6 +93,22 @@ class SessionTest(unittest.TestCase):
         if not log.exists():
             return []
         return [json.loads(l) for l in log.read_text(encoding="utf-8").splitlines() if l.strip()]
+
+    def apply_navigation(self, seq, cursor=None):
+        """Apply the queued navigation as one absolute session transition."""
+        session, _beats = self.session.store.snapshot()
+        action = self.session.store.head()
+        if cursor is None:
+            direction = -1 if action["action"] == "back" else 1
+            cursor = max(0, session.get("cursor", 0) + direction)
+        session["cursor"] = cursor
+        applied = self.session.store.apply(
+            seq,
+            {"kind": "navigation", "cursor": cursor},
+            session=session,
+        )
+        self.session.store.export_json()
+        return applied
 
 
 class ResolvingAFlag(SessionTest):
@@ -194,39 +217,12 @@ class Concurrency(SessionTest):
         self.assertEqual(sorted(r["seq"] for r in self.decisions()), list(range(1, 9)))
 
 
-class AtomicWrites(SessionTest):
-    def test_a_failed_rename_leaves_the_beat_byte_identical(self):
-        before = self.path(1).read_bytes()
-        with mock.patch.object(serve.os, "replace", side_effect=OSError("no space")):
-            with self.assertRaises(OSError):
-                self.session.act(1, "accept", "")
-        self.assertEqual(self.path(1).read_bytes(), before)
-
-    def test_a_failed_rename_leaves_no_temp_file_behind(self):
-        with mock.patch.object(serve.os, "replace", side_effect=OSError("no space")):
-            with self.assertRaises(OSError):
-                self.session.act(1, "accept", "")
-        self.assertEqual(sorted(p.name for p in (self.root / "beats").iterdir()),
-                         ["01.json", "02.json"])
-
-    def test_a_normal_write_leaves_no_temp_file_behind(self):
-        self.session.act(1, "accept", "")
-        self.assertEqual(sorted(p.name for p in (self.root / "beats").iterdir()),
-                         ["01.json", "02.json"])
-
-    def test_a_temp_file_is_never_globbed_as_a_beat(self):
-        """The fingerprint and the renderer's loader both glob *.json, and pathlib
-        globs dotfiles too, so the temp name must not end in .json."""
-        (self.root / "beats" / "01.json.9.9.tmp").write_text("{ half written")
-        self.assertEqual(sorted(p.name for p in (self.root / "beats").glob("*.json")),
-                         ["01.json", "02.json"])
-
-
 class Parking(SessionTest):
     def test_it_returns_the_oldest_unseen_action(self):
         for _ in range(3):
             self.session.act(None, "next", "")
         self.assertEqual(self.session.wait(0.1)["seq"], 1)
+        self.apply_navigation(1)
         self.session.ack(1)
         self.assertEqual(self.session.wait(0.1)["seq"], 2)
 
@@ -241,21 +237,6 @@ class Parking(SessionTest):
                 self.assertIsNone(self.session.wait(0.01))
 
         records.assert_not_called()
-
-    def test_a_blank_line_in_the_log_does_not_fake_a_timeout(self):
-        """seq came from a line count while tail skipped blanks, so a single blank
-        line put seq past the highest record and every park answered instantly.
-        The agent is told that means nobody acted, so the walk span."""
-        (self.root / "decisions.jsonl").write_text(
-            json.dumps({"seq": 1, "n": None, "action": "next", "note": ""}) + "\n\n",
-            encoding="utf-8",
-        )
-        session = self.open_session()
-        self.assertEqual(session.seq, 1)
-        session.ack(1)
-        started = time.monotonic()
-        self.assertIsNone(session.wait(0.2))
-        self.assertGreaterEqual(time.monotonic() - started, 0.2)
 
     def test_nobody_parked_means_nobody_is_listening(self):
         self.assertFalse(self.session.snapshot()["listening"])
@@ -311,6 +292,7 @@ class Acknowledging(SessionTest):
 
     def test_an_acknowledgement_survives_restart(self):
         self.session.act(None, "next", "")
+        self.apply_navigation(1)
         self.assertEqual(self.session.ack(1), {"handled_seq": 1})
 
         resumed = self.open_session()
@@ -320,6 +302,7 @@ class Acknowledging(SessionTest):
 
     def test_an_acknowledgement_does_not_change_rendered_content(self):
         self.session.act(None, "next", "")
+        self.apply_navigation(1)
         revision = self.session.fingerprint()
 
         self.session.ack(1)
@@ -333,11 +316,22 @@ class Acknowledging(SessionTest):
         with self.assertRaises(ValueError):
             self.session.ack(2)
 
+        self.apply_navigation(1)
         self.assertEqual(self.session.ack(1), {"handled_seq": 1})
+        self.apply_navigation(2)
         self.assertEqual(self.session.ack(2), {"handled_seq": 2})
+
+    def test_an_unapplied_navigation_cannot_be_acknowledged(self):
+        self.session.act(None, "next", "")
+
+        with self.assertRaisesRegex(ValueError, "has not been applied"):
+            self.session.ack(1)
+
+        self.assertEqual(self.session.handled_seq, 0)
 
     def test_retrying_the_latest_acknowledgement_is_idempotent(self):
         self.session.act(None, "next", "")
+        self.apply_navigation(1)
         self.session.ack(1)
 
         self.assertEqual(self.session.ack(1), {"handled_seq": 1})
@@ -345,7 +339,9 @@ class Acknowledging(SessionTest):
     def test_a_late_retry_cannot_regress_the_cursor(self):
         self.session.act(None, "next", "")
         self.session.act(None, "skip", "")
+        self.apply_navigation(1)
         self.session.ack(1)
+        self.apply_navigation(2)
         self.session.ack(2)
 
         self.assertEqual(self.session.ack(1), {"handled_seq": 2})
@@ -353,66 +349,6 @@ class Acknowledging(SessionTest):
     def test_an_acknowledgement_cannot_name_an_unproduced_action(self):
         with self.assertRaises(ValueError):
             self.session.ack(1)
-
-    def test_a_failed_ack_write_does_not_advance_the_cursor(self):
-        self.session.act(None, "next", "")
-
-        with mock.patch.object(serve.os, "replace", side_effect=OSError("no space")):
-            with self.assertRaises(OSError):
-                self.session.ack(1)
-
-        self.assertEqual(self.session.handled_seq, 0)
-
-    def test_legacy_actions_are_migrated_as_already_handled(self):
-        (self.root / "ack.json").unlink()
-        (self.root / "decisions.jsonl").write_text(
-            json.dumps({"seq": 1, "n": None, "action": "next", "note": ""}) + "\n",
-            encoding="utf-8",
-        )
-
-        resumed = self.open_session()
-
-        self.assertEqual(resumed.handled_seq, 1)
-        self.assertIsNone(resumed.wait(0.05))
-
-    def test_a_missing_ack_is_rejected_after_cursor_aware_actions(self):
-        self.session.act(None, "next", "")
-        (self.root / "ack.json").unlink()
-
-        with self.assertRaisesRegex(ValueError, "missing from a cursor-aware session"):
-            self.open_session()
-
-    def test_an_unknown_action_delivery_version_is_rejected(self):
-        (self.root / "decisions.jsonl").write_text(
-            json.dumps({
-                "seq": 1, "n": None, "action": "next", "note": "",
-                "delivery_version": 2,
-            }) + "\n",
-            encoding="utf-8",
-        )
-
-        with self.assertRaisesRegex(ValueError, "unsupported action delivery version: 2"):
-            self.open_session()
-
-    def test_an_ack_file_that_is_not_an_object_is_rejected(self):
-        (self.root / "ack.json").write_text("[]", encoding="utf-8")
-
-        with self.assertRaisesRegex(ValueError, "must be a JSON object"):
-            self.open_session()
-
-    def test_an_ack_file_with_the_wrong_version_is_rejected(self):
-        (self.root / "ack.json").write_text(
-            json.dumps({"version": 2, "handled_seq": 0}), encoding="utf-8")
-
-        with self.assertRaisesRegex(ValueError, "version must be 1"):
-            self.open_session()
-
-    def test_an_ack_file_cannot_be_ahead_of_the_action_log(self):
-        (self.root / "ack.json").write_text(
-            json.dumps({"version": 1, "handled_seq": 1}), encoding="utf-8")
-
-        with self.assertRaisesRegex(ValueError, "ahead of produced seq 0"):
-            self.open_session()
 
     def test_snapshot_names_the_action_and_handled_cursors_once(self):
         self.session.act(None, "next", "")
@@ -459,50 +395,57 @@ class StatusSize(SessionTest):
         self.assertEqual(len(stored["text"]), serve.MAX_STATUS_TEXT)
 
 
-class ATornLog(SessionTest):
-    """ENOSPC or a power loss during the append leaves a half-written last line.
-    Refusing to parse it stranded the session the log exists to preserve."""
+class Publishing(SessionTest):
+    def test_concurrent_publishers_deliver_snapshots_in_capture_order(self):
+        channel = self.session.subscribe()
+        gate = threading.Condition()
+        snapshot_calls = 0
+        lock_attempts = 0
 
-    TORN = '{"seq": 1, "n": null, "action": "next", "note": ""}\n{"seq": 2, "n'
+        class ObservedLock:
+            def __init__(inner_self):
+                inner_self.lock = threading.Lock()
 
-    def tear(self):
-        (self.root / "decisions.jsonl").write_text(self.TORN, encoding="utf-8")
+            def __enter__(inner_self):
+                nonlocal lock_attempts
+                with gate:
+                    lock_attempts += 1
+                    gate.notify_all()
+                inner_self.lock.acquire()
 
-    def test_the_readable_records_still_load(self):
-        self.tear()
-        session = self.open_session()
-        self.assertEqual([r["seq"] for r in session.records()], [1])
-        self.assertEqual(session.seq, 1)
+            def __exit__(inner_self, *_args):
+                inner_self.lock.release()
 
-    def test_a_park_answers_instead_of_raising(self):
-        """A live server used to answer every /await with a 500 once this landed."""
-        self.tear()
-        session = self.open_session()
-        session.ack(1)
-        self.assertIsNone(session.wait(0.05))
+        def snapshot():
+            nonlocal snapshot_calls
+            with gate:
+                snapshot_calls += 1
+                captured = snapshot_calls
+                gate.notify_all()
+                if captured == 1:
+                    gate.wait_for(
+                        lambda: snapshot_calls >= 2 or lock_attempts >= 2,
+                        timeout=2,
+                    )
+            return {"seq": captured}
 
-    def test_the_next_decision_does_not_fuse_onto_it(self):
-        """The torn line stays where it is. What matters is that the next record gets
-        a line of its own, rather than being appended onto the stump and lost too."""
-        self.tear()
-        session = self.open_session()
-        session.act(None, "next", "")
-        self.assertEqual([r["seq"] for r in session.records()], [1, 2])
-        lines = (self.root / "decisions.jsonl").read_text(encoding="utf-8").splitlines()
-        self.assertEqual(lines[1], '{"seq": 2, "n')
-        self.assertEqual(json.loads(lines[2])["seq"], 2)
-
-    def test_a_log_ending_cleanly_gains_no_blank_line(self):
-        session = self.open_session()
-        session.act(None, "next", "")
-        session.act(None, "next", "")
-        self.assertNotIn(
-            "\n\n", (self.root / "decisions.jsonl").read_text(encoding="utf-8"))
+        self.session.lock = ObservedLock()
+        self.session.snapshot = snapshot
+        first = threading.Thread(target=self.session.publish)
+        second = threading.Thread(target=self.session.publish)
+        first.start()
+        with gate:
+            self.assertTrue(gate.wait_for(lambda: snapshot_calls == 1, timeout=2))
+        second.start()
+        first.join(2)
+        second.join(2)
+        self.assertFalse(first.is_alive())
+        self.assertFalse(second.is_alive())
+        self.assertEqual([channel.get()["seq"], channel.get()["seq"]], [1, 2])
 
 
 class Watching(SessionTest):
-    """The watcher is what makes a beat the agent wrote straight to disk, which is
-    every beat, show up on a page nobody told about it.
+    """The watcher makes a transaction from another process reach the live page.
 
     Driven a reading at a time rather than by a thread and a sleep, because the loop
     has no baseline until its first reading lands. A test that raced that tick saw no
@@ -537,8 +480,9 @@ class Watching(SessionTest):
         finally:
             del self.session.stop.wait
 
-    def test_a_beat_written_behind_its_back_still_reaches_the_page(self):
-        self.readings(lambda: self.put(dict(FLAG, state="dropped")))
+    def test_a_beat_committed_through_another_connection_reaches_the_page(self):
+        other = serve.SessionStore(self.root)
+        self.readings(lambda: other.put_beat(dict(FLAG, claim="updated claim")))
         self.assertEqual(self.channel.get_nowait()["rev"], self.session.fingerprint())
 
     def test_a_reading_that_matches_the_last_one_publishes_nothing(self):
@@ -547,15 +491,10 @@ class Watching(SessionTest):
         self.readings(lambda: None)
         self.assertTrue(self.channel.empty())
 
-    def test_a_file_that_vanishes_does_not_take_the_watcher_with_it(self):
-        """It runs on a daemon thread nobody joins, so an exception here is silent:
-        the page simply stops updating for the rest of the session."""
-        kept = (self.root / "session.json").read_bytes()
-        self.readings(
-            lambda: (self.root / "session.json").unlink(),
-            lambda: (self.root / "session.json").write_bytes(kept),
-        )
-        self.assertIsNotNone(self.channel.get_nowait())
+    def test_an_action_committed_through_another_connection_reaches_the_page(self):
+        other = serve.SessionStore(self.root)
+        self.readings(lambda: other.produce("external-action", None, "next", ""))
+        self.assertEqual(self.channel.get_nowait()["seq"], 1)
 
 
 class HotReload(SessionTest):
@@ -636,6 +575,13 @@ class Served(SessionTest):
         self.url = "http://127.0.0.1:%d" % self.port
 
     def post(self, route, body):
+        if route == "/act" and isinstance(body, dict):
+            body = {
+                "session_id": self.session.snapshot()["session_id"],
+                **body,
+            }
+            if "id" not in body:
+                body = {**body, "id": str(uuid.uuid4())}
         request = urllib.request.Request(
             self.url + route, data=json.dumps(body).encode(), method="POST",
             headers={"Content-Type": "application/json"},
@@ -666,13 +612,20 @@ class Served(SessionTest):
 
 
 class Requests(Served):
+    def test_state_exposes_the_durable_session_identity(self):
+        state = json.loads(self.get("/state")[1])
+
+        self.assertEqual(state["session_id"], self.session.snapshot()["session_id"])
+
     def test_an_accept_over_http_resolves_the_flag(self):
         status, body = self.post("/act", {"n": 1, "action": "accept", "note": "yes"})
         action = json.loads(body)
         self.assertEqual(status, 200)
         self.assertEqual(action["seq"], 1)
         self.assertEqual(set(action), set(serve.ACTION_FIELDS))
-        self.assertEqual(self.decisions()[0]["delivery_version"], serve.CURSOR_VERSION)
+        self.assertEqual(action["state"], "applied")
+        self.assertEqual(action["result"]["state"], "accepted")
+        self.assertEqual(self.decisions()[0]["action_id"], action["id"])
         self.assertEqual(self.beat(1)["state"], "accepted")
 
     def test_a_decide_over_http_resolves_the_flag(self):
@@ -682,6 +635,7 @@ class Requests(Served):
 
     def test_an_ack_over_http_advances_the_handled_cursor(self):
         self.session.act(None, "next", "")
+        self.apply_navigation(1)
 
         status, body = self.post("/ack", {"seq": 1})
 
@@ -695,8 +649,16 @@ class Requests(Served):
 
         status, body = self.post("/ack", {"seq": 2})
 
-        self.assertEqual(status, 400)
-        self.assertIn("oldest unhandled action is 1", body)
+        self.assertEqual(status, 409)
+        self.assertIn("action 1 is at the head", body)
+
+    def test_an_unapplied_navigation_cannot_be_acknowledged(self):
+        self.session.act(None, "next", "")
+
+        status, body = self.post("/ack", {"seq": 1})
+
+        self.assertEqual(status, 409)
+        self.assertIn("has not been applied", body)
 
     def test_an_ack_requires_a_non_negative_integer(self):
         self.session.act(None, "next", "")
@@ -731,8 +693,111 @@ class Requests(Served):
         self.assertEqual(status, 400)
         self.assertIn("action must be one of", body)
 
+    def test_an_action_requires_a_stable_nonempty_id(self):
+        for action_id in (None, "", "   "):
+            with self.subTest(action_id=action_id):
+                status, body = self.post(
+                    "/act", {"id": action_id, "action": "next"}
+                )
+                self.assertEqual(status, 400)
+                self.assertIn("id must be non-empty text", body)
+
+    def test_an_action_with_no_id_answers_400(self):
+        payload = json.dumps({"action": "next"})
+        answer = self.raw(
+            "POST /act HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(payload)}\r\n\r\n{payload}"
+        )
+
+        self.assertIn("400", answer)
+        self.assertEqual(self.session.seq, 0)
+
+    def test_an_action_with_no_session_identity_answers_400(self):
+        payload = json.dumps({"id": "missing-session", "action": "next"})
+        answer = self.raw(
+            "POST /act HTTP/1.1\r\n"
+            "Host: 127.0.0.1\r\n"
+            "Content-Type: application/json\r\n"
+            f"Content-Length: {len(payload)}\r\n\r\n{payload}"
+        )
+
+        self.assertIn("400", answer)
+        self.assertEqual(self.session.seq, 0)
+
+    def test_an_action_for_another_session_is_refused(self):
+        status, body = self.post(
+            "/act",
+            {"session_id": "another-session", "action": "next"},
+        )
+
+        self.assertEqual(status, 409)
+        self.assertIn("session identity does not match", body)
+        self.assertEqual(self.session.seq, 0)
+
+    def test_retrying_the_same_action_id_returns_the_same_action(self):
+        payload = {"id": "retry-accept", "n": 1, "action": "accept", "note": "yes"}
+
+        first = self.post("/act", payload)
+        second = self.post("/act", payload)
+
+        self.assertEqual(first, second)
+        self.assertEqual(first[0], 200)
+        self.assertEqual(len(self.decisions()), 1)
+
+    def test_a_500_after_commit_is_safe_to_retry_with_the_same_id(self):
+        payload = {"id": "retry-after-export", "n": 1, "action": "accept", "note": "yes"}
+        original = self.session.store.export_json
+        calls = []
+
+        def flaky_export():
+            calls.append(True)
+            if len(calls) == 1:
+                raise OSError("projection failed")
+            return original()
+
+        with mock.patch.object(self.session.store, "export_json", side_effect=flaky_export):
+            first = self.post("/act", payload)
+            second = self.post("/act", payload)
+
+        self.assertEqual(first[0], 500)
+        self.assertEqual(second[0], 200)
+        self.assertEqual(json.loads(second[1])["seq"], 1)
+        self.assertEqual(len(self.decisions()), 1)
+
+    def test_reusing_an_action_id_for_different_input_answers_409(self):
+        first = {"id": "conflicting-id", "n": 1, "action": "accept", "note": "yes"}
+        self.assertEqual(self.post("/act", first)[0], 200)
+
+        status, body = self.post("/act", {**first, "note": "different"})
+
+        self.assertEqual(status, 409)
+        self.assertIn("names a different action", body)
+
+    def test_resolving_an_already_resolved_beat_answers_409(self):
+        self.assertEqual(self.post("/act", {"n": 1, "action": "drop"})[0], 200)
+
+        status, body = self.post("/act", {"n": 1, "action": "accept"})
+
+        self.assertEqual(status, 409)
+        self.assertIn("cannot become accepted", body)
+
     def test_a_beat_number_that_is_not_a_number_answers_400(self):
-        self.assertEqual(self.post("/act", {"n": "abc", "action": "accept"})[0], 400)
+        for value in ("abc", True, 1.5, [], {}):
+            with self.subTest(value=value):
+                self.assertEqual(
+                    self.post("/act", {"n": value, "action": "accept"})[0], 400
+                )
+
+    def test_a_note_that_is_not_text_answers_400(self):
+        for value in (True, 1, [], {}):
+            with self.subTest(value=value):
+                status, body = self.post(
+                    "/act", {"n": 1, "action": "accept", "note": value}
+                )
+                self.assertEqual(status, 400)
+                self.assertIn("note must be text", body)
 
     def test_a_beat_that_does_not_exist_answers_400(self):
         status, body = self.post("/act", {"n": 99, "action": "accept"})
@@ -744,6 +809,17 @@ class Requests(Served):
         self.assertEqual(status, 200)
         self.assertEqual(json.loads(body)["phase"], "parked")
         self.assertEqual(json.loads(self.get("/state")[1])["status"]["phase"], "parked")
+
+    def test_status_rejects_invalid_fields(self):
+        for payload in (
+            {"phase": 42, "text": "waiting"},
+            {"phase": "unknown", "text": "waiting"},
+            {"phase": "parked", "text": 42},
+        ):
+            with self.subTest(payload=payload):
+                status, body = self.post("/status", payload)
+                self.assertEqual(status, 400)
+                self.assertTrue(body)
 
     def test_the_live_page_carries_the_controls(self):
         status, page = self.get("/")
@@ -773,7 +849,13 @@ class Forgery(Served):
         return self.raw("\r\n".join(lines) + "\r\n\r\n" + body)
 
     def act_body(self):
-        return json.dumps({"n": 1, "action": "accept", "note": "not the reviewer"})
+        return json.dumps({
+            "id": "forgery-test",
+            "session_id": self.session.snapshot()["session_id"],
+            "n": 1,
+            "action": "accept",
+            "note": "not the reviewer",
+        })
 
     def test_a_rebound_host_cannot_read_the_session(self):
         """DNS rebinding: the browser sends the name it navigated to, so refusing
@@ -876,6 +958,7 @@ class Streaming(Served):
         first = self.frames(self.stream()[1])[0]
         self.assertEqual(first["seq"], 0)
         self.assertEqual(first["status"]["phase"], "starting")
+        self.assertEqual(first["session_id"], self.session.snapshot()["session_id"])
         self.assertFalse(first["listening"])
 
     def test_an_action_reaches_the_page_without_it_asking(self):
@@ -938,12 +1021,17 @@ class Awaiting(Served):
         action = json.loads(body)
         self.assertEqual(status, 200)
         self.assertEqual(action["action"], "accept")
+        self.assertEqual(action["state"], "applied")
+        self.assertEqual(action["result"]["state"], "accepted")
         self.assertEqual(set(action), set(serve.ACTION_FIELDS))
 
     def test_a_caller_cursor_cannot_skip_an_unhandled_action(self):
         self.session.act(None, "next", "")
 
-        self.assertEqual(json.loads(self.get("/await?after=1")[1])["action"], "next")
+        action = json.loads(self.get("/await?after=1")[1])
+        self.assertEqual(action["action"], "next")
+        self.assertEqual(action["state"], "produced")
+        self.assertIsNone(action["result"])
 
     def test_it_redelivers_until_ack_then_exposes_the_next_action(self):
         self.session.act(None, "next", "")
@@ -951,12 +1039,14 @@ class Awaiting(Served):
 
         self.assertEqual(json.loads(self.get("/await")[1])["action"], "next")
         self.assertEqual(json.loads(self.get("/await")[1])["action"], "next")
+        self.apply_navigation(1)
         self.post("/ack", {"seq": 1})
         self.assertEqual(json.loads(self.get("/await")[1])["action"], "skip")
 
     def test_an_ack_that_finishes_before_wait_starts_cannot_redeliver(self):
         self.session.act(None, "next", "")
         self.session.act(None, "skip", "")
+        self.apply_navigation(1)
         original_wait = self.session.wait
         entered = threading.Barrier(2)
         release = threading.Event()
@@ -1079,20 +1169,41 @@ class Lifecycle(unittest.TestCase):
             proc.wait(timeout=10)
 
         first, url = start()
+        with urllib.request.urlopen(url + "/state", timeout=5) as response:
+            session_id = json.loads(response.read())["session_id"]
         request = urllib.request.Request(
-            url + "/act", data=b'{"action":"next"}', method="POST",
+            url + "/act",
+            data=json.dumps({
+                "id": "lifecycle-next",
+                "session_id": session_id,
+                "action": "next",
+            }).encode(),
+            method="POST",
             headers={"Content-Type": "application/json"},
         )
         with urllib.request.urlopen(request, timeout=5) as response:
             self.assertEqual(json.loads(response.read())["seq"], 1)
         stop(first)
 
+        store = serve.SessionStore(self.root)
+        session, _beats = store.snapshot()
+        session["cursor"] = 1
+        store.apply(
+            1,
+            {"kind": "navigation", "cursor": 1},
+            session=session,
+        )
+        store.export_json()
+
         second, url = start()
         with urllib.request.urlopen(url + "/state", timeout=5) as response:
             state = json.loads(response.read())
         self.assertEqual((state["seq"], state["handled_seq"]), (1, 0))
         with urllib.request.urlopen(url + "/await", timeout=5) as response:
-            self.assertEqual(json.loads(response.read())["action"], "next")
+            action = json.loads(response.read())
+        self.assertEqual(action["action"], "next")
+        self.assertEqual(action["state"], "applied")
+        self.assertEqual(action["result"]["cursor"], 1)
         request = urllib.request.Request(
             url + "/ack", data=b'{"seq":1}', method="POST",
             headers={"Content-Type": "application/json"},
@@ -1158,7 +1269,7 @@ class Lifecycle(unittest.TestCase):
             capture_output=True, text=True,
         )
         self.assertEqual(done.returncode, 1)
-        self.assertIn("no session.json", done.stderr)
+        self.assertIn("no session database or session.json", done.stderr)
 
     def test_a_usage_error_exits_1_like_the_header_says(self):
         """argparse spends 2 on this, and 2 is the code the other two scripts use for
@@ -1183,9 +1294,9 @@ class OneServerPerSession(unittest.TestCase):
         (self.root / "session.json").write_text(
             json.dumps({"repo": "acme/widget"}), encoding="utf-8")
 
-    def start(self):
+    def start(self, root=None):
         proc = subprocess.Popen(
-            [sys.executable, str(SCRIPTS / "serve.py"), str(self.root)],
+            [sys.executable, str(SCRIPTS / "serve.py"), str(root or self.root)],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
         # Reversed, so it reads as kill then reap. Killing alone leaves a zombie and
@@ -1243,6 +1354,23 @@ class OneServerPerSession(unittest.TestCase):
         (self.root / "serve.json").write_text(
             json.dumps({"url": "http://127.0.0.1:9", "pid": os.getpid()}), encoding="utf-8")
         self.assertTrue(self.start().stdout.readline().startswith("http://127.0.0.1:"))
+
+    def test_a_stale_url_now_serving_another_session_does_not_block_a_start(self):
+        other = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, other, True)
+        (other / "beats").mkdir()
+        (other / "session.json").write_text(
+            json.dumps({"repo": "acme/other"}), encoding="utf-8"
+        )
+        other_url = self.start(other).stdout.readline().strip()
+        (self.root / "serve.json").write_text(
+            json.dumps({"url": other_url, "pid": os.getpid()}), encoding="utf-8"
+        )
+
+        own_url = self.start().stdout.readline().strip()
+
+        self.assertTrue(own_url.startswith("http://127.0.0.1:"))
+        self.assertNotEqual(own_url, other_url)
 
 
 if __name__ == "__main__":
