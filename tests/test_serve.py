@@ -117,6 +117,7 @@ class ResolvingAFlag(SessionTest):
         self.assertEqual(record["seq"], 1)
         self.assertEqual(self.beat(1)["state"], "accepted")
         self.assertEqual(self.beat(1)["call"], "yes, pin it")
+        self.assertEqual(self.session.status["text"], "picking up your decision")
 
     def test_a_flag_resolves_only_once(self):
         self.session.act(1, "accept", "")
@@ -148,21 +149,19 @@ class ResolvingAFlag(SessionTest):
 
 
 class Deciding(SessionTest):
-    """The yes that resolves in words rather than a commit. Without it the beat sat
-    accepted with nothing landed, which Phase 4 refuses to render clean, and the reviewer
-    was told to fix a beat file that had no legal fix."""
+    """The resolution whose recorded words complete the work."""
 
     def test_it_resolves_an_open_flag(self):
         self.session.act(1, "decide", "stays as is")
         self.assertEqual(self.beat(1)["state"], "decided")
         self.assertEqual(self.beat(1)["call"], "stays as is")
 
-    def test_it_also_takes_a_beat_the_reviewer_already_accepted(self):
-        """The click said yes. Deciding records that the yes was a call rather than a
-        patch, which is the same answer refined and not a second bite at it."""
+    def test_an_accepted_delivery_cannot_be_reclassified_as_a_decision(self):
+        self.session.store.put_beat({**FLAG, "resolution_kind": "delivery"})
         self.session.act(1, "accept", "yes")
-        self.session.act(1, "decide", "")
-        self.assertEqual(self.beat(1)["state"], "decided")
+        with self.assertRaisesRegex(ValueError, "resolution_kind 'delivery'"):
+            self.session.act(1, "decide", "stays as is")
+        self.assertEqual(self.beat(1)["state"], "accepted")
         self.assertEqual(self.beat(1)["call"], "yes")
 
     def test_it_cannot_reopen_what_the_reviewer_dropped(self):
@@ -821,10 +820,31 @@ class Requests(Served):
                 self.assertEqual(status, 400)
                 self.assertTrue(body)
 
-    def test_the_live_page_carries_the_controls(self):
+    def test_the_live_page_offers_branch_implementation_through_accept(self):
         status, page = self.get("/")
         self.assertEqual(status, 200)
-        self.assertIn('data-action="accept"', page)
+        self.assertIn('data-action="accept">Implement</button>', page)
+
+    def test_the_live_page_offers_review_inclusion_through_accept(self):
+        session, _beats = self.session.store.snapshot()
+        self.session.store.put_session({
+            **session,
+            "audience": {"mode": "review", "why": "another reviewer owns the PR"},
+        })
+
+        status, page = self.get("/")
+
+        self.assertEqual(status, 200)
+        self.assertIn('data-action="accept">Include in review</button>', page)
+
+    def test_the_live_page_offers_the_explicit_decision_action(self):
+        self.session.store.put_beat({**FLAG, "resolution_kind": "decision"})
+
+        status, page = self.get("/")
+
+        self.assertEqual(status, 200)
+        self.assertIn('data-action="decide">Record decision</button>', page)
+        self.assertNotIn('data-action="accept"', page)
 
     def test_state_reports_the_beats_it_found(self):
         self.assertEqual(json.loads(self.get("/state")[1])["beats"], 2)
@@ -1117,6 +1137,18 @@ class Fragment(Served):
         body = self.get("/fragment")[1]
         self.assertIn("s-acc", body)
         self.assertIn("yes, pin it", body)
+        self.assertIn("Implementation pending", body)
+
+    def test_it_shows_failed_delivery_without_rewriting_the_accepted_intent(self):
+        self.post("/act", {"n": 1, "action": "accept"})
+        self.session.store.fail(1, "tests failed", "repair the fixture")
+
+        body = self.get("/fragment")[1]
+
+        self.assertIn("Implementation failed", body)
+        self.assertIn("tests failed", body)
+        self.assertIn("Next attempt: repair the fixture", body)
+        self.assertIn("pin it", body)
 
 
 class QuietHangUps(unittest.TestCase):

@@ -176,9 +176,10 @@ class ApplyingAndRecovering(SessionCtlCase):
         )
 
         self.assertEqual(failed["state"], "failed")
+        self.assertEqual(failed["owed"], "pin the release")
         self.assertEqual(landed["state"], "landed")
         beat = json.loads((self.root / "beats" / "01.json").read_text(encoding="utf-8"))
-        self.assertEqual(beat["slots"]["fix"], "pin the release")
+        self.assertEqual(beat["slots"]["fix"], "pin it")
         self.assertEqual(beat["landed"], "abc1234")
         session = json.loads((self.root / "session.json").read_text(encoding="utf-8"))
         self.assertEqual(session["lands"][0]["where"], "abc1234")

@@ -1,6 +1,6 @@
 ---
 name: underwrite
-description: Interactive PR review, one beat at a time. Reconstructs what a change is for and how it fits the project, walks it in causal order while the reviewer steers, resolves each flag at the moment it is raised, and lands the accepted ones as commits or a GitHub review, whichever has a reader. Use for reviewing a PR or an unfamiliar diff, especially AI-authored changes where no author is around to answer questions.
+description: Interactive PR review, one beat at a time. Reconstructs what a change is for and how it fits the project, walks it in causal order while the reviewer steers, resolves each flag at the moment it is raised, and lands the chosen resolutions as commits, recorded decisions, or a GitHub review, whichever has a reader. Use for reviewing a PR or an unfamiliar diff, especially AI-authored changes where no author is around to answer questions.
 disable-model-invocation: true
 argument-hint: [pr-number | branch]
 ---
@@ -11,7 +11,8 @@ A review session the reviewer drives. Your job is to make them understand the ch
 enough to judge it, resolve what they notice into something runnable, and land it.
 
 You are not a bug finder. Defects surface as a side effect of understanding, never as the
-point. A finding that does not become a commit or a comment has not landed.
+point. A finding that does not become a commit, comment, or recorded decision has not
+landed.
 
 The scripts live beside this file. Call them from the directory this SKILL.md was loaded
 from, never from the repo under review. Below, `$S` is that directory and `$R` is the
@@ -39,7 +40,7 @@ WHY    why it exists
 PROOF  the command you ran or the file you read
 RISK   what breaks if the reasoning is wrong
 PRIOR  the earlier PR or decision this lands on
-FIX    the patch, or the decision owed
+FIX    the implementation intent, review recommendation, or decision owed
 ```
 
 `WHAT` and `PROOF` always appear. The rest appear only when they carry something. Omit
@@ -55,12 +56,13 @@ map is empty," the note says that. It does not become "This will panic when `ses
 empty because the loop assumes at least one entry." Adding reasoning they did not give
 makes it your comment wearing their name.
 
-**4. One flag per beat, and it ships with what resolves it.** Only raise something a
-senior engineer would genuinely stop at. Not style, not "consider extracting," not missing
-tests, not pre-existing issues. A flag arrives with the smallest thing that makes it
-accept-or-drop in one word: a patch you have already written and run, or a named decision
-with its options. Do not manufacture a patch for a policy question. Never collect flags
-into a findings section.
+**4. One flag per beat, with a concrete resolution.** Only raise something a senior
+engineer would genuinely stop at. Not style, not "consider extracting," not missing tests,
+not pre-existing issues. A branch flag carries the smallest implementation intent that
+could resolve it. A review flag carries a finding ready to include in the final review. A
+policy question carries a named decision with its options. Never claim code has already
+been written or verified before it has, and do not manufacture a patch for a policy
+question. Never collect flags into a findings section.
 
 **5. Land in the medium that has a reader.** Decide it at ingest, not at the end.
 
@@ -190,9 +192,16 @@ and give the reviewer the URL it prints:
 $S/scripts/serve.py $R
 ```
 
-The page streams beats over SSE as you write them and carries the controls: Accept and
-Drop on an open flag, Save note on any beat, Next beat anywhere. It writes its URL to
-`$R/serve.json`.
+The page streams beats over SSE as you write them and carries mode-specific controls. An
+ordinary flag shows Implement in `branch` mode or Include in review in `review` mode, plus
+Drop. A decision-only flag with top-level `resolution_kind: "decision"` shows Record
+decision. Save note remains available on any beat, and Next beat works anywhere. The page
+writes its URL to `$R/serve.json`.
+
+Those labels name the effect while the durable protocol remains stable. Implement and
+Include in review both post the canonical `accept` action. Record decision posts the
+existing `decide` action. New ordinary flags persist `resolution_kind: "delivery"`.
+Imported legacy beats may omit the field and retain their earlier transition rules.
 
 **Say what you are doing.** The page cannot see you work, and "busy" and "waiting on you"
 look identical on disk, so the controls stay disabled until you say you are parked. POST
@@ -284,11 +293,15 @@ If the same `seq` returns after a restart with `state: applied`, its stored abso
 finish any external delivery still owed, then acknowledge it. Repeating `apply`, `land`,
 or `ack` with the same absolute inputs is safe; conflicting inputs are refused.
 
-**Resolving a flag.** The reviewer accepts or drops it in the same beat, from the page or
-in words. A click has already reached the server, which flipped the beat's `state` and
-recorded their words as `call`. An answer in words has reached nothing. Before posting
-it, read `/state` and retain its `session_id`. If `seq` and `handled_seq`
-differ, handle and acknowledge the older
+**Resolving a flag.** The reviewer chooses the named action or drops the flag in the same
+beat, from the page or in words. In branch mode, Implement authorizes applying the stated
+`FIX`, running verification, and committing the result after the click. It does not
+approve an exact prepared patch. In review mode, Include in review queues the finding for
+the final GitHub review. Both clicks have already posted the canonical `accept` action,
+which flips the beat's `state` and records the reviewer's words as `call`.
+
+An answer in words has reached nothing. Before posting it, read `/state` and retain its
+`session_id`. If `seq` and `handled_seq` differ, handle and acknowledge the older
 queued action first. Then post the answer yourself and let the same code do the same work:
 
 Generate one UUID, substitute it below, and retain the exact JSON body until the server
@@ -301,14 +314,14 @@ curl -fsS -X POST $URL/act -H 'Content-Type: application/json' \
 
 The same goes for a note on any beat. The server owns `state` and `call` on both paths, so
 never write either by hand: a beat resolved in words and edited by hand stays `flag` on
-disk, and the Phase 4 check for an accept that landed nothing never fires on it. The reply
-carries its stable `id`, `seq`, applied state, and absolute result. Finish its effect and
-acknowledge that seq. A definite 4xx rejection may be corrected with a new ID. If an older
-action is pending, do not apply this one again: handle and acknowledge the older action,
-then acknowledge this already-applied seq and call `/await` again.
+disk, and the final Phase 4 check for an accept that landed nothing never fires on it. The
+reply carries its stable `id`, `seq`, applied state, and absolute result. Finish its effect
+and acknowledge that seq. A definite 4xx rejection may be corrected with a new ID. If an
+older action is pending, do not apply this one again: handle and acknowledge the older
+action, then acknowledge this already-applied seq and call `/await` again.
 
-On accept, in `branch` mode, where the fix goes depends on whether the PR can still take
-it:
+On accept, in `branch` mode, the visible action was Implement. Where the resulting fix
+goes depends on whether the PR can still take it:
 
 | the target | where the commit goes |
 | --- | --- |
@@ -320,10 +333,10 @@ A finding about code in an open PR belongs in that PR. Opening a sibling branch 
 PR that is still taking commits splits the change in two and leaves the reviewer to
 reconcile them.
 
-For a PR target, run `sessionctl.py check-pr "$R"` immediately before checkout or patch
-application. Exit 2 stops the effect and requires a supervised replacement session. Check
-out the frozen head, not the current branch tip. For a merged PR's first accept, create
-the fixes branch there and pin its exact name before editing:
+For a PR target, run `sessionctl.py check-pr "$R"` immediately before checkout or
+implementation. Exit 2 stops the effect and requires a supervised replacement session.
+Check out the frozen head, not the current branch tip. For a merged PR's first accept,
+create the fixes branch there and pin its exact name before editing:
 
 ```bash
 $S/scripts/sessionctl.py pin-branch "$R" <fixes-branch>
@@ -338,8 +351,8 @@ $S/scripts/sessionctl.py check-worktree "$R" "$PWD"
 For an open PR this also requires its frozen head repository to exist and the local branch
 to match its frozen head ref. For a merged PR it requires the pinned fixes branch to begin
 at the frozen head. After earlier accepted flags, it requires local `HEAD` to equal the
-latest commit already recorded by this session. Apply the patch and run the repo's
-verification.
+latest commit already recorded by this session. Implement the stated `FIX` and run the
+repo's verification.
 Run both `check-pr` and `check-worktree` again immediately before the commit, because
 verification can be long enough for either the PR or local branch to move. One commit per
 accepted flag, conventional subject, the `FIX` line as the body.
@@ -368,31 +381,35 @@ Then acknowledge the action, confirm in one line, and advance:
 landed · fix/pin-attw · 961eb58
 ```
 
-If verification fails, do not commit. Record the failure and what is now owed with
-`sessionctl.py fail "$R" <seq> '<failure>' '<new FIX>'`, say so, and stop. The action stays
-at the head until the same accept lands or is explicitly recovered. Phase 4 refuses to
-render an accepted beat that landed nothing.
+If implementation or verification fails, do not commit. Record the failure and what is
+now owed with `sessionctl.py fail "$R" <seq> '<failure>' '<owed>'`, say so, and stop. The
+approved `FIX` intent remains unchanged; the failure stores the next attempt separately.
+The action stays at the head until the same accept lands or is explicitly recovered.
+The page shows Implementation failed, and the Phase 4 final render refuses to ship it.
 
-In `review` mode, keep the beat `accepted` after the reviewer accepts a finding. A finding
+In `review` mode, Include in review posts `accept`, so keep the beat `accepted`. A finding
 intended for the PR audience stays accepted even when its recommended fix is a policy
 choice rather than code, because the GitHub review comment is what delivers it. Nothing
 lands per beat until Phase 4 posts the single review, so no review URL exists yet by
 design. Acknowledge the applied accept now; the store keeps its review delivery pending
-until Phase 4 records the URL. The review audience alone never changes an accepted
-finding to `decided`.
+until Phase 4 records the URL, and the page shows Included, review pending. The review
+audience alone never changes an accepted finding to `decided`.
 
 When the flag itself is a decision whose words complete the work and do not need to reach
-the PR audience as a finding, post `decide` and let the server move the beat to `decided`:
+the PR audience as a finding, set top-level `resolution_kind: "decision"` before presenting
+the beat. Record decision then posts `decide` and moves the beat directly to `decided`. A
+terminal answer must post `decide` too:
 
 ```bash
 curl -fsS -X POST $URL/act -H 'Content-Type: application/json' \
   -d '{"id":"<new UUID, reused on retry>","session_id":"<from /state>","n":5,"action":"decide","note":"stays as is, the cost lands on the caller"}'
 ```
 
-Post it whether the beat is still an open flag or the reviewer already clicked Accept.
-`decided` says the answer itself is the artifact, independent of audience mode. A finding
-that belongs in the GitHub review is not such a decision. A `decided` beat with no `call`
-fails validation the same way an accepted one with no `landed` does.
+For a legacy beat already moved to `accepted`, the same `decide` action refines it into the
+decision outcome. `decided` says the answer itself is the artifact, independent of
+audience mode. A finding that belongs in the GitHub review is not such a decision. A
+`decided` beat with no `call` fails validation the same way an accepted one with no
+`landed` does.
 
 If the working tree is dirty, say so and stop rather than stashing. Never push and never
 open a PR unasked.
@@ -406,26 +423,35 @@ continue?"
 ## Phase 4: land
 
 Render the page first, so the reviewer makes any remaining calls off the hoisted flags
-rather than off scrollback:
+rather than off scrollback. Branch delivery is already complete, so render it with final
+delivery checks. Review mode needs a pre-POST preview, so omit `--final` until the GitHub
+review lands:
 
 ```bash
+# branch mode
+$S/scripts/render-report.py $R --final
+
+# review mode, before the GitHub POST
 $S/scripts/render-report.py $R
 ```
 
-Exit 2 means it rendered but a beat failed validation and carries an `UNPROVEN` chip. Read
-the authoritative beat with `get-beat`, fix the complete object through `put-beat`, and
-re-render; do not ship an unproven page. Publish with the `Artifact` tool. If that tool is
-unavailable, re-render with `--standalone` so the file opens correctly in a browser, and
-report the local `$R/report.html` path instead.
+Without `--final`, pending and failed delivery are valid live states and remain visibly
+unfinished. They are never shippable final states. A final render rejects either one, as
+well as every accepted delivery with no landing. Exit 2 means the page rendered but a beat
+failed validation and carries an `UNPROVEN` chip. Read the authoritative beat with
+`get-beat`, fix the complete object through `put-beat`, and re-render; do not ship an
+unproven page. Publish with the `Artifact` tool. If that tool is unavailable, re-render
+with `--standalone` so the file opens correctly in a browser, and report the local
+`$R/report.html` path instead.
 
 **Branch mode.** The commits already exist from Phase 3. Report the branch and
 `git log --oneline`, and offer to push and open a PR. Do not do either unasked. A session
-with no accepted flags leaves no branch at all, which is correct. For a PR target, run
-`sessionctl.py check-pr "$R"` and `sessionctl.py check-worktree "$R" "$PWD"` once more
-immediately before any requested push. For an open PR, push `HEAD` to the exact frozen
-`head_repo` and `head_ref`, never to an inferred upstream. The push may intentionally
-advance that PR after the check; any later work belongs in a replacement session tied to
-the new head.
+with no requested implementations leaves no branch at all, which is correct. For a PR
+target, run `sessionctl.py check-pr "$R"` and `sessionctl.py check-worktree "$R" "$PWD"`
+once more immediately before any requested push. For an open PR, push `HEAD` to the exact
+frozen `head_repo` and `head_ref`, never to an inferred upstream. The push may
+intentionally advance that PR after the check; any later work belongs in a replacement
+session tied to the new head.
 
 **Review mode.** Build the payload at `$R/review.json`, never inside the repo being
 reviewed:
@@ -482,6 +508,13 @@ final target check and obtain approval before a retry. Never match only `commit_
 never blindly post the review twice. The receipt includes the review state. `DISMISSED`
 proves the post happened but is no longer an active delivery: preserve that receipt, stop
 for supervised handling, and do not retry or mark the pending beats landed.
+
+Only after a response or reconciliation proves that no review was created, use
+`sessionctl.py reconcile "$R"` to list the pending `cause_seq` values, then record each
+definite publication failure with `sessionctl.py fail "$R" <cause_seq> '<failure>'
+'<owed>'`. The page will show Review publication failed while preserving the accepted
+finding. Never mark an unknown outcome failed. A later verified post can still land the
+same accepts.
 
 A 422 here means the audience call was wrong upstream. Audience mode is frozen once an
 accept is recorded, so stop and create a supervised replacement session with the correct
@@ -569,16 +602,19 @@ silently.
 
 `state` is one of `clean`, `flag`, `unverified`, `accepted`, `dropped`, `decided`. The
 first three are what a beat opens with; the last three are what a flag becomes after the
-reviewer answers, `decided` being the yes that resolves in words rather than a commit.
-`slots` accepts only the six keys from rule 2. `diff` is a list of raw
-lines, classified on the first character. `lands[]` entries are
+reviewer answers. `accepted` is the durable state behind Implement and Include in review;
+`decided` is the outcome behind Record decision. Set top-level `resolution_kind` to
+`decision` only when the answer itself completes the work. New ordinary flags persist
+`delivery`; imported legacy beats may omit it. `slots` accepts only the six keys from rule
+2. `diff` is a list of raw lines, classified on the first character. `lands[]` entries are
 `{state: landed|ready|open, what, where}`.
 
 `landed` names what an accepted beat became: a commit SHA in `branch` mode, the review URL
 in `review` mode, with `branch` beside it when there is one. A frozen PR records the full
-SHA so the local-history guard can resolve it without ambiguity. An accepted review beat
-may omit it only in the pre-POST render. The `--final` render rejects every accepted beat
-that still names nothing. A `decided` beat never carries one; its `call` is what it became.
+SHA so the local-history guard can resolve it without ambiguity. An accepted beat may omit
+it in a live render, where delivery remains visibly pending or failed. The `--final`
+render rejects every accepted beat that still names nothing. A `decided` beat never
+carries one; its `call` is what it became.
 
 These accumulate into a review history. When a later session touches the same paths, read
 the prior sessions for context.

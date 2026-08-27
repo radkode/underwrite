@@ -60,11 +60,14 @@ class BeatValidation(unittest.TestCase):
         problems = rr.validate(beat(state="accepted", slots={"what": "x"}))
         self.assertIn("accepted with no proof", problems[0])
 
-    def test_accepted_with_nothing_landed_is_not_shippable(self):
+    def test_a_final_accept_with_nothing_landed_is_not_shippable(self):
         """The reviewer said yes and the page had nothing to show for it. A real
         session shipped two beats in exactly this state."""
-        problems = rr.validate(beat(state="accepted"))
+        problems = rr.validate(beat(state="accepted"), final=True)
         self.assertIn("accepted, nothing landed", problems[0])
+
+    def test_an_accept_may_still_have_delegated_work_pending(self):
+        self.assertEqual(rr.validate(beat(state="accepted")), [])
 
     def test_accepted_naming_what_it_landed_is_shippable(self):
         self.assertEqual(
@@ -158,6 +161,10 @@ class BeatValidation(unittest.TestCase):
         problems = rr.validate(beat(state="probably-fine"))
         self.assertIn("is not one of", problems[0])
 
+    def test_resolution_kind_must_name_a_supported_control(self):
+        problems = rr.validate(beat(resolution_kind="magic"))
+        self.assertIn("resolution_kind must be delivery or decision", problems[0])
+
     def test_states_other_than_clean_and_accepted_need_no_proof(self):
         for state in ("flag", "unverified", "dropped"):
             slots = {"what": "x"}
@@ -187,7 +194,10 @@ class DecidedBeats(unittest.TestCase):
 
     def test_an_accepted_beat_still_owes_one(self):
         """The escape must not turn into a way around the rule it escapes."""
-        self.assertIn("accepted, nothing landed", rr.validate(beat(state="accepted"))[0])
+        self.assertIn(
+            "accepted, nothing landed",
+            rr.validate(beat(state="accepted"), final=True)[0],
+        )
 
     def test_it_renders_among_the_beats_the_reviewer_said_yes_to(self):
         html = rr.render(
@@ -307,6 +317,110 @@ class ReportOrdering(unittest.TestCase):
     def test_a_failing_beat_carries_the_unproven_chip(self):
         html = rr.render({"repo": "r"}, [beat(n=1)], "", {1: ["beat 1: no what"]})
         self.assertIn("unproven", html)
+
+
+class DelegatedActionControls(unittest.TestCase):
+    def flag(self, **kw):
+        return beat(
+            state="flag",
+            slots={"what": "x", "proof": "a.ts:1", "risk": "r", "fix": "f"},
+            **kw,
+        )
+
+    def render(self, session, b):
+        return rr.render(session, [b], "", {}, live=True)
+
+    def test_branch_flags_offer_implementation_through_the_compatible_action(self):
+        html = self.render(
+            {"repo": "r", "audience": {"mode": "branch"}}, self.flag()
+        )
+
+        self.assertIn(
+            '<button class="act primary" data-action="accept">Implement</button>',
+            html,
+        )
+        self.assertNotIn(">Accept</button>", html)
+
+    def test_review_flags_offer_inclusion_through_the_compatible_action(self):
+        html = self.render(
+            {"repo": "r", "audience": {"mode": "review"}}, self.flag()
+        )
+
+        self.assertIn(
+            '<button class="act primary" data-action="accept">Include in review</button>',
+            html,
+        )
+
+    def test_decision_only_flags_record_the_decision_directly(self):
+        html = self.render(
+            {"repo": "r", "audience": {"mode": "branch"}},
+            self.flag(resolution_kind="decision"),
+        )
+
+        self.assertIn(
+            '<button class="act primary" data-action="decide">Record decision</button>',
+            html,
+        )
+        self.assertIn('placeholder="record the decision in your own words"', html)
+        self.assertIn("fresh.action === 'decide' && !fresh.note", html)
+        self.assertIn("enter the decision first", html)
+        self.assertNotIn('data-action="accept"', html)
+
+    def test_pending_delivery_is_described_by_audience(self):
+        branch = rr.render(
+            {"repo": "r", "audience": {"mode": "branch"}},
+            [beat(
+                state="accepted",
+                delivery={"state": "pending", "kind": "commit"},
+            )],
+            "",
+            {},
+        )
+        review = rr.render(
+            {"repo": "r", "audience": {"mode": "review"}},
+            [beat(
+                state="accepted",
+                delivery={"state": "pending", "kind": "review"},
+            )],
+            "",
+            {},
+        )
+
+        self.assertIn("Implementation pending", branch)
+        self.assertIn("Included, review pending", review)
+
+    def test_failed_delivery_shows_the_failure_and_next_attempt(self):
+        html = rr.render(
+            {"repo": "r", "audience": {"mode": "branch"}},
+            [beat(state="accepted", delivery={
+                "state": "failed",
+                "kind": "commit",
+                "error": "tests <failed>",
+                "owed": "repair `fixture.py:2`",
+            })],
+            "",
+            {},
+        )
+
+        self.assertIn("Implementation failed", html)
+        self.assertIn("tests &lt;failed&gt;", html)
+        self.assertIn("Next attempt:", html)
+        self.assertIn("repair <code>fixture.py:2</code>", html)
+
+    def test_failed_review_delivery_names_publication(self):
+        html = rr.render(
+            {"repo": "r", "audience": {"mode": "review"}},
+            [beat(state="accepted", delivery={
+                "state": "failed",
+                "kind": "review",
+                "error": "request rejected",
+                "owed": "retry the post",
+            })],
+            "",
+            {},
+        )
+
+        self.assertIn("Review publication failed", html)
 
 
 class Escaping(unittest.TestCase):
@@ -604,6 +718,19 @@ class RenderCli(unittest.TestCase):
         self.assertEqual(final.returncode, 2)
         self.assertIn("accepted, nothing landed", final.stderr)
 
+    def test_a_branch_accept_is_allowed_during_delivery_but_not_in_the_final_report(self):
+        self.session({
+            "repo": "acme/widget",
+            "audience": {"mode": "branch", "why": "the author owns the branch"},
+        })
+        self.put(beat(n=1, state="accepted"))
+
+        self.assertEqual(self.run_cli().returncode, 0)
+        final = self.run_cli("--final")
+
+        self.assertEqual(final.returncode, 2)
+        self.assertIn("accepted, nothing landed", final.stderr)
+
     def test_a_final_review_with_its_url_exits_zero(self):
         review_url = "https://example.test/review/2"
         self.session({
@@ -688,6 +815,27 @@ class RenderCli(unittest.TestCase):
 
         self.assertEqual(done.returncode, 0)
         self.assertIn("authoritative", self.page())
+
+    def test_the_database_projection_exposes_failed_delivery(self):
+        self.session({
+            "repo": "acme/widget",
+            "audience": {"mode": "branch", "why": "the author owns the branch"},
+        })
+        self.put(beat(
+            n=1,
+            state="flag",
+            slots={"what": "x", "proof": "a.ts:1", "risk": "r", "fix": "pin it"},
+        ))
+        store = rr.SessionStore(self.root)
+        action = store.produce("accept-1", 1, "accept", "")
+        store.fail(action["seq"], "tests failed", "repair the fixture")
+
+        done = self.run_cli()
+
+        self.assertEqual(done.returncode, 0)
+        self.assertIn("Implementation failed", self.page())
+        self.assertIn("tests failed", self.page())
+        self.assertIn("Next attempt: repair the fixture", self.page())
 
     def test_a_usage_error_exits_1_rather_than_naming_a_beat_to_fix(self):
         """argparse spends 2 on this, and 2 already means "rendered, go fix a beat".
