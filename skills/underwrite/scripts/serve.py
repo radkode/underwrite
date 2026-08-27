@@ -216,7 +216,8 @@ class Session:
             )
             self.store.export_json()
             self.cond.notify_all()
-        self.set_status({"phase": "working", "text": f"picking up your {action}"})
+        name = "decision" if action in ("accept", "drop", "decide") else action
+        self.set_status({"phase": "working", "text": f"picking up your {name}"})
         return record
 
     def ack(self, seq):

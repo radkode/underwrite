@@ -1,12 +1,13 @@
 # underwrite
 
 Read a pull request closely enough to stand behind it. One beat at a time, driven by you,
-ending in code.
+ending in a delivered result.
 
 Most review tooling hands you a wall of findings and leaves the work of deciding to you.
 This walks a change in causal order, one coherent unit per turn, and stops after each one
-so you steer. When something is worth flagging, the flag arrives with the patch already
-written and run, so it is accept-or-drop in one word. Accepted flags become commits.
+so you steer. When something is worth flagging, the action names what happens next:
+Implement applies and verifies a branch fix, Include in review queues a finding for the
+GitHub review, and Record decision stores an answer whose words complete the work.
 
 ## Install
 
@@ -55,38 +56,48 @@ FIX    npx --yes @arethetypeswrong/cli@0.18.5
 `PROOF` names a command that was run or a file that was read. `inferred` is a legal value.
 A claim with neither does not ship.
 
+`FIX` is the smallest concrete implementation intent, review recommendation, or decision
+owed. In branch mode, choosing Implement authorizes Underwrite to apply that intent and
+run verification. It does not claim that an exact patch already exists.
+
 **Land.** The medium is decided at ingest, from whether anyone will read it. A merged or
 self-authored PR with no other reviewers lands as commits on a branch created lazily at
-the first accepted flag, so a session with no accepts leaves no trace. Anything with a
-real audience lands as a single GitHub review, anchor-validated first because one bad
-anchor rejects the whole thing. The review carries the frozen full head as `commit_id`, so
-a PR update cannot silently move the delivery onto code that was never walked. A stable
-hidden marker distinguishes that delivery from every older review on the same commit.
+the first requested implementation, so a session with no implementations leaves no trace.
+Anything with a real audience lands as a single GitHub review, anchor-validated first
+because one bad anchor rejects the whole thing. The review carries the frozen full head as
+`commit_id`, so a PR update cannot silently move the delivery onto code that was never
+walked. A stable hidden marker distinguishes that delivery from every older review on the
+same commit.
 
 ## The page drives
 
 A walk serves itself on loopback, and the page is where you actually review. Beats stream
 in as they are walked, ordered by what is owed rather than by what was walked: open flags
-expanded at the top, accepted next, clean beats collapsed to one line each that still
-carry their proof.
+expanded at the top, chosen resolutions next, clean beats collapsed to one line each that
+still carry their proof.
 
-Decisions happen there too. An open flag carries Accept and Drop plus a field for putting
-it in your own words, and Next beat advances the walk from anywhere. Clicking is what
-unblocks the terminal side, which parks on the server between beats rather than spinning.
-The terminal still takes the same answers in words, so closing the tab never strands a
-session.
+Decisions happen there too. An open branch flag carries Implement and Drop. Review mode
+uses Include in review and Drop. A policy question whose answer completes the work carries
+Record decision. Each has a field for putting the call in your own words, and Next beat
+advances the walk from anywhere. Clicking is what unblocks the terminal side, which parks
+on the server between beats rather than spinning. The terminal still takes the same
+answers in words, so closing the tab never strands a session.
+
+The labels describe the delegated effect without changing the durable protocol. Implement
+and Include in review both record the existing `accept` action. Record decision uses the
+existing `decide` action.
 
 ```
 terminal                     browser
 --------                     -------
 presents beat 5    ------>   beat 5 appears, FLAG, expanded
-(parked on /await)           [ accept ]  [ drop ]  [ your words ]
-                   <------   POST /act with stable action and session IDs
-SQLite commits the call and its application receipt
-writes the patch
+(parked on /await)           [ Implement ]  [ Drop ]  [ your words ]
+                   <------   POST /act with canonical accept and stable IDs
+SQLite records the call, pending delivery, and application receipt
+applies the stated fix
 runs verification
 commits 961eb58
-records the landing ------>  beat 5 shows ACCEPTED and 961eb58
+records the landing ------>  beat 5 shows ACCEPTED, Landed, and 961eb58
 presents beat 6    ------>   beat 6 arrives
 ```
 
@@ -126,13 +137,16 @@ and ref.
 changes to the frozen head plus commits already recorded by the session. The frozen diff
 is checked by byte count and SHA-256.
 
-`render-report.py` turns a session into the page and validates it on the way through: a
-flag with no fix, a clean beat with no proof, a proof naming no command, or a beat you
-accepted that landed nothing gets an `UNPROVEN` chip and exit 2. Review mode permits that
-last state only in the preview before the GitHub POST; its final render requires the
-review URL. The page still renders when validation fails. `validate-anchors.py` snaps
-review comments to lines that exist in the diff and folds unsnappable ones into the body
-rather than dropping them.
+`render-report.py` turns a session into the page and validates it on the way through. A
+flag with no fix, a clean beat with no proof, or a proof naming no command gets an
+`UNPROVEN` chip and exit 2. During a live walk, pending and failed delivery are visible
+states and do not pretend to be completion: `Implementation pending` or `Implementation
+failed` in branch mode, `Included, review pending` or `Review publication failed` in
+review mode. A final render uses `--final` and rejects any chosen branch or review delivery
+that has not landed. Review mode omits that flag only for the preview before its GitHub
+POST. The page still renders when validation fails.
+`validate-anchors.py` snaps review comments to lines that exist in the diff and folds
+unsnappable ones into the body rather than dropping them.
 
 Iterating on the page design means editing `skills/underwrite/assets/report.css`, or
 passing `--css` to try something without a commit.

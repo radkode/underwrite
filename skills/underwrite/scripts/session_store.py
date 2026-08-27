@@ -13,7 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-DB_SCHEMA_VERSION = 2
+DB_SCHEMA_VERSION = 3
 SCHEMA_VERSION = 1
 DELIVERY_VERSION = 1
 ACTIONS = ("accept", "drop", "decide", "note", "next", "back", "skip")
@@ -21,6 +21,7 @@ NAVIGATION = ("next", "back", "skip")
 RESOLVE = {"accept": "accepted", "drop": "dropped", "decide": "decided"}
 RESOLVABLE = {"accept": ("flag",), "drop": ("flag",), "decide": ("flag", "accepted")}
 OPEN_STATES = ("clean", "flag", "unverified")
+RESOLUTION_KINDS = ("delivery", "decision")
 _MISSING = object()
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -274,7 +275,7 @@ class SessionStore:
             version = db.execute("PRAGMA user_version").fetchone()[0]
             if version == DB_SCHEMA_VERSION:
                 return
-            if version != 1:
+            if version not in (1, 2):
                 raise StoreError(f"unsupported session database version {version}")
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
@@ -286,23 +287,25 @@ class SessionStore:
                 raise StoreError(
                     f"unsupported session format version {row['format_version']}"
                 )
-            columns = {
-                row["name"] for row in db.execute("PRAGMA table_info(session)")
-            }
-            if "session_id" not in columns:
-                db.execute("ALTER TABLE session ADD COLUMN session_id TEXT")
-            row = db.execute(
-                "SELECT session_id FROM session WHERE singleton = 1"
-            ).fetchone()
-            if not isinstance(row["session_id"], str) or not row["session_id"].strip():
+            if version == 1:
+                columns = {
+                    row["name"] for row in db.execute("PRAGMA table_info(session)")
+                }
+                if "session_id" not in columns:
+                    db.execute("ALTER TABLE session ADD COLUMN session_id TEXT")
+                row = db.execute(
+                    "SELECT session_id FROM session WHERE singleton = 1"
+                ).fetchone()
+                if not isinstance(row["session_id"], str) or not row["session_id"].strip():
+                    db.execute(
+                        "UPDATE session SET session_id = ? WHERE singleton = 1",
+                        (str(uuid.uuid4()),),
+                    )
                 db.execute(
-                    "UPDATE session SET session_id = ? WHERE singleton = 1",
-                    (str(uuid.uuid4()),),
+                    "CREATE UNIQUE INDEX IF NOT EXISTS session_identity "
+                    "ON session(session_id)"
                 )
-            db.execute(
-                "CREATE UNIQUE INDEX IF NOT EXISTS session_identity "
-                "ON session(session_id)"
-            )
+            self._restore_failed_fix_intents(db)
             db.execute(f"PRAGMA user_version = {DB_SCHEMA_VERSION}")
             db.execute("COMMIT")
         except Exception:
@@ -311,6 +314,60 @@ class SessionStore:
             raise
         finally:
             db.close()
+
+    def _restore_failed_fix_intents(self, db):
+        changed = False
+        rows = db.execute(
+            "SELECT n, body_json, delivery_json FROM beats "
+            "WHERE delivery_state = 'failed'"
+        ).fetchall()
+        for row in rows:
+            delivery = json.loads(row["delivery_json"]) if row["delivery_json"] else {}
+            action = db.execute(
+                "SELECT beat_n, kind, result_json FROM actions WHERE seq = ?",
+                (delivery.get("cause_seq"),),
+            ).fetchone()
+            if (
+                action is None
+                or action["kind"] != "accept"
+                or action["beat_n"] != row["n"]
+                or not action["result_json"]
+            ):
+                continue
+            application = json.loads(action["result_json"])
+            approved = next(
+                (
+                    beat
+                    for beat in application.get("beats", [])
+                    if isinstance(beat, dict) and beat.get("n") == row["n"]
+                ),
+                None,
+            )
+            approved_slots = approved.get("slots") if isinstance(approved, dict) else None
+            beat = json.loads(row["body_json"])
+            slots = beat.get("slots")
+            if not isinstance(slots, dict):
+                continue
+            if isinstance(approved_slots, dict) and "fix" in approved_slots:
+                if slots.get("fix") == approved_slots["fix"]:
+                    continue
+                slots["fix"] = _copy(approved_slots["fix"])
+            elif slots.get("fix") == delivery.get("owed"):
+                slots.pop("fix")
+                if not slots and not isinstance(approved_slots, dict):
+                    beat.pop("slots", None)
+            else:
+                continue
+            db.execute(
+                "UPDATE beats SET revision = revision + 1, body_json = ? WHERE n = ?",
+                (_dump(beat), row["n"]),
+            )
+            changed = True
+        if changed:
+            db.execute(
+                "UPDATE session SET render_revision = render_revision + 1 "
+                "WHERE singleton = 1"
+            )
 
     def _verify_version(self):
         db = self._connect()
@@ -681,7 +738,21 @@ class SessionStore:
             raise StoreError("beat must be an object")
         beat = _copy(document)
         _positive(beat.get("n"), "beat n")
+        if (
+            "resolution_kind" in beat
+            and beat["resolution_kind"] not in RESOLUTION_KINDS
+        ):
+            raise StoreError(
+                "beat resolution_kind must be one of "
+                f"{', '.join(RESOLUTION_KINDS)}"
+            )
         return beat
+
+    def _canonical_beat(self, beat):
+        canonical = _copy(beat)
+        if canonical.get("state") == "flag":
+            canonical.setdefault("resolution_kind", "delivery")
+        return canonical
 
     def _expected_delivery_kind(self, session):
         audience = session.get("audience")
@@ -847,13 +918,15 @@ class SessionStore:
             )
         owned = [
             field
-            for field in ("call", "landed", "branch", "delivery_kind")
+            for field in ("call", "landed", "branch", "delivery_kind", "delivery")
             if field in beat
         ]
         if owned:
             raise StoreError(
                 f"new beat cannot set store-owned field {', '.join(owned)}"
             )
+        if beat.get("state") == "flag":
+            beat.setdefault("resolution_kind", "delivery")
 
     def put_session(self, document):
         with self._write() as db:
@@ -1081,12 +1154,25 @@ class SessionStore:
                         beat[field] = current[field]
                     else:
                         beat.pop(field, None)
-                if row["delivery_state"] == "failed":
-                    delivery = json.loads(row["delivery_json"])
-                    slots = beat.setdefault("slots", {})
-                    if not isinstance(slots, dict):
+                if "resolution_kind" not in beat and "resolution_kind" in current:
+                    beat["resolution_kind"] = current["resolution_kind"]
+                if current.get("state") not in OPEN_STATES:
+                    if "resolution_kind" in current:
+                        beat["resolution_kind"] = current["resolution_kind"]
+                    else:
+                        beat.pop("resolution_kind", None)
+                if current.get("state") == "accepted":
+                    current_slots = current.get("slots")
+                    incoming_slots = beat.get("slots")
+                    if incoming_slots is not None and not isinstance(incoming_slots, dict):
                         raise StoreError(f"beat {beat['n']} slots must be an object")
-                    slots["fix"] = delivery["owed"]
+                    if isinstance(current_slots, dict) and "fix" in current_slots:
+                        slots = beat.setdefault("slots", {})
+                        if not isinstance(slots, dict):
+                            raise StoreError(f"beat {beat['n']} slots must be an object")
+                        slots["fix"] = current_slots["fix"]
+                    elif isinstance(incoming_slots, dict):
+                        incoming_slots.pop("fix", None)
             changed, _revision, _state, _detail = self._save_beat(db, beat)
             if changed:
                 self._bump_render(db)
@@ -1101,6 +1187,24 @@ class SessionStore:
                 json.loads(item["body_json"])
                 for item in db.execute("SELECT * FROM beats ORDER BY n")
             ]
+        return session, beats
+
+    def presentation_snapshot(self):
+        with self._read() as db:
+            session_row = self._session_row(db)
+            session = json.loads(session_row["body_json"])
+            session["schema_version"] = session_row["format_version"]
+            beats = []
+            for row in db.execute("SELECT * FROM beats ORDER BY n"):
+                beat = json.loads(row["body_json"])
+                delivery = (
+                    json.loads(row["delivery_json"])
+                    if row["delivery_json"]
+                    else {}
+                )
+                delivery["state"] = row["delivery_state"]
+                beat["delivery"] = delivery
+                beats.append(beat)
         return session, beats
 
     # ---- action queue -------------------------------------------------
@@ -1211,6 +1315,8 @@ class SessionStore:
                 if (existing["beat_n"], existing["kind"], existing["note"]) != (n, kind, note):
                     raise Conflict(f"action_id {action_id!r} names a different action")
                 return self._action(existing)
+            if kind == "decide" and not note:
+                raise StoreError("decide requires a non-empty note")
 
             seq = db.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM actions").fetchone()[0]
             if kind in NAVIGATION:
@@ -1228,6 +1334,15 @@ class SessionStore:
                 delivery_state = row["delivery_state"]
                 delivery = json.loads(row["delivery_json"]) if row["delivery_json"] else None
                 if kind in RESOLVE:
+                    resolution_kind = beat.get("resolution_kind")
+                    if kind == "accept" and resolution_kind == "decision":
+                        raise Conflict(
+                            f"accept does not match beat {n} resolution_kind 'decision'"
+                        )
+                    if kind == "decide" and resolution_kind == "delivery":
+                        raise Conflict(
+                            f"decide does not match beat {n} resolution_kind 'delivery'"
+                        )
                     if beat.get("state") not in RESOLVABLE[kind]:
                         raise Conflict(
                             f"beat {n} is {beat.get('state')}, which cannot become {RESOLVE[kind]}"
@@ -1293,7 +1408,10 @@ class SessionStore:
         if session is not None:
             _version, normalized_session = self._session_document(session)
         normalized_beats = tuple(
-            sorted((self._beat_document(beat) for beat in beats), key=lambda beat: beat["n"])
+            sorted(
+                (self._canonical_beat(self._beat_document(beat)) for beat in beats),
+                key=lambda beat: beat["n"],
+            )
         )
         return (
             self._application(result, normalized_session, normalized_beats),
@@ -1302,7 +1420,13 @@ class SessionStore:
         )
 
     def _same_application(self, row, application):
-        return json.loads(row["result_json"]) == application
+        current = json.loads(row["result_json"])
+        for value in (current, application):
+            value["beats"] = [
+                self._canonical_beat(beat) if isinstance(beat, dict) else beat
+                for beat in value.get("beats", [])
+            ]
+        return current == application
 
     def apply(self, seq, result, session=None, beats=()):
         _positive(seq, "seq")
@@ -1333,7 +1457,7 @@ class SessionStore:
                     "SELECT body_json FROM beats WHERE n = ?", (beat["n"],)
                 ).fetchone()
                 if current is not None:
-                    if json.loads(current["body_json"]) != beat:
+                    if self._canonical_beat(json.loads(current["body_json"])) != beat:
                         raise Conflict(
                             f"navigation cannot replace existing beat {beat['n']}"
                         )
@@ -1512,10 +1636,6 @@ class SessionStore:
                 raise Conflict(f"beat {beat_n} has already landed")
             if beat.get("state") != "accepted":
                 raise Conflict(f"beat {beat_n} is {beat.get('state')}, not accepted")
-            slots = beat.setdefault("slots", {})
-            if not isinstance(slots, dict):
-                raise StoreError(f"beat {beat_n} slots must be an object")
-            slots["fix"] = owed
             changed, _revision, _state, _detail = self._save_beat(
                 db, beat, "failed", desired
             )
@@ -1594,7 +1714,7 @@ class SessionStore:
                     raise Conflict("observed session does not match the stored session")
             for beat in normalized_beats:
                 current = json.loads(self._beat_row(db, beat["n"])["body_json"])
-                if current != beat:
+                if self._canonical_beat(current) != beat:
                     raise Conflict(f"observed beat {beat['n']} does not match the stored beat")
             timestamp = _now()
             db.execute(

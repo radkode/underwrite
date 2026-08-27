@@ -241,7 +241,7 @@ class CreatingAndMigrating(StoreCase):
 
     def test_the_database_and_export_format_are_versioned(self):
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
             self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "delete")
         db = self.store._connect()
         try:
@@ -276,9 +276,50 @@ class CreatingAndMigrating(StoreCase):
         self.assertEqual(upgraded.head()["action_id"], action["action_id"])
         self.assertTrue(upgraded.delivery_state()["session_id"])
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 2)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
             columns = {row[1] for row in db.execute("PRAGMA table_info(session)")}
         self.assertIn("session_id", columns)
+
+    def test_a_v2_upgrade_restores_the_fix_approved_before_delivery_failed(self):
+        action = self.store.produce("click-1", 1, "accept", "yes")
+        self.store.fail(action["seq"], "tests failed", "retry with the fixture")
+        beat = self.beat(1)
+        beat["slots"]["fix"] = "retry with the fixture"
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            db.execute(
+                "UPDATE beats SET body_json = ? WHERE n = 1",
+                (json.dumps(beat),),
+            )
+            db.execute("PRAGMA user_version = 2")
+
+        upgraded = session_store.SessionStore(self.root)
+
+        self.assertEqual(upgraded.snapshot()[1][0]["slots"]["fix"], "pin it")
+        failed = upgraded.presentation_snapshot()[1][0]["delivery"]
+        self.assertEqual(failed["owed"], "retry with the fixture")
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
+
+    def test_a_v2_upgrade_removes_a_failure_injected_fix(self):
+        beat = self.beat(1)
+        beat["slots"].pop("fix")
+        self.store.put_beat(beat)
+        action = self.store.produce("click-1", 1, "accept", "yes")
+        self.store.fail(action["seq"], "tests failed", "retry with the fixture")
+        beat = self.beat(1)
+        beat["slots"]["fix"] = "retry with the fixture"
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            db.execute(
+                "UPDATE beats SET body_json = ? WHERE n = 1",
+                (json.dumps(beat),),
+            )
+            db.execute("PRAGMA user_version = 2")
+
+        upgraded = session_store.SessionStore(self.root)
+
+        self.assertNotIn("fix", upgraded.snapshot()[1][0]["slots"])
+        failed = upgraded.presentation_snapshot()[1][0]["delivery"]
+        self.assertEqual(failed["owed"], "retry with the fixture")
 
     def test_an_unsupported_document_is_not_partially_upgraded(self):
         self.downgrade_to_pre_identity_v1(format_version=99)
@@ -339,13 +380,13 @@ class CreatingAndMigrating(StoreCase):
         (self.root / "session.sqlite3").unlink()
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
             self.assertEqual(db.execute("PRAGMA journal_mode = WAL").fetchone()[0], "wal")
-            db.execute("PRAGMA user_version = 3")
+            db.execute("PRAGMA user_version = 4")
 
         with self.assertRaisesRegex(session_store.StoreError, "newer than supported"):
             session_store.SessionStore(self.root)
 
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
             self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
 
     def test_legacy_actions_without_an_ack_migrate_as_handled(self):
@@ -621,13 +662,66 @@ class ProducingAndApplying(StoreCase):
         self.assertEqual(self.store.ack(action["seq"]), {"handled_seq": 1})
         self.assertTrue(self.store.delivery_state()["recovery"])
 
-    def test_a_later_decision_supersedes_an_accept_that_needs_no_commit(self):
+    def test_a_legacy_accept_can_be_refined_into_a_decision(self):
+        self.assertNotIn("resolution_kind", self.beat(1))
         accepted = self.store.produce("click-1", 1, "accept", "yes")
         decided = self.store.produce("decision-1", 1, "decide", "stays as is")
 
         self.assertEqual(self.beat(1)["state"], "decided")
+        self.assertNotIn("resolution_kind", self.beat(1))
         self.assertEqual(self.store.ack(accepted["seq"]), {"handled_seq": 1})
         self.assertEqual(self.store.ack(decided["seq"]), {"handled_seq": 2})
+
+    def test_new_flags_default_to_delivery_and_reject_decide(self):
+        stored = self.store.put_beat(dict(FLAG, n=3))
+
+        self.assertEqual(stored["resolution_kind"], "delivery")
+        with self.assertRaisesRegex(session_store.Conflict, "resolution_kind 'delivery'"):
+            self.store.produce("decision-1", 3, "decide", "leave it")
+
+        accepted = self.store.produce("click-1", 3, "accept", "implement it")
+        self.assertEqual(accepted["result"]["state"], "accepted")
+
+    def test_clean_beats_do_not_carry_unused_resolution_metadata(self):
+        stored = self.store.put_beat(dict(CLEAN, n=3))
+
+        self.assertNotIn("resolution_kind", stored)
+
+    def test_explicit_decision_beats_reject_accept_and_require_words(self):
+        self.store.put_beat(dict(FLAG, n=3, resolution_kind="decision"))
+
+        with self.assertRaisesRegex(session_store.Conflict, "resolution_kind 'decision'"):
+            self.store.produce("click-1", 3, "accept", "yes")
+        with self.assertRaisesRegex(session_store.StoreError, "non-empty note"):
+            self.store.produce("decision-1", 3, "decide", "")
+
+        decided = self.store.produce("decision-2", 3, "decide", "leave it")
+        self.assertEqual(decided["result"]["state"], "decided")
+        self.assertEqual(decided["result"]["delivery"], "none")
+
+    def test_invalid_resolution_kinds_are_rejected(self):
+        for resolution_kind in (None, "patch", 1):
+            with self.subTest(resolution_kind=resolution_kind):
+                with self.assertRaisesRegex(session_store.StoreError, "resolution_kind"):
+                    self.store.put_beat(
+                        dict(FLAG, n=3, resolution_kind=resolution_kind)
+                    )
+
+    def test_navigation_defaults_a_new_beat_to_delivery_idempotently(self):
+        new = dict(FLAG, n=3)
+        action = self.store.produce("nav-1", None, "next", "")
+        session = dict(self.store.snapshot()[0], current_beat=3)
+        result = {"kind": "walk", "current_beat": 3}
+
+        applied = self.store.apply(
+            action["seq"], result, session=session, beats=(new,)
+        )
+        replay = self.store.apply(
+            action["seq"], result, session=session, beats=(new,)
+        )
+
+        self.assertEqual(replay, applied)
+        self.assertEqual(self.beat(3)["resolution_kind"], "delivery")
 
     def test_put_beat_preserves_store_owned_reviewer_fields(self):
         stale = self.beat(1)
@@ -639,6 +733,49 @@ class ProducingAndApplying(StoreCase):
         self.assertEqual(updated["state"], "accepted")
         self.assertEqual(updated["call"], "reviewer words")
         self.assertEqual(updated["slots"]["proof"], "`python -m unittest`")
+
+    def test_put_beat_cannot_change_a_resolved_resolution_kind(self):
+        stored = self.store.put_beat(
+            dict(FLAG, n=3, resolution_kind="delivery")
+        )
+        self.store.produce("click-1", 3, "accept", "implement it")
+        stored["resolution_kind"] = "decision"
+
+        updated = self.store.put_beat(stored)
+
+        self.assertEqual(updated["resolution_kind"], "delivery")
+
+    def test_put_beat_preserves_an_omitted_open_resolution_kind(self):
+        self.store.put_beat(dict(FLAG, n=3, resolution_kind="delivery"))
+        stale = dict(FLAG, n=3, claim="clearer claim")
+
+        updated = self.store.put_beat(stale)
+
+        self.assertEqual(updated["resolution_kind"], "delivery")
+        with self.assertRaisesRegex(session_store.Conflict, "resolution_kind 'delivery'"):
+            self.store.produce("decision-1", 3, "decide", "leave it")
+
+    def test_put_beat_can_explicitly_change_an_open_resolution_kind(self):
+        stored = self.store.put_beat(dict(FLAG, n=3))
+        stored["resolution_kind"] = "decision"
+
+        updated = self.store.put_beat(stored)
+
+        self.assertEqual(updated["resolution_kind"], "decision")
+        with self.assertRaisesRegex(session_store.Conflict, "resolution_kind 'decision'"):
+            self.store.produce("click-1", 3, "accept", "implement it")
+
+    def test_an_older_empty_decide_still_deduplicates_by_action_id(self):
+        self.store.produce("decision-1", 1, "decide", "stays as is")
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            db.execute(
+                "UPDATE actions SET note = '' WHERE action_id = 'decision-1'"
+            )
+
+        replay = self.store.produce("decision-1", 1, "decide", "")
+
+        self.assertEqual(replay["action_id"], "decision-1")
+        self.assertEqual(replay["note"], "")
 
     def test_new_beats_must_open_unresolved(self):
         accepted = dict(FLAG, n=3, state="accepted")
@@ -663,6 +800,7 @@ class ProducingAndApplying(StoreCase):
             landed="abc1234",
             branch="jacek/fix",
             delivery_kind="commit",
+            delivery={"state": "landed"},
         )
 
         with self.assertRaisesRegex(session_store.StoreError, "store-owned"):
@@ -793,7 +931,8 @@ class RecoveringAndDelivering(StoreCase):
 
         self.assertEqual(failed["state"], "failed")
         self.assertEqual(self.store.fail(action["seq"], "tests failed", "fix the fixture"), failed)
-        self.assertEqual(self.beat(1)["slots"]["fix"], "fix the fixture")
+        self.assertEqual(failed["owed"], "fix the fixture")
+        self.assertEqual(self.beat(1)["slots"]["fix"], "pin it")
         self.assertEqual(self.store.head()["seq"], action["seq"])
         with self.assertRaisesRegex(session_store.Conflict, "has not landed"):
             self.store.ack(action["seq"])
@@ -827,7 +966,7 @@ class RecoveringAndDelivering(StoreCase):
 
         self.assertEqual(latest["error"], "tests failed")
         self.assertEqual(latest["owed"], "fix tests")
-        self.assertEqual(self.beat(1)["slots"]["fix"], "fix tests")
+        self.assertEqual(self.beat(1)["slots"]["fix"], "pin it")
         self.assertEqual(
             self.store.reconcile()["failed_deliveries"][0]["error"],
             "tests failed",
@@ -891,16 +1030,41 @@ class RecoveringAndDelivering(StoreCase):
         self.assertEqual(session["title"], "new title")
         self.assertEqual(session["lands"][0]["where"], "abc1234")
 
-    def test_a_stale_beat_write_cannot_erase_a_failed_fix(self):
+    def test_a_stale_beat_write_cannot_replace_the_approved_fix(self):
         stale = self.beat(1)
         action = self.store.produce("click-1", 1, "accept", "yes")
         self.store.fail(action["seq"], "tests failed", "fix the fixture")
         stale["claim"] = "clearer claim"
+        stale["slots"]["fix"] = "different implementation intent"
 
         updated = self.store.put_beat(stale)
 
         self.assertEqual(updated["claim"], "clearer claim")
-        self.assertEqual(updated["slots"]["fix"], "fix the fixture")
+        self.assertEqual(updated["slots"]["fix"], "pin it")
+        presented = self.store.presentation_snapshot()[1][0]
+        self.assertEqual(presented["delivery"]["owed"], "fix the fixture")
+
+    def test_presentation_snapshot_projects_delivery_without_persisting_it(self):
+        raw_session, raw_beats = self.store.snapshot()
+        presented_session, presented_beats = self.store.presentation_snapshot()
+
+        self.assertEqual(presented_session, raw_session)
+        self.assertNotIn("delivery", raw_beats[0])
+        self.assertEqual(presented_beats[0]["delivery"], {"state": "none"})
+
+        action = self.store.produce("click-1", 1, "accept", "yes")
+        pending = self.store.presentation_snapshot()[1][0]["delivery"]
+        self.assertEqual(
+            pending,
+            {"state": "pending", "cause_seq": action["seq"], "kind": "commit"},
+        )
+
+        self.store.fail(action["seq"], "tests failed", "fix the fixture")
+        failed = self.store.presentation_snapshot()[1][0]["delivery"]
+        self.assertEqual(failed["state"], "failed")
+        self.assertEqual(failed["error"], "tests failed")
+        self.assertEqual(failed["owed"], "fix the fixture")
+        self.assertNotIn("delivery", self.beat(1))
 
     def test_export_regenerates_the_legacy_projection(self):
         first = self.store.produce("click-1", 1, "accept", "yes")

@@ -5,6 +5,7 @@ from pathlib import Path
 
 
 SKILL = Path(__file__).resolve().parent.parent / "skills" / "underwrite" / "SKILL.md"
+README = Path(__file__).resolve().parent.parent / "README.md"
 
 
 class ReviewModeContract(unittest.TestCase):
@@ -83,6 +84,58 @@ class ActionDeliveryContract(unittest.TestCase):
         self.assertIn("do not apply this one again", text)
 
 
+class DelegatedActionContract(unittest.TestCase):
+    def skill(self):
+        return SKILL.read_text(encoding="utf-8")
+
+    def test_visible_actions_map_to_the_existing_protocol(self):
+        text = self.skill()
+
+        for label in ("Implement", "Include in review", "Record decision"):
+            with self.subTest(label=label):
+                self.assertIn(label, text)
+        self.assertIn("both post the canonical `accept` action", text)
+        self.assertIn("Record decision posts the\nexisting `decide` action", text)
+
+    def test_decision_only_beats_declare_their_resolution_kind(self):
+        text = self.skill()
+
+        self.assertIn('resolution_kind: "decision"', text)
+        self.assertIn('resolution_kind: "delivery"', text)
+        self.assertIn("Imported legacy beats may omit the field", text)
+        self.assertIn("moves the beat directly to `decided`", text)
+
+    def test_branch_action_authorizes_later_implementation(self):
+        text = self.skill()
+
+        self.assertNotIn("a patch you have already written and run", text)
+        self.assertNotIn("FIX    the patch", text)
+        self.assertIn(
+            "FIX    the implementation intent, review recommendation, or decision owed",
+            text,
+        )
+        self.assertIn("after the click", text)
+        self.assertIn("It does not\napprove an exact prepared patch.", text)
+        self.assertIn("approved `FIX` intent remains unchanged", text)
+
+    def test_final_render_rejects_unfinished_delegated_delivery(self):
+        text = self.skill()
+
+        self.assertIn("$S/scripts/render-report.py $R --final", text)
+        self.assertIn("pending and failed delivery are valid live states", text)
+        self.assertIn("They are never shippable final states", text)
+        self.assertIn("Never mark an unknown outcome failed", text)
+
+    def test_readme_describes_delegated_actions(self):
+        text = README.read_text(encoding="utf-8")
+
+        self.assertNotIn("patch already\nwritten and run", text)
+        self.assertIn("Implement applies and verifies a branch fix", text)
+        self.assertIn("Include in review queues a finding", text)
+        self.assertIn("Record decision stores an answer", text)
+        self.assertIn("both record the existing `accept` action", text)
+
+
 class FrozenSnapshotContract(unittest.TestCase):
     def skill(self):
         return SKILL.read_text(encoding="utf-8")
@@ -103,7 +156,7 @@ class FrozenSnapshotContract(unittest.TestCase):
         end = text.index("In `review` mode", start)
         rule = text[start:end]
 
-        self.assertIn("immediately before checkout or patch", rule)
+        self.assertIn("immediately before checkout or\nimplementation", rule)
         self.assertIn("again immediately before the commit", rule)
         self.assertIn("supervised replacement session", rule)
         self.assertIn('pin-branch "$R" <fixes-branch>', rule)

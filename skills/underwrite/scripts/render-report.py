@@ -276,6 +276,11 @@ LIVE_JS = """<script>
       action: button.dataset.action,
       note: note ? note.value.trim() : '',
     };
+    if (fresh.action === 'decide' && !fresh.note) {
+      msg.textContent = 'enter the decision first';
+      if (note) note.focus();
+      return;
+    }
     if (pending && !sameAction(pending, fresh)) {
       msg.textContent = 'retry the saved ' + pending.action + ' first';
       restorePending();
@@ -322,6 +327,13 @@ def md(text):
     return re.sub(r"`([^`]+)`", r"<code>\1</code>", out)
 
 
+def session_mode(session):
+    audience = session.get("audience")
+    if isinstance(audience, dict) and audience.get("mode") in ("branch", "review"):
+        return audience["mode"]
+    return "branch"
+
+
 def validate(beat, mode="branch", final=False):
     """Return a list of problems. Empty means the beat is shippable."""
     problems = []
@@ -334,13 +346,17 @@ def validate(beat, mode="branch", final=False):
     for key in slots:
         if key not in SLOTS:
             problems.append(f"beat {n}: unknown slot {key!r}")
+    resolution_kind = beat.get("resolution_kind", "delivery")
+    if resolution_kind not in ("delivery", "decision"):
+        problems.append(
+            f"beat {n}: resolution_kind must be delivery or decision"
+        )
     if not slots.get("what"):
         problems.append(f"beat {n}: no what")
     if state in ("clean", "accepted") and not slots.get("proof"):
         problems.append(f"beat {n}: {state} with no proof")
-    # Review mode renders once before the POST. Its delivered report has the same
-    # obligation as branch mode, with the review URL in place of a commit.
-    if (mode == "branch" or final) and state == "accepted" and not beat.get("landed"):
+    # Live reports may show delegated work in flight. Final reports require its receipt.
+    if final and state == "accepted" and not beat.get("landed"):
         problems.append(f"beat {n}: accepted, nothing landed")
     if state == "accepted" and beat.get("landed"):
         expected_delivery = "commit" if mode == "branch" else "review"
@@ -386,7 +402,45 @@ def diff_html(lines):
     return f'<div class="diff"><pre>{"".join(out)}</pre></div>'
 
 
-def beat_html(beat, problems, expanded, live=False):
+def delivery_html(beat, mode):
+    if beat.get("state") != "accepted":
+        return ""
+    delivery = beat.get("delivery")
+    if not isinstance(delivery, dict):
+        return ""
+    state = delivery.get("state")
+    if state == "pending":
+        label = (
+            "Implementation pending"
+            if mode == "branch"
+            else "Included, review pending"
+        )
+        return (
+            '<div class="call delivery pending">'
+            f'<span class="lbl">{label}</span></div>'
+        )
+    if state != "failed":
+        return ""
+    label = (
+        "Implementation failed"
+        if mode == "branch"
+        else "Review publication failed"
+    )
+    detail = []
+    if delivery.get("error"):
+        detail.append(f'<span class="delivery-error">{md(delivery["error"])}</span>')
+    if delivery.get("owed"):
+        detail.append(
+            '<span class="delivery-owed">Next attempt: '
+            f'{md(delivery["owed"])}</span>'
+        )
+    return (
+        '<div class="call delivery failed">'
+        f'<span class="lbl">{label}</span>{" ".join(detail)}</div>'
+    )
+
+
+def beat_html(beat, problems, expanded, live=False, mode="branch"):
     suffix, token = STATE_STYLE.get(beat.get("state"), ("unver", "UNVERIFIED"))
     slots = beat.get("slots") or {}
     n = beat.get("n", "?")
@@ -408,6 +462,9 @@ def beat_html(beat, problems, expanded, live=False):
             '<div class="call"><span class="lbl">Your call · beat '
             f'{n}</span><q>{md(beat["call"])}</q></div>'
         )
+    delivery = delivery_html(beat, mode)
+    if delivery:
+        body.append(delivery)
     if beat.get("landed"):
         branch = beat.get("branch")
         body.append(
@@ -418,13 +475,26 @@ def beat_html(beat, problems, expanded, live=False):
         )
     if live:
         flag = beat.get("state") == "flag"
-        controls = (
-            '<button class="act primary" data-action="accept">Accept</button>'
-            '<button class="act" data-action="drop">Drop</button>'
-            if flag
-            else '<button class="act" data-action="note">Save note</button>'
-        )
-        placeholder = "or put it in your own words" if flag else "note this for the record"
+        if flag:
+            decision_only = beat.get("resolution_kind") == "decision"
+            action = "decide" if decision_only else "accept"
+            label = (
+                "Record decision"
+                if decision_only
+                else "Implement" if mode == "branch" else "Include in review"
+            )
+            controls = (
+                f'<button class="act primary" data-action="{action}">{label}</button>'
+                '<button class="act" data-action="drop">Drop</button>'
+            )
+            placeholder = (
+                "record the decision in your own words"
+                if decision_only
+                else "or put it in your own words"
+            )
+        else:
+            controls = '<button class="act" data-action="note">Save note</button>'
+            placeholder = "note this for the record"
         body.append(
             f'<div class="acts" data-acts="{attr(n)}">{controls}'
             f'<input class="note" aria-label="your words, beat {attr(n)}" placeholder="{placeholder}">'
@@ -447,6 +517,7 @@ def beat_html(beat, problems, expanded, live=False):
 
 def body_html(session, beats, problems_by_n, live=False):
     """Everything below the masthead. This is what /fragment re-serves on a change."""
+    mode = session_mode(session)
     counts = {}
     for beat in beats:
         counts[beat.get("state")] = counts.get(beat.get("state"), 0) + 1
@@ -481,7 +552,10 @@ def body_html(session, beats, problems_by_n, live=False):
         if not picked:
             continue
         cards = "".join(
-            beat_html(b, problems_by_n.get(b.get("n")), expanded, live) for b in picked
+            beat_html(
+                b, problems_by_n.get(b.get("n")), expanded, live=live, mode=mode
+            )
+            for b in picked
         )
         parts.append(
             f'<section class="sec"><div class="sec-head"><h2>{heading}</h2>'
@@ -558,7 +632,7 @@ def load(root, css_path, final=False):
     """Read a session off disk. Returns (session, beats, problems_by_n, problems)."""
     legacy = not (root / "session.sqlite3").exists()
     if not legacy:
-        session, beats = SessionStore(root).snapshot()
+        session, beats = SessionStore(root).presentation_snapshot()
     else:
         session = json.loads((root / "session.json").read_text(encoding="utf-8"))
         beats = [
@@ -576,10 +650,9 @@ def load(root, css_path, final=False):
         session["audience"] = {}
         mode = "branch"
     else:
-        mode = audience.get("mode")
-        if mode not in ("branch", "review"):
+        if audience.get("mode") not in ("branch", "review"):
             problems.append("session audience mode must be branch or review")
-            mode = "branch"
+        mode = session_mode(session)
     if legacy:
         expected_delivery = "commit" if mode == "branch" else "review"
         for beat in beats:
