@@ -25,10 +25,12 @@ written and run, so it is accept-or-drop in one word. Accepted flags become comm
 
 ## How a session goes
 
-**Ingest.** Reads the PR, the diff, the last twenty commits touching those paths, and the
-two or three earlier PRs the squash-merge subjects point at. That last one is not padding:
-prior work in the same area is reliably where the best finding comes from, because it is
-the context a diff cannot show you.
+**Ingest.** Freezes the PR's exact base and head, fetches both into a bare repository, and
+builds their three-dot diff locally. That avoids remote display limits and binds every
+later check to full commit IDs. It then reads the last twenty commits touching those paths
+and the two or three earlier PRs the squash-merge subjects point at. That last one is not
+padding: prior work in the same area is reliably where the best finding comes from,
+because it is the context a diff cannot show you.
 
 **Orient.** A short reconstruction of what the change is for, plus a claim check comparing
 the PR description against what the diff actually does. You confirm or correct it, and
@@ -57,7 +59,9 @@ A claim with neither does not ship.
 self-authored PR with no other reviewers lands as commits on a branch created lazily at
 the first accepted flag, so a session with no accepts leaves no trace. Anything with a
 real audience lands as a single GitHub review, anchor-validated first because one bad
-anchor rejects the whole thing.
+anchor rejects the whole thing. The review carries the frozen full head as `commit_id`, so
+a PR update cannot silently move the delivery onto code that was never walked. A stable
+hidden marker distinguishes that delivery from every older review on the same commit.
 
 ## The page drives
 
@@ -104,7 +108,8 @@ session.json     derived compatibility export
 beats/01.json    derived compatibility export of one beat
 decisions.jsonl  derived compatibility export of reviewer actions
 ack.json         derived compatibility export of the handled cursor
-pr.diff          saved review input
+pr.json          GitHub metadata captured with the target
+pr.diff          frozen local three-dot diff, hash-bound to the target
 report.html      rendered, regenerable
 ```
 
@@ -112,8 +117,14 @@ The scripts are Python 3 stdlib, with no dependencies. `serve.py` runs the walk 
 `sessionctl.py` is the only command-line mutation path. SQLite commits a reviewer action
 with its local beat change, deduplicates retries by action ID, and stores navigation as an
 absolute application receipt. A crash before commit changes nothing; a crash after commit
-resumes from the stored result without moving twice. JSON is regenerated from SQLite and
-is never authoritative once the database exists.
+resumes from the stored result without moving twice. Compatibility JSON is regenerated
+from SQLite and is never authoritative once the database exists. The `snapshot-pr`
+command in `sessionctl.py` records the write-once target, including the head repository
+and ref.
+`check-pr` refuses a moved base, head, route, or lifecycle before an external effect, while
+`pin-branch` freezes the fixes branch for a merged PR and `check-worktree` pins branch
+changes to the frozen head plus commits already recorded by the session. The frozen diff
+is checked by byte count and SHA-256.
 
 `render-report.py` turns a session into the page and validates it on the way through: a
 flag with no fix, a clean beat with no proof, a proof naming no command, or a beat you

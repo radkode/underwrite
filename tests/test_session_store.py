@@ -64,6 +64,162 @@ class StoreCase(unittest.TestCase):
         return next(beat for beat in self.store.snapshot()[1] if beat["n"] == n)
 
 
+class FrozenTargets(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.store = session_store.SessionStore(self.root)
+
+    def target(self, suffix="1"):
+        return {
+            "version": 1,
+            "kind": "github_pr",
+            "repo": "acme/widget",
+            "number": 7,
+            "state": "open",
+            "merged_at": None,
+            "base_sha": ("a" if suffix == "1" else "c") * 40,
+            "head_sha": ("b" if suffix == "1" else "d") * 40,
+            "head_repo_id": 123,
+            "head_repo": "acme/widget",
+            "head_ref": "feature",
+            "merge_base_sha": ("e" if suffix == "1" else "f") * 40,
+            "changed_files": 1,
+        }
+
+    def inputs(self, suffix="1"):
+        diff = self.root / f"capture-{suffix}.diff"
+        metadata = self.root / f"capture-{suffix}.json"
+        diff.write_bytes(f"diff {suffix}\n".encode())
+        metadata.write_text(json.dumps({"capture": suffix}), encoding="utf-8")
+        return diff, metadata
+
+    def freeze(self, suffix="1"):
+        diff, metadata = self.inputs(suffix)
+        return self.store.freeze_target(self.target(suffix), diff, metadata)
+
+    def test_freeze_records_one_hash_verified_target(self):
+        target = self.freeze()
+
+        self.assertEqual(self.store.snapshot()[0]["target"], target)
+        self.assertEqual(self.store.verify_target_files(), target)
+        self.assertEqual((self.root / "pr.diff").read_bytes(), b"diff 1\n")
+        self.assertEqual(json.loads((self.root / "pr.json").read_text()), {"capture": "1"})
+
+    def test_generic_mutations_cannot_add_remove_or_change_a_target(self):
+        diff, metadata = self.inputs()
+        with self.assertRaisesRegex(session_store.Conflict, "freeze-target"):
+            self.store.put_session(dict(SESSION, target={
+                **self.target(),
+                "diff_sha256": "0" * 64,
+                "diff_bytes": 0,
+            }))
+
+        target = self.store.freeze_target(self.target(), diff, metadata)
+        with self.assertRaisesRegex(session_store.Conflict, "cannot change"):
+            self.store.put_session(SESSION)
+        with self.assertRaisesRegex(session_store.Conflict, "freeze-target"):
+            self.store.patch_session({"target": target})
+
+        action = self.store.produce("nav-1", None, "next", "")
+        without_target = dict(self.store.snapshot()[0])
+        without_target.pop("target")
+        with self.assertRaisesRegex(session_store.Conflict, "cannot change"):
+            self.store.apply(action["seq"], {"kind": "walk"}, session=without_target)
+        self.assertEqual(self.store.head()["state"], "produced")
+
+    def test_first_freeze_is_refused_after_the_walk_starts(self):
+        self.store.put_beat(FLAG)
+        diff, metadata = self.inputs()
+
+        with self.assertRaisesRegex(session_store.Conflict, "before beats or actions"):
+            self.store.freeze_target(self.target(), diff, metadata)
+
+        self.assertNotIn("target", self.store.snapshot()[0])
+        self.assertFalse((self.root / "pr.diff").exists())
+
+    def test_a_delivery_branch_is_write_once_through_its_gateway(self):
+        self.freeze()
+        self.store.patch_session({
+            "audience": {"mode": "branch", "why": "the author owns the branch"}
+        })
+
+        pinned = self.store.pin_branch("feature")
+
+        self.assertEqual(pinned["delivery_branch"], "feature")
+        self.assertEqual(self.store.pin_branch("feature"), pinned)
+        with self.assertRaisesRegex(session_store.Conflict, "cannot change"):
+            self.store.pin_branch("another")
+        with self.assertRaisesRegex(session_store.Conflict, "pin-branch"):
+            self.store.patch_session({"delivery_branch": "another"})
+        without_branch = dict(self.store.snapshot()[0])
+        without_branch.pop("delivery_branch")
+        with self.assertRaisesRegex(session_store.Conflict, "cannot change"):
+            self.store.put_session(without_branch)
+
+    def test_exact_replay_repairs_a_corrupt_projection(self):
+        target = self.freeze()
+        (self.root / "pr.diff").write_bytes(b"tampered")
+        with self.assertRaisesRegex(session_store.Conflict, "does not match"):
+            self.store.verify_target_files()
+
+        replay = self.freeze()
+
+        self.assertEqual(replay, target)
+        self.assertEqual(self.store.verify_target_files(), target)
+
+    def test_verified_diff_returns_the_exact_hashed_bytes(self):
+        target = self.freeze()
+
+        read_target, data = self.store.read_verified_target_diff()
+        (self.root / "pr.diff").write_bytes(b"changed\n")
+
+        self.assertEqual(read_target, target)
+        self.assertEqual(data, b"diff 1\n")
+        with self.assertRaisesRegex(session_store.Conflict, "does not match"):
+            self.store.read_verified_target_diff()
+
+    def test_concurrent_different_freezes_cannot_split_identity_and_diff(self):
+        first = self.inputs("1")
+        second = self.inputs("2")
+        ready = threading.Barrier(2)
+        results, errors = [], []
+
+        def freeze(target, inputs):
+            ready.wait()
+            try:
+                results.append(self.store.freeze_target(target, *inputs))
+            except session_store.Conflict as error:
+                errors.append(error)
+
+        threads = [
+            threading.Thread(target=freeze, args=(self.target("1"), first)),
+            threading.Thread(target=freeze, args=(self.target("2"), second)),
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(len(errors), 1)
+        frozen = self.store.verify_target_files()
+        expected = b"diff 1\n" if frozen["base_sha"] == "a" * 40 else b"diff 2\n"
+        self.assertEqual((self.root / "pr.diff").read_bytes(), expected)
+
+    def test_a_failed_database_save_publishes_no_target_and_retry_repairs_it(self):
+        diff, metadata = self.inputs()
+        with mock.patch.object(
+            self.store, "_save_session", side_effect=OSError("database unavailable")
+        ):
+            with self.assertRaisesRegex(OSError, "database unavailable"):
+                self.store.freeze_target(self.target(), diff, metadata)
+
+        self.assertNotIn("target", self.store.snapshot()[0])
+        target = self.store.freeze_target(self.target(), diff, metadata)
+        self.assertEqual(self.store.verify_target_files(), target)
+
+
 class CreatingAndMigrating(StoreCase):
     def downgrade_to_pre_identity_v1(self, format_version=1):
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:

@@ -83,5 +83,55 @@ class ActionDeliveryContract(unittest.TestCase):
         self.assertIn("do not apply this one again", text)
 
 
+class FrozenSnapshotContract(unittest.TestCase):
+    def skill(self):
+        return SKILL.read_text(encoding="utf-8")
+
+    def test_ingest_freezes_a_local_exact_diff_before_contextual_reads(self):
+        text = self.skill()
+        snapshot = text.index('sessionctl.py snapshot-pr "$R"')
+        context = text.index("After the snapshot is frozen")
+
+        self.assertLess(snapshot, context)
+        self.assertNotIn("gh pr diff", text)
+        self.assertIn("local three-dot diff", text)
+        self.assertIn("check-pr` again after those reads", text)
+
+    def test_pr_movement_stops_branch_side_effects(self):
+        text = self.skill()
+        start = text.index("On accept, in `branch` mode")
+        end = text.index("In `review` mode", start)
+        rule = text[start:end]
+
+        self.assertIn("immediately before checkout or patch", rule)
+        self.assertIn("again immediately before the commit", rule)
+        self.assertIn("supervised replacement session", rule)
+        self.assertIn('pin-branch "$R" <fixes-branch>', rule)
+        self.assertGreaterEqual(rule.count('check-worktree "$R" "$PWD"'), 2)
+        self.assertIn("full SHA", rule)
+        self.assertIn('--repo-root "$PWD"', rule)
+
+    def test_review_validation_and_delivery_share_the_frozen_head(self):
+        text = self.skill()
+        start = text.index("**Review mode.**")
+        rule = text[start:]
+
+        self.assertIn('"commit_id": "<frozen target.head_sha>"', rule)
+        self.assertIn('validate-anchors.py --session "$R"', rule)
+        approval = rule.index("one explicit yes")
+        preflight = rule.index('check-pr "$R" --require-open')
+        post = rule.index("pulls/<n>/reviews --method POST")
+        self.assertLess(approval, preflight)
+        self.assertLess(preflight, post)
+        self.assertIn('review-receipt "$R"', rule)
+        self.assertIn('--actor "$ACTOR"', rule)
+        self.assertIn("stable hidden delivery marker", rule)
+        self.assertIn("requires exactly one non-pending review", rule)
+        self.assertIn("`COMMENT`, `APPROVE`, or `REQUEST_CHANGES`", rule)
+        self.assertIn("`DISMISSED`\nproves the post happened", rule)
+        self.assertIn("Never match only `commit_id`", rule)
+        self.assertIn("posted but stale", rule)
+
+
 if __name__ == "__main__":
     unittest.main()

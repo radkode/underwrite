@@ -6,7 +6,7 @@ diff, so this runs before every post. Anchors that land near a hunk are snapped 
 the nearest valid line; anchors with no hunk to attach to are folded into the
 review body so the observation survives.
 
-  validate-anchors.py --pr 1234 --payload payload.json --out payload.fixed.json
+  validate-anchors.py --session review-dir --payload payload.json --out payload.fixed.json
   validate-anchors.py --diff pr.diff --payload payload.json
 
 Exit 0 = every anchor was already valid, 2 = anchors were snapped or folded,
@@ -16,10 +16,18 @@ Exit 0 = every anchor was already valid, 2 = anchors were snapped or folded,
 import argparse
 import json
 import re
-import subprocess
 import sys
+from pathlib import Path
+
+
+HERE = Path(__file__).resolve().parent
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from session_store import SessionStore, StoreError  # noqa: E402
 
 HUNK = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
+REVIEW_MARKER = re.compile(r"<!-- underwrite-review:[0-9a-f]{32} -->")
 SNAP_WINDOW = 20
 
 
@@ -197,7 +205,7 @@ class Usage(argparse.ArgumentParser):
 def main():
     ap = Usage()
     src = ap.add_mutually_exclusive_group(required=True)
-    src.add_argument("--pr", help="PR number; fetches the diff with gh")
+    src.add_argument("--session", help="session with a frozen PR target")
     src.add_argument("--diff", help="path to a unified diff, or - for stdin")
     ap.add_argument("--payload", required=True, help="review payload JSON")
     ap.add_argument("--out", help="where to write the corrected payload (default stdout)")
@@ -206,10 +214,13 @@ def main():
     try:
         # All three reads take bytes on purpose. Text mode translates a lone \r inside
         # a line's content to \n, desyncing the hunk before parse_diff ever runs.
-        if args.pr:
-            diff = subprocess.run(
-                ["gh", "pr", "diff", args.pr], capture_output=True, check=True
-            ).stdout.decode("utf-8")
+        target = None
+        if args.session:
+            root = Path(args.session).expanduser()
+            store = SessionStore(root)
+            target, diff_bytes = store.read_verified_target_diff()
+            marker = store.review_marker()
+            diff = diff_bytes.decode("utf-8")
         elif args.diff == "-":
             diff = sys.stdin.buffer.read().decode("utf-8")
         else:
@@ -218,7 +229,33 @@ def main():
 
         with open(args.payload, encoding="utf-8") as fh:
             payload = json.load(fh)
-    except (OSError, json.JSONDecodeError, subprocess.CalledProcessError) as e:
+        if not isinstance(payload, dict):
+            raise StoreError("review payload must be an object")
+        if target is not None:
+            if payload.get("event") not in (
+                "COMMENT",
+                "APPROVE",
+                "REQUEST_CHANGES",
+            ):
+                raise StoreError(
+                    "review payload event must submit a final review, not leave it pending"
+                )
+            commit_id = payload.get("commit_id")
+            if commit_id is None:
+                payload["commit_id"] = target["head_sha"]
+            elif commit_id != target["head_sha"]:
+                raise StoreError("review payload commit_id does not match the frozen head")
+            body = payload.get("body", "")
+            if body is None:
+                body = ""
+            if not isinstance(body, str):
+                raise StoreError("review payload body must be text")
+            markers = REVIEW_MARKER.findall(body)
+            if markers and markers != [marker]:
+                raise StoreError("review payload has a conflicting delivery marker")
+            if not markers:
+                payload["body"] = (body.rstrip() + "\n\n" + marker).strip()
+    except (OSError, UnicodeError, json.JSONDecodeError, StoreError) as e:
         sys.exit("validate-anchors: %s" % e)
 
     report = validate(payload, parse_diff(diff))

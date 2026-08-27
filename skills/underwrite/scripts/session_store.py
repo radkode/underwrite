@@ -2,8 +2,10 @@
 """Transactional storage for one underwrite session."""
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import uuid
@@ -20,6 +22,25 @@ RESOLVE = {"accept": "accepted", "drop": "dropped", "decide": "decided"}
 RESOLVABLE = {"accept": ("flag",), "drop": ("flag",), "decide": ("flag", "accepted")}
 OPEN_STATES = ("clean", "flag", "unverified")
 _MISSING = object()
+_FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+_TARGET_FIELDS = {
+    "version",
+    "kind",
+    "repo",
+    "number",
+    "state",
+    "merged_at",
+    "base_sha",
+    "head_sha",
+    "head_repo_id",
+    "head_repo",
+    "head_ref",
+    "merge_base_sha",
+    "changed_files",
+    "diff_sha256",
+    "diff_bytes",
+}
 
 
 class StoreError(ValueError):
@@ -82,6 +103,46 @@ def _atomic_write(path, payload):
             os.unlink(name)
         except FileNotFoundError:
             pass
+
+
+def _stage_copy(source, directory, label):
+    source = Path(source)
+    fd, name = tempfile.mkstemp(prefix=f".{label}.", suffix=".tmp", dir=str(directory))
+    digest, size = hashlib.sha256(), 0
+    try:
+        with source.open("rb") as incoming, os.fdopen(fd, "wb") as outgoing:
+            while True:
+                chunk = incoming.read(1024 * 1024)
+                if not chunk:
+                    break
+                outgoing.write(chunk)
+                digest.update(chunk)
+                size += len(chunk)
+            outgoing.flush()
+            os.fsync(outgoing.fileno())
+        return Path(name), digest.hexdigest(), size
+    except Exception:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+        try:
+            os.unlink(name)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _file_identity(path):
+    digest, size = hashlib.sha256(), 0
+    with Path(path).open("rb") as handle:
+        while True:
+            chunk = handle.read(1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+            size += len(chunk)
+    return digest.hexdigest(), size
 
 
 class SessionStore:
@@ -545,7 +606,75 @@ class SessionStore:
                 raise StoreError("session audience must be an object")
             if audience.get("mode") not in ("branch", "review"):
                 raise StoreError("session audience mode must be branch or review")
+        delivery_branch = body.get("delivery_branch")
+        if delivery_branch is not None and (
+            not isinstance(delivery_branch, str)
+            or not delivery_branch.strip()
+            or delivery_branch != delivery_branch.strip()
+            or any(ord(character) < 32 for character in delivery_branch)
+        ):
+            raise StoreError("session delivery_branch must be a valid non-empty name")
+        if "target" in body:
+            body["target"] = self._target_document(body["target"])
         return version, body
+
+    def _target_document(self, document):
+        if not isinstance(document, dict):
+            raise StoreError("session target must be an object")
+        target = _copy(document)
+        missing = sorted(_TARGET_FIELDS - set(target))
+        unknown = sorted(set(target) - _TARGET_FIELDS)
+        if missing:
+            raise StoreError(f"session target is missing {', '.join(missing)}")
+        if unknown:
+            raise StoreError(f"session target has unknown field {', '.join(unknown)}")
+        if type(target["version"]) is not int or target["version"] != 1:
+            raise StoreError("session target version must be 1")
+        if target["kind"] != "github_pr":
+            raise StoreError("session target kind must be github_pr")
+        repo = target["repo"]
+        if (
+            not isinstance(repo, str)
+            or repo.count("/") != 1
+            or not all(part.strip() for part in repo.split("/"))
+        ):
+            raise StoreError("session target repo must be owner/name")
+        _positive(target["number"], "session target number")
+        if target["state"] not in ("open", "closed"):
+            raise StoreError("session target state must be open or closed")
+        if target["merged_at"] is not None and (
+            not isinstance(target["merged_at"], str) or not target["merged_at"].strip()
+        ):
+            raise StoreError("session target merged_at must be null or non-empty text")
+        for name in ("base_sha", "head_sha", "merge_base_sha"):
+            value = target[name]
+            if not isinstance(value, str) or not _FULL_SHA.fullmatch(value):
+                raise StoreError(f"session target {name} must be a full lowercase SHA")
+        head_repo = target["head_repo"]
+        head_repo_id = target["head_repo_id"]
+        if head_repo is None:
+            if head_repo_id is not None:
+                raise StoreError(
+                    "session target head_repo_id must be null when head_repo is null"
+                )
+        else:
+            if (
+                not isinstance(head_repo, str)
+                or head_repo.count("/") != 1
+                or not all(part.strip() for part in head_repo.split("/"))
+            ):
+                raise StoreError("session target head_repo must be null or owner/name")
+            _positive(head_repo_id, "session target head_repo_id")
+        if not isinstance(target["head_ref"], str) or not target["head_ref"].strip():
+            raise StoreError("session target head_ref must be non-empty text")
+        _non_negative(target["changed_files"], "session target changed_files")
+        if (
+            not isinstance(target["diff_sha256"], str)
+            or not _SHA256.fullmatch(target["diff_sha256"])
+        ):
+            raise StoreError("session target diff_sha256 must be a SHA-256 digest")
+        _non_negative(target["diff_bytes"], "session target diff_bytes")
+        return target
 
     def _beat_document(self, document):
         if not isinstance(document, dict):
@@ -589,10 +718,37 @@ class SessionStore:
             raise StoreError(f"no beat {n}")
         return row
 
-    def _save_session(self, db, document, allow_new_lands=False):
+    def _save_session(
+        self,
+        db,
+        document,
+        allow_new_lands=False,
+        allow_new_target=False,
+        allow_new_branch=False,
+    ):
         version, body = self._session_document(document)
         row = self._session_row(db)
         current = json.loads(row["body_json"])
+        current_target = current.get("target", _MISSING)
+        incoming_target = body.get("target", _MISSING)
+        if current_target != incoming_target:
+            if current_target is _MISSING and allow_new_target:
+                pass
+            elif current_target is _MISSING:
+                raise Conflict("session target must be recorded through freeze-target")
+            else:
+                raise Conflict("session target cannot change once frozen")
+        current_branch = current.get("delivery_branch", _MISSING)
+        incoming_branch = body.get("delivery_branch", _MISSING)
+        if current_target is not _MISSING and current_branch != incoming_branch:
+            if current_branch is _MISSING and allow_new_branch:
+                pass
+            elif current_branch is _MISSING:
+                raise Conflict(
+                    "session delivery_branch must be recorded through pin-branch"
+                )
+            else:
+                raise Conflict("session delivery_branch cannot change once pinned")
         current_mode = self._expected_delivery_kind(current)
         incoming_mode = self._expected_delivery_kind(body)
         if current_mode != incoming_mode:
@@ -714,6 +870,12 @@ class SessionStore:
         patch = _copy(changes)
         if "lands" in patch:
             raise Conflict("session lands must be changed through land")
+        if "target" in patch:
+            raise Conflict("session target must be changed through freeze-target")
+        if "delivery_branch" in patch:
+            raise Conflict(
+                "session delivery_branch must be changed through pin-branch"
+            )
         if "schema_version" in patch:
             version = patch.pop("schema_version")
             if type(version) is not int or version != SCHEMA_VERSION:
@@ -725,6 +887,183 @@ class SessionStore:
             if changed:
                 self._bump_render(db)
         return self.snapshot()[0]
+
+    def pin_branch(self, branch):
+        if not isinstance(branch, str) or not branch.strip():
+            raise StoreError("delivery branch must be non-empty text")
+        branch = branch.strip()
+        if any(ord(character) < 32 for character in branch):
+            raise StoreError("delivery branch contains a control character")
+        with self._write() as db:
+            current = json.loads(self._session_row(db)["body_json"])
+            target = current.get("target")
+            if target is None:
+                raise Conflict("session has no frozen target")
+            if self._expected_delivery_kind(current) != "commit":
+                raise Conflict("session is not in branch delivery mode")
+            frozen = current.get("delivery_branch")
+            if frozen is not None:
+                if frozen != branch:
+                    raise Conflict("session delivery_branch cannot change once pinned")
+            else:
+                if target["state"] == "open" and target["merged_at"] is None:
+                    if branch != target["head_ref"]:
+                        raise Conflict(
+                            "open PR delivery branch must match the frozen head ref"
+                        )
+                has_landed = db.execute(
+                    "SELECT EXISTS(SELECT 1 FROM beats WHERE delivery_state = 'landed')"
+                ).fetchone()[0]
+                if has_landed:
+                    raise Conflict(
+                        "delivery branch must be pinned before the first landing"
+                    )
+                current["delivery_branch"] = branch
+                if self._save_session(db, current, allow_new_branch=True):
+                    self._bump_render(db)
+        return self.snapshot()[0]
+
+    def freeze_target(self, document, diff_source, metadata_source):
+        target = _copy(document)
+        for name in ("diff_sha256", "diff_bytes"):
+            if name in target:
+                raise StoreError(f"freeze-target computes {name}")
+
+        staged = []
+        with self._session_lock():
+            try:
+                diff, diff_sha256, diff_bytes = _stage_copy(
+                    diff_source, self.root, "pr.diff"
+                )
+                staged.append(diff)
+                metadata, _metadata_sha256, _metadata_bytes = _stage_copy(
+                    metadata_source, self.root, "pr.json"
+                )
+                staged.append(metadata)
+                target.update({
+                    "diff_sha256": diff_sha256,
+                    "diff_bytes": diff_bytes,
+                })
+                target = self._target_document(target)
+
+                with self._read() as db:
+                    current = json.loads(self._session_row(db)["body_json"])
+                    frozen = current.get("target")
+                    if frozen is not None and frozen != target:
+                        raise Conflict("session target cannot change once frozen")
+                    if frozen is None:
+                        has_work = db.execute(
+                            "SELECT EXISTS(SELECT 1 FROM beats) OR "
+                            "EXISTS(SELECT 1 FROM actions)"
+                        ).fetchone()[0]
+                        if has_work:
+                            raise Conflict(
+                                "session target must be frozen before beats or actions"
+                            )
+
+                os.replace(str(metadata), str(self.root / "pr.json"))
+                staged.remove(metadata)
+                os.replace(str(diff), str(self.root / "pr.diff"))
+                staged.remove(diff)
+                _fsync_directory(self.root)
+
+                with self._write() as db:
+                    current = json.loads(self._session_row(db)["body_json"])
+                    frozen = current.get("target")
+                    if frozen is None:
+                        has_work = db.execute(
+                            "SELECT EXISTS(SELECT 1 FROM beats) OR "
+                            "EXISTS(SELECT 1 FROM actions)"
+                        ).fetchone()[0]
+                        if has_work:
+                            raise Conflict(
+                                "session target must be frozen before beats or actions"
+                            )
+                        current["target"] = target
+                        if self._save_session(db, current, allow_new_target=True):
+                            self._bump_render(db)
+                    elif frozen != target:
+                        raise Conflict("session target cannot change once frozen")
+            finally:
+                for path in staged:
+                    try:
+                        path.unlink()
+                    except FileNotFoundError:
+                        pass
+        return target
+
+    def frozen_target(self):
+        with self._read() as db:
+            session = json.loads(self._session_row(db)["body_json"])
+            target = session.get("target")
+            if target is None:
+                raise Conflict("session has no frozen target")
+            return target
+
+    def review_marker(self):
+        with self._read() as db:
+            row = self._session_row(db)
+            session = json.loads(row["body_json"])
+            if session.get("target") is None:
+                raise Conflict("session has no frozen target")
+            token = hashlib.sha256(row["session_id"].encode("utf-8")).hexdigest()[:32]
+        return f"<!-- underwrite-review:{token} -->"
+
+    def read_verified_target_diff(self):
+        with self._session_lock():
+            with self._read() as db:
+                session = json.loads(self._session_row(db)["body_json"])
+                target = session.get("target")
+                if target is None:
+                    raise Conflict("session has no frozen target")
+            try:
+                data = (self.root / "pr.diff").read_bytes()
+            except FileNotFoundError as error:
+                raise Conflict("frozen target projection pr.diff is missing") from error
+            digest = hashlib.sha256(data).hexdigest()
+            if len(data) != target["diff_bytes"] or digest != target["diff_sha256"]:
+                raise Conflict("frozen target projection pr.diff does not match")
+            return target, data
+
+    def verify_target_files(self):
+        with self._session_lock():
+            target = self.frozen_target()
+            path = self.root / "pr.diff"
+            try:
+                digest, size = _file_identity(path)
+            except FileNotFoundError as error:
+                raise Conflict("frozen target projection pr.diff is missing") from error
+            if size != target["diff_bytes"] or digest != target["diff_sha256"]:
+                raise Conflict("frozen target projection pr.diff does not match")
+            return target
+
+    def branch_position(self):
+        with self._read() as db:
+            session = json.loads(self._session_row(db)["body_json"])
+            target = session.get("target")
+            if target is None:
+                raise Conflict("session has no frozen target")
+            if self._expected_delivery_kind(session) != "commit":
+                raise Conflict("session is not in branch delivery mode")
+            deliveries = []
+            for row in db.execute(
+                "SELECT n, delivery_json FROM beats "
+                "WHERE delivery_state = 'landed' ORDER BY n"
+            ):
+                detail = json.loads(row["delivery_json"])
+                if detail.get("kind") != "commit":
+                    raise Conflict(
+                        f"beat {row['n']} has a non-commit delivery in branch mode"
+                    )
+                deliveries.append({"beat_n": row["n"], **detail})
+        deliveries.sort(key=lambda item: item["cause_seq"])
+        expected = deliveries[-1]["artifact"] if deliveries else target["head_sha"]
+        return {
+            "target": target,
+            "delivery_branch": session.get("delivery_branch"),
+            "expected_head": expected,
+            "deliveries": deliveries,
+        }
 
     def put_beat(self, document):
         beat = self._beat_document(document)

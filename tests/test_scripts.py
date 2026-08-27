@@ -294,6 +294,16 @@ class ReportOrdering(unittest.TestCase):
     def test_no_unplaced_section_when_every_state_is_known(self):
         self.assertNotIn("Unplaced", self.render([beat(n=1, state="clean")]))
 
+    def test_a_frozen_target_supplies_the_pr_identity(self):
+        html = rr.render(
+            {"target": {"repo": "acme/frozen", "number": 42, "head_sha": "a" * 40}},
+            [beat(n=1, state="clean")],
+            "",
+            {},
+        )
+        self.assertIn("acme/frozen", html)
+        self.assertIn("#42 underwrite", html)
+
     def test_a_failing_beat_carries_the_unproven_chip(self):
         html = rr.render({"repo": "r"}, [beat(n=1)], "", {1: ["beat 1: no what"]})
         self.assertIn("unproven", html)
@@ -753,21 +763,46 @@ class RenderCli(unittest.TestCase):
 
 
 class AnchorCli(unittest.TestCase):
-    """The exit codes Phase 4 reads, and the two input modes the header documents but
-    the skill does not use. Only --diff on a file had ever been run."""
+    """The exit codes Phase 4 reads and the frozen and standalone input modes."""
 
     DIFF = b"+++ b/x.py\n@@ -10,2 +10,3 @@\n ctx\n+a\n+b\n"
 
     def setUp(self):
         self.dir = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.dir, True)
-        (self.dir / "pr.diff").write_bytes(self.DIFF)
+        source = self.dir / "captured.diff"
+        metadata = self.dir / "captured.json"
+        source.write_bytes(self.DIFF)
+        metadata.write_text("{}\n", encoding="utf-8")
+        self.head = "b" * 40
+        va.SessionStore(self.dir).freeze_target(
+            {
+                "version": 1,
+                "kind": "github_pr",
+                "repo": "acme/widget",
+                "number": 42,
+                "state": "open",
+                "merged_at": None,
+                "base_sha": "a" * 40,
+                "head_sha": self.head,
+                "head_repo_id": 123,
+                "head_repo": "acme/widget",
+                "head_ref": "feature",
+                "merge_base_sha": "c" * 40,
+                "changed_files": 1,
+            },
+            source,
+            metadata,
+        )
         self.payload(11)
 
-    def payload(self, line):
+    def payload(self, line, commit_id=None):
+        payload = {"body": "head", "event": "COMMENT", "comments": [
+            {"path": "x.py", "line": line, "side": "RIGHT", "body": "n"}]}
+        if commit_id is not None:
+            payload["commit_id"] = commit_id
         (self.dir / "review.json").write_text(
-            json.dumps({"body": "head", "event": "COMMENT", "comments": [
-                {"path": "x.py", "line": line, "side": "RIGHT", "body": "n"}]}),
+            json.dumps(payload),
             encoding="utf-8",
         )
 
@@ -776,16 +811,6 @@ class AnchorCli(unittest.TestCase):
             [sys.executable, str(SCRIPTS / "validate-anchors.py"), *args],
             capture_output=True, text=True, cwd=str(self.dir), **kw,
         )
-
-    def stub_gh(self, code=0):
-        """--pr is the invocation the header documents first, and it shells out."""
-        bin_dir = self.dir / "bin"
-        bin_dir.mkdir(exist_ok=True)
-        gh = bin_dir / "gh"
-        gh.write_text(
-            "#!/bin/sh\ncat %s\nexit %d\n" % (self.dir / "pr.diff", code), encoding="utf-8")
-        gh.chmod(0o755)
-        return dict(os.environ, PATH="%s:%s" % (bin_dir, os.environ.get("PATH", "")))
 
     def test_a_valid_anchor_exits_0_and_says_so(self):
         done = self.run_cli("--diff", "pr.diff", "--payload", "review.json")
@@ -805,18 +830,45 @@ class AnchorCli(unittest.TestCase):
             "--diff", "-", "--payload", "review.json", input=self.DIFF.decode())
         self.assertEqual(done.returncode, 0)
 
-    def test_pr_mode_takes_the_diff_from_gh(self):
-        done = self.run_cli("--pr", "42", "--payload", "review.json", env=self.stub_gh())
+    def test_session_mode_uses_the_frozen_diff_and_injects_the_head(self):
+        done = self.run_cli("--session", str(self.dir), "--payload", "review.json")
         self.assertEqual(done.returncode, 0)
         self.assertIn("all anchors valid", done.stderr)
+        payload = json.loads(done.stdout)
+        self.assertEqual(payload["commit_id"], self.head)
+        self.assertIn("<!-- underwrite-review:", payload["body"])
 
-    def test_gh_failing_exits_1_rather_than_validating_against_nothing(self):
-        """An empty diff makes every anchor unanchorable, so the quiet version of this
-        is a review with every comment folded into the body and no hint why."""
-        done = self.run_cli(
-            "--pr", "42", "--payload", "review.json", env=self.stub_gh(code=1))
+    def test_session_mode_rejects_a_conflicting_delivery_marker(self):
+        payload = json.loads((self.dir / "review.json").read_text(encoding="utf-8"))
+        payload["body"] += "\n\n<!-- underwrite-review:" + "0" * 32 + " -->"
+        (self.dir / "review.json").write_text(json.dumps(payload), encoding="utf-8")
+
+        done = self.run_cli("--session", str(self.dir), "--payload", "review.json")
+
         self.assertEqual(done.returncode, 1)
-        self.assertIn("validate-anchors:", done.stderr)
+        self.assertIn("conflicting delivery marker", done.stderr)
+
+    def test_session_mode_rejects_a_conflicting_commit_id(self):
+        self.payload(11, commit_id=self.head[:12])
+        done = self.run_cli("--session", str(self.dir), "--payload", "review.json")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("does not match the frozen head", done.stderr)
+
+    def test_session_mode_refuses_a_pending_review(self):
+        payload = json.loads((self.dir / "review.json").read_text(encoding="utf-8"))
+        payload.pop("event")
+        (self.dir / "review.json").write_text(json.dumps(payload), encoding="utf-8")
+
+        done = self.run_cli("--session", str(self.dir), "--payload", "review.json")
+
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("not leave it pending", done.stderr)
+
+    def test_session_mode_rejects_a_tampered_diff(self):
+        (self.dir / "pr.diff").write_bytes(b"x" * len(self.DIFF))
+        done = self.run_cli("--session", str(self.dir), "--payload", "review.json")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("pr.diff does not match", done.stderr)
 
     def test_a_payload_that_will_not_parse_exits_1(self):
         (self.dir / "review.json").write_text("{ half written", encoding="utf-8")

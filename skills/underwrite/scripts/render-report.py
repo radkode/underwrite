@@ -507,15 +507,18 @@ def body_html(session, beats, problems_by_n, live=False):
 
 
 def render(session, beats, css, problems_by_n, live=False):
-    number = session.get("number")
-    label = f"#{number}" if number else session.get("head", "")[:7]
+    target = session.get("target") if isinstance(session.get("target"), dict) else {}
+    number = session.get("number") or target.get("number")
+    repo = session.get("repo") or target.get("repo", "")
+    head = session.get("head") or target.get("head_sha", "")
+    label = f"#{number}" if number else head[:7]
 
     parts = [
-        f'<title>{html.escape(label)} underwrite · {html.escape(session.get("repo", ""))}</title>',
+        f'<title>{html.escape(label)} underwrite · {html.escape(repo)}</title>',
         f"<style>\n{css}\n</style>",
         '<div class="page">',
         '<header class="masthead"><div class="eyebrow">'
-        f'<span>{md(session.get("repo", ""))}</span>',
+        f'<span>{md(repo)}</span>',
     ]
     if number:
         parts.append(f'<span class="sep">/</span><span>pull/{md(number)}</span>')
