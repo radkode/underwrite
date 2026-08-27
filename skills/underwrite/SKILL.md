@@ -90,7 +90,7 @@ in parallel:
   repo's commit and branch conventions again in Phase 4.
 - The linked issue, if the body references one
 
-**Decide the audience now** and write it to `session.json`:
+**Decide the audience now** and write it through the session store:
 
 | condition | mode |
 | --- | --- |
@@ -98,13 +98,24 @@ in parallel:
 | author is the authenticated user, no other reviewers, no other collaborators | `branch` |
 | otherwise | `review` |
 
-Write the decision as `audience{mode: branch|review, why}` in `session.json`, for example:
+Create the store once, then send the complete session object to `put-session` on stdin:
+
+```bash
+mkdir -p "$R"
+$S/scripts/sessionctl.py init "$R"
+$S/scripts/sessionctl.py put-session "$R" - <<'JSON'
+{"repo":"owner/repo","audience":{"mode":"review","why":"the PR has another reviewer"}}
+JSON
+```
+
+The decision is `audience{mode: branch|review, why}`, for example:
 
 ```json
 {"audience":{"mode":"review","why":"the PR has another reviewer"}}
 ```
 
-Write `session.json` with the facts and that audience object before walking anything.
+Include the facts and that audience object before walking anything. From this point on,
+SQLite is authoritative. Never edit its JSON exports by hand.
 
 ## Phase 1: orient
 
@@ -127,7 +138,9 @@ frames the rest of the walk.
 ## Phase 2: plan the walk
 
 Tier every changed file, show the plan, and let the reviewer reorder or skip before you
-start walking. Write the plan into `session.json`.
+start walking. Persist the plan as a top-level patch with
+`$S/scripts/sessionctl.py patch-session "$R" -`; never read or replace `session.json`
+directly.
 
 - **core** the change that *is* the feature or fix, usually small
 - **enabling** what had to change to make core possible: new helper, signature change, config
@@ -195,10 +208,12 @@ PRIOR  #2 pinned break-check to 0.6.0 citing this exact failure mode
 FIX    npx --yes @arethetypeswrong/cli@0.18.5
 ```
 
-**Write `$R/beats/NN.json` in the same turn you present the beat.** Not at the end. Real
-reviews get interrupted, and the large PRs that most need this are the ones nobody
-finishes in one sitting. Bump `cursor` in `session.json` as you go; the renderer reports a
-mismatch between `cursor` and the beat files it finds.
+**Persist the beat in the same turn you present it.** Not at the end. Send the complete
+beat object to `$S/scripts/sessionctl.py put-beat "$R" -`, then patch `cursor` through
+`patch-session`. Read an existing document only through `get-session` or `get-beat`.
+Real reviews get interrupted, and the large PRs that most need this are the ones nobody
+finishes in one sitting. The renderer reports a mismatch between `cursor` and the beats
+the store contains.
 
 **Waiting on the reviewer.** After presenting a beat, park on the server rather than
 ending the turn silently. Run this in the background too, so the harness wakes you when
@@ -209,45 +224,61 @@ curl -fsS "$(python3 -c "import json;print(json.load(open('$R/serve.json'))['url
 ```
 
 `/await` always returns the oldest action that has not been acknowledged. The reply is
-`{seq, n, action, note}` where action is `accept`, `drop`, `decide`, `note`, `next`,
-`back`, or `skip`. A reply of
+`{id, seq, n, action, note, state, result}` where action is `accept`, `drop`, `decide`,
+`note`, `next`, `back`, or `skip`. `state` is `produced` until a navigation result is
+applied, then `applied`. Beat actions arrive already applied. A reply of
 `{"timeout": true}` means nobody acted; say so and park again. The terminal accepts the
 same answers in words, so a closed browser never strands the walk.
 
-After the action's effect is durable, acknowledge that exact reply before parking again:
+For `next`, `back`, or `skip`, compute the full resulting session document. Store the
+absolute position and plan state, never a relative delta, in one transaction with its
+receipt:
 
 ```bash
-curl -fsS -X POST $URL/ack -H 'Content-Type: application/json' -d '{"seq":<seq>}'
+$S/scripts/sessionctl.py apply "$R" <seq> application.json
 ```
 
-Use the `seq` from the reply. A successful request advances `handled_seq`; `curl` exits
-non-zero on a 4xx or 5xx response. If handling fails, do not acknowledge the action; stop
-with the failure visible. The next sitting will receive it again.
+`application.json` is `{result, session, beats}`. `result` names the absolute outcome,
+for example `{"kind":"walk","current_beat":6,"skipped_tiers":[]}`. `session` is the
+complete resulting session object read through `get-session`, and `beats` contains only
+new beat objects first presented by that move. Navigation cannot replace an existing
+beat; reviewer-owned state would otherwise be vulnerable to a stale snapshot.
+`cursor` remains the number of persisted beats; do not use it as the navigation position.
 
-Delivery is at least once. If the same `seq` returns after a restart, reconcile it against
-the beat, session, and git or review state before acting. When its durable effect already
-exists, acknowledge it without repeating it. The flat-file session does not yet carry a
-durable receipt for navigation. If a redelivered `next`, `back`, or `skip` has no
-unambiguous effect to reconcile, stop and ask rather than moving twice or guessing.
+After the local effect and any required external effect are durable, acknowledge the
+exact reply before parking again:
+
+```bash
+$S/scripts/sessionctl.py ack "$R" <seq>
+```
+
+If the same `seq` returns after a restart with `state: applied`, its stored absolute
+`result` is the receipt. Present from the authoritative session without moving again,
+finish any external delivery still owed, then acknowledge it. Repeating `apply`, `land`,
+or `ack` with the same absolute inputs is safe; conflicting inputs are refused.
 
 **Resolving a flag.** The reviewer accepts or drops it in the same beat, from the page or
 in words. A click has already reached the server, which flipped the beat's `state` and
 recorded their words as `call`. An answer in words has reached nothing. Before posting
-it, read `/state`; if `seq` and `handled_seq` differ, handle and acknowledge the older
+it, read `/state` and retain its `session_id`. If `seq` and `handled_seq`
+differ, handle and acknowledge the older
 queued action first. Then post the answer yourself and let the same code do the same work:
+
+Generate one UUID, substitute it below, and retain the exact JSON body until the server
+responds. A transport failure or 5xx has an unknown outcome, so retry it unchanged.
 
 ```bash
 curl -fsS -X POST $URL/act -H 'Content-Type: application/json' \
-  -d '{"n":5,"action":"accept","note":"yes, pin it"}'
+  -d '{"id":"<new UUID, reused on retry>","session_id":"<from /state>","n":5,"action":"accept","note":"yes, pin it"}'
 ```
 
 The same goes for a note on any beat. The server owns `state` and `call` on both paths, so
 never write either by hand: a beat resolved in words and edited by hand stays `flag` on
 disk, and the Phase 4 check for an accept that landed nothing never fires on it. The reply
-carries the `seq` it recorded. Finish its effect and acknowledge that seq. If the ack
-fails because an older action is still pending, do not apply this one again: handle and
-acknowledge the older action, then acknowledge this already-applied seq and call `/await`
-again.
+carries its stable `id`, `seq`, applied state, and absolute result. Finish its effect and
+acknowledge that seq. A definite 4xx rejection may be corrected with a new ID. If an older
+action is pending, do not apply this one again: handle and acknowledge the older action,
+then acknowledge this already-applied seq and call `/await` again.
 
 On accept, in `branch` mode, where the fix goes depends on whether the PR can still take
 it:
@@ -265,30 +296,39 @@ reconcile them.
 Then apply the patch, run the repo's verification, and commit. One commit per accepted
 flag, conventional subject, the `FIX` line as the body.
 
-**Write the result back into the beat**, `landed` set to the short SHA and `branch` to the
-branch, so the page shows what shipped instead of going quiet. Add the matching `lands[]`
-entry to `session.json`. Then confirm in one line and advance:
+Record the result with one idempotent operation, which updates the beat and the session's
+`lands[]` together:
+
+```bash
+$S/scripts/sessionctl.py land "$R" <seq> <beat> <short-sha> \
+  --kind commit --branch <branch>
+```
+
+Then acknowledge the action, confirm in one line, and advance:
 
 ```
 landed · fix/pin-attw · 961eb58
 ```
 
-If verification fails, do not commit and do not set `landed`. Rewrite the `FIX` slot to say
-what is now owed, say so, and stop. Phase 4 will refuse to render an accepted beat that
-landed nothing.
+If verification fails, do not commit. Record the failure and what is now owed with
+`sessionctl.py fail "$R" <seq> '<failure>' '<new FIX>'`, say so, and stop. The action stays
+at the head until the same accept lands or is explicitly recovered. Phase 4 refuses to
+render an accepted beat that landed nothing.
 
 In `review` mode, keep the beat `accepted` after the reviewer accepts a finding. A finding
 intended for the PR audience stays accepted even when its recommended fix is a policy
 choice rather than code, because the GitHub review comment is what delivers it. Nothing
 lands per beat until Phase 4 posts the single review, so no review URL exists yet by
-design. The review audience alone never changes an accepted finding to `decided`.
+design. Acknowledge the applied accept now; the store keeps its review delivery pending
+until Phase 4 records the URL. The review audience alone never changes an accepted
+finding to `decided`.
 
 When the flag itself is a decision whose words complete the work and do not need to reach
 the PR audience as a finding, post `decide` and let the server move the beat to `decided`:
 
 ```bash
 curl -fsS -X POST $URL/act -H 'Content-Type: application/json' \
-  -d '{"n":5,"action":"decide","note":"stays as is, the cost lands on the caller"}'
+  -d '{"id":"<new UUID, reused on retry>","session_id":"<from /state>","n":5,"action":"decide","note":"stays as is, the cost lands on the caller"}'
 ```
 
 Post it whether the beat is still an open flag or the reviewer already clicked Accept.
@@ -314,10 +354,11 @@ rather than off scrollback:
 $S/scripts/render-report.py $R
 ```
 
-Exit 2 means it rendered but a beat failed validation and carries an `UNPROVEN` chip. Fix
-the beat file and re-render; do not ship an unproven page. Publish with the `Artifact`
-tool. If that tool is unavailable, re-render with `--standalone` so the file opens
-correctly in a browser, and report the local `$R/report.html` path instead.
+Exit 2 means it rendered but a beat failed validation and carries an `UNPROVEN` chip. Read
+the authoritative beat with `get-beat`, fix the complete object through `put-beat`, and
+re-render; do not ship an unproven page. Publish with the `Artifact` tool. If that tool is
+unavailable, re-render with `--standalone` so the file opens correctly in a browser, and
+report the local `$R/report.html` path instead.
 
 **Branch mode.** The commits already exist from Phase 3. Report the branch and
 `git log --oneline`, and offer to push and open a PR. Do not do either unasked. A session
@@ -350,13 +391,23 @@ one explicit yes, then:
 gh api repos/<owner>/<repo>/pulls/<n>/reviews --method POST --input $R/review.fixed.json
 ```
 
-A 422 here means the audience call was wrong upstream. Go back and fix it. Do not
-downgrade the event to make the command succeed.
+A 422 here means the audience call was wrong upstream. Audience mode is frozen once an
+accept is recorded, so stop and create a supervised replacement session with the correct
+audience. Do not reclassify the pending delivery or downgrade the event to make the
+command succeed.
 
-Capture the successful response's review URL. Write the outcome, review URL, and `status`
-back into `session.json`, and set each accepted beat's `landed` to that URL.
-Add one `lands[]` entry with `state: landed`, what the review delivered, and the same URL
-in `where`.
+Capture the successful response's review URL. Write one land-entry JSON object with
+`state: landed`, what the review delivered, and that URL in `where`. Run
+`sessionctl.py reconcile "$R"` to obtain each pending accepted beat's `beat_n` and
+`cause_seq`, then record the same URL for each:
+
+```bash
+$S/scripts/sessionctl.py land "$R" <cause_seq> <beat_n> <review-url> \
+  --kind review --entry review-land.json
+```
+
+The shared entry is added to `lands[]` only once. Persist the outcome, review URL, and
+`status` as one `patch-session` object.
 
 Then re-render the report with final delivery checks:
 
@@ -364,10 +415,11 @@ Then re-render the report with final delivery checks:
 $S/scripts/render-report.py $R --final
 ```
 
-Exit 2 now means the review posted but its write-back is incomplete. Fix the session and
-run the command again. Once it passes, re-publish the updated artifact so the page the
-reviewer keeps shows the review URL and What lands. If Artifact is unavailable, run the
-same command with `--standalone` and report the updated local file.
+Exit 2 now means the review posted but its write-back is incomplete. Repair it through
+the idempotent `land` and `patch-session` commands, then run the render again. Once it
+passes, re-publish the updated artifact so the page the reviewer keeps shows the review
+URL and What lands. If Artifact is unavailable, run the same command with `--standalone`
+and report the updated local file.
 
 ## Session state
 
@@ -375,20 +427,36 @@ same command with `--standalone` and report the updated local file.
 repo, so it never shows up in `git status`. `mkdir -p` it on first write.
 
 ```
-session.json     repo, number, title, head, date, status, cursor, facts[], audience{mode: branch|review, why}, plan[], lands[], footer
-beats/01.json    n, tier, state, claim, where, slots{}, diff[], call, landed, branch
-pr.diff          the saved diff
-decisions.jsonl  append-only, one line per reviewer action, written by the server
-ack.json         version, handled_seq of the last durably handled action; server-owned
-serve.json       url and pid of the running server, removed when it exits
+session.sqlite3  authoritative versioned session, beats, actions, receipts, and delivery
+.session.lock    cross-process initialization and export lock
+session.json     derived compatibility export of the session document
+beats/01.json    derived compatibility export of one beat
+decisions.jsonl  derived compatibility export of reviewer actions
+ack.json         derived compatibility export of handled_seq
+pr.diff          saved review input
+serve.json       running server URL and pid, removed when it exits
 report.html      rendered, regenerable, throwaway
 ```
 
-An older session with decisions but no `ack.json` starts with its prior actions marked
-handled. Replaying them could duplicate commits, and the old format cannot say which one
-was still pending. New actions carry a delivery version in `decisions.jsonl`. If a
-cursor-aware session later loses `ack.json`, the server refuses to guess whether those
-actions were handled. Actions recorded after the cursor exists are delivered until acked.
+All mutations go through `sessionctl.py` or the server's `/act` endpoint. All reads used
+for a later mutation go through `get-session` or `get-beat`. JSON files are exports for
+older tooling and inspection. The renderer reads SQLite whenever it exists, and a later
+`$S/scripts/sessionctl.py export "$R"` repairs missing or corrupt exports.
+
+An unversioned legacy action log with no `ack.json` imports as handled because replaying
+it could duplicate a commit. A cursor-aware log with a missing, corrupt, or impossible
+ack refuses automatic migration. Inspect the log and external effects, then run
+`$S/scripts/sessionctl.py init "$R" --handled-seq <known-boundary>`. Never guess that
+boundary.
+
+At startup and after any interrupted external effect, run
+`$S/scripts/sessionctl.py reconcile "$R"`.
+If an old action's absolute effect is already visible, use `reconcile-action` with an
+envelope containing `result`, the observed full session or beat documents, and nonempty
+`evidence`, then run `$S/scripts/sessionctl.py reconcile-action "$R" <seq> recovery.json`.
+If an action cannot be recovered, run `$S/scripts/sessionctl.py abandon-head "$R" <seq>
+--actor <name> --reason '<why>'`. It only accepts the exact head and never skips an action
+silently.
 
 `state` is one of `clean`, `flag`, `unverified`, `accepted`, `dropped`, `decided`. The
 first three are what a beat opens with; the last three are what a flag becomes after the

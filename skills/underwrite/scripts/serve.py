@@ -27,16 +27,22 @@ import queue
 import select
 import signal
 import socket
+import sqlite3
 import sys
 import threading
 import time
 import urllib.request
+import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from types import ModuleType
 
 HERE = Path(__file__).resolve().parent
 RENDERER = HERE / "render-report.py"
+if str(HERE) not in sys.path:
+    sys.path.insert(0, str(HERE))
+
+from session_store import ACTIONS, Conflict, SessionStore, StoreError
 
 _renderer = None
 _renderer_mtime = None
@@ -64,13 +70,6 @@ def rr():
             _renderer, _renderer_mtime = module, stamp
     return _renderer
 
-# These three resolve a flag; the rest steer the walk without changing state.
-RESOLVE = {"accept": "accepted", "drop": "dropped", "decide": "decided"}
-# What a beat has to be already. `decide` also takes an accepted one: an accept says yes,
-# and decide then records that the yes was a call rather than a patch, which refines the
-# same answer rather than taking a second bite at it.
-RESOLVABLE = {"accept": ("flag",), "drop": ("flag",), "decide": ("flag", "accepted")}
-ACTIONS = (*RESOLVE, "next", "note", "back", "skip")
 MAX_BODY = 64 * 1024
 AWAIT_TIMEOUT = 900.0
 # A park sleeps in slices so it can notice the client left between them.
@@ -80,8 +79,7 @@ MAX_STATUS_TEXT = 2000
 HEARTBEAT = 20.0
 WATCH_INTERVAL = 0.5
 LOOPBACK = {"127.0.0.1", "localhost", "::1", "[::1]"}
-CURSOR_VERSION = 1
-ACTION_FIELDS = ("seq", "n", "action", "note")
+ACTION_FIELDS = ("id", "seq", "n", "action", "note", "state", "result")
 
 
 def host_only(header):
@@ -92,64 +90,35 @@ def host_only(header):
     return value.split(":", 1)[0]
 
 
-def ends_mid_line(path):
-    """True when the last append never finished, so the log has no closing newline."""
-    try:
-        with path.open("rb") as fh:
-            fh.seek(-1, os.SEEK_END)
-            return fh.read(1) != b"\n"
-    except OSError:
-        return False  # missing or empty, so there is nothing to run into
-
-
-def fsync_directory(path):
-    """Persist a renamed or newly created directory entry."""
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
-
-
-def write_json(path, data):
-    """Write through a temp sibling, so a reader never sees a half-written beat.
-
-    The temp name must not end in `.json`: the fingerprint below and the renderer's
-    loader both glob `*.json`, and pathlib's glob matches dotfiles too.
-    """
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
-    try:
-        with tmp.open("w", encoding="utf-8") as fh:
-            fh.write(json.dumps(data, indent=2) + "\n")
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-        fsync_directory(path.parent)
-    finally:
-        tmp.unlink(missing_ok=True)
-
-
 def public_action(record):
-    """The delivery contract, without storage-only migration fields."""
-    return {key: record.get(key) for key in ACTION_FIELDS}
+    """The delivery contract, with the storage name shortened back to `id`."""
+    public = {"id": record.get("action_id")}
+    public.update({key: record.get(key) for key in ACTION_FIELDS if key != "id"})
+    return public
 
 
 class Session:
     """Session state, the pub/sub fanout, and the condition awaiters park on."""
 
-    def __init__(self, root, css_path):
+    def __init__(self, root, css_path, store=None):
         self.root = root
         self.css_path = css_path
-        self.decisions = root / "decisions.jsonl"
+        self.store = store or SessionStore(root)
+        self.store.export_json()
         self.cond = threading.Condition()
         self.lock = threading.Lock()
         self.subscribers = []
         self.status = {"phase": "starting", "text": "waiting for the walk to begin"}
         self.stop = threading.Event()
         self.waiting = 0
-        records = self.records()
-        self.seq = max((r.get("seq", 0) for r in records), default=0)
-        self.handled_seq = self.read_handled_seq(records)
+
+    @property
+    def seq(self):
+        return self.store.delivery_state()["seq"]
+
+    @property
+    def handled_seq(self):
+        return self.store.delivery_state()["handled_seq"]
 
     def records(self):
         """Every decision on disk that still reads as one.
@@ -163,10 +132,11 @@ class Session:
         would not start, and a live one answered every /await with a 500. One lost
         decision is the smaller harm.
         """
-        if not self.decisions.exists():
+        decisions = self.root / "decisions.jsonl"
+        if not decisions.exists():
             return []
         out = []
-        for line in self.decisions.read_text(encoding="utf-8").splitlines():
+        for line in decisions.read_text(encoding="utf-8").splitlines():
             if not line.strip():
                 continue
             try:
@@ -177,63 +147,34 @@ class Session:
                 continue
         return out
 
-    def read_handled_seq(self, records):
-        path = self.root / "ack.json"
-        versions = [r["delivery_version"] for r in records if "delivery_version" in r]
-        unknown = [
-            version
-            for version in versions
-            if type(version) is not int or version != CURSOR_VERSION
-        ]
-        if unknown:
-            raise ValueError(f"unsupported action delivery version: {unknown[0]!r}")
-        if not path.exists():
-            if versions:
-                raise ValueError("ack.json is missing from a cursor-aware session")
-            # Legacy actions cannot be safely replayed, so migration starts after them.
-            handled = self.seq
-            write_json(path, {"version": CURSOR_VERSION, "handled_seq": handled})
-            return handled
-        data = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            raise ValueError("ack.json must be a JSON object")
-        if type(data.get("version")) is not int or data["version"] != CURSOR_VERSION:
-            raise ValueError(f"ack.json version must be {CURSOR_VERSION}")
-        handled = data.get("handled_seq")
-        if isinstance(handled, bool) or not isinstance(handled, int) or handled < 0:
-            raise ValueError("ack.json handled_seq must be a non-negative integer")
-        if handled > self.seq:
-            raise ValueError(
-                f"ack.json handled_seq {handled} is ahead of produced seq {self.seq}"
-            )
-        return handled
-
     def load(self):
         return rr().load(self.root, self.css_path)
 
     def fingerprint(self):
-        stamps = sorted(
-            (p.name, p.stat().st_mtime_ns) for p in (self.root / "beats").glob("*.json")
-        )
-        session = (self.root / "session.json").stat().st_mtime_ns
-        return f"{self.seq}:{session}:{hash(tuple(stamps))}"
+        return str(self.store.delivery_state()["render_revision"])
 
     # ---- pub/sub -------------------------------------------------------
 
     def snapshot(self):
         # `listening` is the half `status` cannot tell you: status is whatever the agent
         # last said, and an agent that died mid-walk leaves its last word standing.
+        delivery = self.store.delivery_state()
         return {
-            "rev": self.fingerprint(),
-            "seq": self.seq,
-            "handled_seq": self.handled_seq,
+            "session_id": delivery["session_id"],
+            "rev": str(delivery["render_revision"]),
+            "seq": delivery["seq"],
+            "handled_seq": delivery["handled_seq"],
+            "head_id": delivery["head_id"],
+            "recovery": delivery["recovery"],
             "status": self.status,
             "listening": self.waiting > 0,
         }
 
-    def subscribe(self):
+    def subscribe(self, initial=False):
         channel = queue.Queue()
         with self.lock:
+            if initial:
+                channel.put(self.snapshot())
             self.subscribers.append(channel)
         return channel
 
@@ -243,16 +184,21 @@ class Session:
                 self.subscribers.remove(channel)
 
     def publish(self):
-        event = self.snapshot()
         with self.lock:
-            listeners = list(self.subscribers)
-        for channel in listeners:
-            channel.put(event)
+            event = self.snapshot()
+            for channel in self.subscribers:
+                channel.put(event)
 
     def set_status(self, status):
+        phase = status.get("phase", "working")
+        text = status.get("text", "")
+        if not isinstance(phase, str) or phase.strip() not in ("working", "parked", "done"):
+            raise ValueError("phase must be working, parked, or done")
+        if not isinstance(text, str):
+            raise ValueError("text must be text")
         self.status = {
-            "phase": (status.get("phase") or "working").strip(),
-            "text": (status.get("text") or "").strip()[:MAX_STATUS_TEXT],
+            "phase": phase.strip(),
+            "text": text.strip()[:MAX_STATUS_TEXT],
         }
         for key in ("beat", "sha"):
             if status.get(key) is not None:
@@ -262,77 +208,25 @@ class Session:
 
     # ---- actions -------------------------------------------------------
 
-    def act(self, n, action, note):
-        """Apply a reviewer action. Only accept and drop change a beat's state.
-
-        Read, guard, write and log are one critical section. Split apart, two clients
-        resolving the same flag both pass the guard and both succeed, which is how a
-        beat ends up accepted and dropped at once. `cond` is always the outer lock and
-        is never taken while holding `self.lock`.
-        """
+    def act(self, n, action, note, action_id=None, session_id=None):
+        """Produce one idempotent reviewer action and wake the parked walk."""
         with self.cond:
-            if action in RESOLVE or (action == "note" and n is not None):
-                path = self.root / "beats" / f"{n:02d}.json"
-                if not path.exists():
-                    raise ValueError(f"no beat {n}")
-                beat = json.loads(path.read_text(encoding="utf-8"))
-                if action in RESOLVE:
-                    if beat.get("state") not in RESOLVABLE[action]:
-                        raise ValueError(
-                            f"beat {n} is {beat.get('state')}, "
-                            f"which cannot become {RESOLVE[action]}"
-                        )
-                    beat["state"] = RESOLVE[action]
-                if note:
-                    beat["call"] = note
-                write_json(path, beat)
-
-            # seq advances only once the record is on disk; a failed append that had
-            # already bumped it would leave every later /await unable to match.
-            seq = self.seq + 1
-            record = {
-                "seq": seq,
-                "n": n,
-                "action": action,
-                "note": note,
-                "delivery_version": CURSOR_VERSION,
-            }
-            # Start a line of our own when the previous append was cut short, or the
-            # two fuse into one line that parses as neither and both are lost.
-            opener = "\n" if ends_mid_line(self.decisions) else ""
-            new_log = not self.decisions.exists()
-            with self.decisions.open("a", encoding="utf-8") as fh:
-                fh.write(opener + json.dumps(record) + "\n")
-                fh.flush()
-                os.fsync(fh.fileno())
-            if new_log:
-                fsync_directory(self.decisions.parent)
-            self.seq = seq
+            record = self.store.produce(
+                action_id or str(uuid.uuid4()), n, action, note, session_id
+            )
+            self.store.export_json()
             self.cond.notify_all()
         self.set_status({"phase": "working", "text": f"picking up your {action}"})
         return record
 
     def ack(self, seq):
-        """Durably acknowledge exactly the oldest action the walk has not handled."""
-        if isinstance(seq, bool) or not isinstance(seq, int) or seq < 0:
-            raise ValueError("seq must be a non-negative integer")
+        """Acknowledge the applied head and expose the next queued action."""
         with self.cond:
-            if seq <= self.handled_seq:
-                return {"handled_seq": self.handled_seq}
-            oldest = self.tail(self.handled_seq)
-            if oldest is None:
-                raise ValueError("there is no unhandled action to acknowledge")
-            if seq != oldest.get("seq"):
-                raise ValueError(
-                    f"oldest unhandled action is {oldest.get('seq')}, not {seq}"
-                )
-            write_json(
-                self.root / "ack.json",
-                {"version": CURSOR_VERSION, "handled_seq": seq},
-            )
-            self.handled_seq = seq
+            result = self.store.ack(seq)
+            self.store.export_json()
+            self.cond.notify_all()
         self.publish()
-        return {"handled_seq": self.handled_seq}
+        return result
 
     def wait(self, timeout, gone=None):
         """Block until an action newer than the handled cursor lands.
@@ -342,7 +236,7 @@ class Session:
         is kept under `cond` rather than `lock`, which is the documented order.
         """
         with self.cond:
-            found = self.tail(self.handled_seq) if self.seq > self.handled_seq else None
+            found = self.store.head()
             if found is not None:
                 return found
             self.waiting += 1
@@ -356,31 +250,40 @@ class Session:
                     if left <= 0:
                         return None
                     self.cond.wait(min(WAIT_SLICE, left))
-                    found = (
-                        self.tail(self.handled_seq)
-                        if self.seq > self.handled_seq
-                        else None
-                    )
+                    found = self.store.head()
                     if found is not None:
                         return found
             finally:
                 self.waiting -= 1
                 self.publish()
 
-    def tail(self, after):
-        newer = [r for r in self.records() if r.get("seq", 0) > after]
-        return newer[0] if newer else None
-
     def watch(self):
-        """Catch writes nobody announced, so a hand-edited beat still shows up."""
-        last = None
+        """Publish changes committed by the session CLI in another process."""
+        try:
+            delivery = self.store.delivery_state()
+            last = tuple(
+                delivery[key]
+                for key in (
+                    "session_id", "render_revision", "seq", "handled_seq", "recovery"
+                )
+            )
+        except (OSError, sqlite3.Error, StoreError):
+            last = None
         while not self.stop.wait(WATCH_INTERVAL):
             try:
-                current = self.fingerprint()
+                delivery = self.store.delivery_state()
+                current = tuple(
+                    delivery[key]
+                    for key in (
+                        "session_id", "render_revision", "seq", "handled_seq", "recovery"
+                    )
+                )
                 if last is not None and current != last:
+                    with self.cond:
+                        self.cond.notify_all()
                     self.publish()
                 last = current
-            except OSError:
+            except (OSError, sqlite3.Error, StoreError):
                 pass
 
 
@@ -435,10 +338,8 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.close_connection = True
 
-        channel = self.session.subscribe()
+        channel = self.session.subscribe(initial=True)
         try:
-            self.wfile.write(f"data: {json.dumps(self.session.snapshot())}\n\n".encode())
-            self.wfile.flush()
             while True:
                 try:
                     event = channel.get(timeout=HEARTBEAT)
@@ -485,7 +386,7 @@ class Handler(BaseHTTPRequestHandler):
                 )
             if route == "/favicon.ico":
                 return self.send(204, b"", "image/x-icon")
-        except (OSError, json.JSONDecodeError) as err:
+        except (OSError, sqlite3.Error, StoreError, json.JSONDecodeError) as err:
             return self.send(500, json.dumps({"error": str(err)}))
         self.send(404, json.dumps({"error": "no such route"}))
 
@@ -519,12 +420,31 @@ class Handler(BaseHTTPRequestHandler):
             if action not in ACTIONS:
                 raise ValueError(f"action must be one of {', '.join(ACTIONS)}")
             n = payload.get("n")
+            if n is not None and (isinstance(n, bool) or not isinstance(n, int)):
+                raise ValueError("n must be a positive integer or null")
+            note = payload.get("note", "")
+            if note is None:
+                note = ""
+            if not isinstance(note, str):
+                raise ValueError("note must be text")
+            action_id = payload.get("id")
+            if not isinstance(action_id, str) or not action_id.strip():
+                raise ValueError("id must be non-empty text")
+            session_id = payload.get("session_id")
+            if not isinstance(session_id, str) or not session_id.strip():
+                raise ValueError("session_id must be non-empty text")
             record = self.session.act(
-                int(n) if n is not None else None, action, (payload.get("note") or "").strip()
+                n,
+                action,
+                note.strip(),
+                action_id,
+                session_id,
             )
+        except Conflict as err:
+            return self.send(409, str(err), "text/plain")
         except (KeyError, ValueError, TypeError, json.JSONDecodeError) as err:
             return self.send(400, str(err), "text/plain")
-        except OSError as err:
+        except (OSError, sqlite3.Error) as err:
             return self.send(500, str(err), "text/plain")
         self.send(200, json.dumps(public_action(record)))
 
@@ -550,7 +470,7 @@ class Usage(argparse.ArgumentParser):
         sys.exit(f"serve: {message}")
 
 
-def already_serving(root):
+def already_serving(root, session_id):
     """The URL of a server already answering for this session, or None.
 
     Two servers on one directory is the cross-process version of the race `act` takes
@@ -564,7 +484,8 @@ def already_serving(root):
     try:
         url = json.loads((root / "serve.json").read_text(encoding="utf-8"))["url"]
         with urllib.request.urlopen(url + "/state", timeout=1) as answer:
-            return url if "rev" in json.loads(answer.read()) else None
+            state = json.loads(answer.read())
+            return url if state.get("session_id") == session_id else None
     except (OSError, ValueError, KeyError):
         return None
 
@@ -577,19 +498,25 @@ def main():
     args = ap.parse_args()
 
     root = Path(args.session_dir).expanduser()
-    if not (root / "session.json").exists():
-        sys.exit(f"serve: no session.json in {root}")
+    if not (root / "session.sqlite3").exists() and not (root / "session.json").exists():
+        sys.exit(f"serve: no session database or session.json in {root}")
 
-    # Before anything is bound or written, so refusing leaves the running server's
-    # serve.json exactly as it found it.
-    running = already_serving(root)
+    try:
+        store = SessionStore(root)
+        session_id = store.delivery_state()["session_id"]
+    except (OSError, sqlite3.Error, ValueError, json.JSONDecodeError) as err:
+        sys.exit(f"serve: {err}")
+
+    # The durable identity distinguishes this session from another server that later
+    # inherited the stale URL's port. Refusal leaves the live serve.json untouched.
+    running = already_serving(root, session_id)
     if running:
         sys.exit(f"serve: this session is already being served at {running}")
 
     css_path = Path(args.css).expanduser() if args.css else rr().default_css()
     try:
-        Handler.session = Session(root, css_path)
-    except (OSError, ValueError, json.JSONDecodeError) as err:
+        Handler.session = Session(root, css_path, store)
+    except (OSError, sqlite3.Error, ValueError, json.JSONDecodeError) as err:
         sys.exit(f"serve: {err}")
     threading.Thread(target=Handler.session.watch, daemon=True).start()
 

@@ -32,7 +32,7 @@ class ReviewModeContract(unittest.TestCase):
     def test_review_delivery_has_a_final_validation_and_publish_step(self):
         text = self.skill()
         self.assertIn("render-report.py $R --final", text)
-        self.assertIn("Add one `lands[]` entry", text)
+        self.assertIn("shared entry is added to `lands[]` only once", text)
         self.assertIn("re-render the report", text)
         self.assertIn("re-publish the updated artifact", text)
 
@@ -65,12 +65,17 @@ class ActionDeliveryContract(unittest.TestCase):
         text = self.skill()
         self.assertNotIn("curl -s ", text)
         self.assertIn("curl -fsS", text)
-        self.assertIn("exits\nnon-zero on a 4xx or 5xx response", text)
+        self.assertIn(
+            "A transport failure or 5xx has an unknown outcome, so retry it unchanged.",
+            text,
+        )
+        self.assertIn("A definite 4xx rejection may be corrected with a new ID.", text)
 
-    def test_navigation_replay_is_not_claimed_safe_without_a_receipt(self):
+    def test_navigation_replay_uses_an_absolute_transactional_receipt(self):
         rule = self.waiting_rule()
-        self.assertIn("does not yet carry a\ndurable receipt for navigation", rule)
-        self.assertIn("stop and ask rather than moving twice", rule)
+        self.assertIn("absolute position and plan state", rule)
+        self.assertIn("stored absolute\n`result` is the receipt", rule)
+        self.assertNotIn("flat-file session", rule)
 
     def test_a_terminal_action_does_not_jump_the_queue(self):
         text = self.skill()
