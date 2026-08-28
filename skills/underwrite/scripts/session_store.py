@@ -18,6 +18,9 @@ SCHEMA_VERSION = 1
 DELIVERY_VERSION = 1
 EXECUTION_POLICY_VERSION = 1
 EXECUTION_MODES = ("no_exec",)
+AUDIENCE_MODES = ("branch", "review", "report")
+BEAT_SLOTS = ("what", "why", "proof", "risk", "prior", "fix")
+BEAT_STATES = ("clean", "flag", "unverified", "accepted", "dropped", "decided")
 BLOCKED_COMMIT_DELIVERY_REASON = (
     "untrusted PR commit delivery requires a supervised replacement; "
     "do not execute target code"
@@ -35,6 +38,10 @@ RESOLUTION_KINDS = ("delivery", "decision")
 _MISSING = object()
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
+# Proof names a rerunnable command or path:line, or explicitly records inference.
+PROOF_EVIDENCE = re.compile(
+    r"`[^`]+`|\b[\w./-]*[A-Za-z][\w./-]*:\d+|^inferred\b"
+)
 _TARGET_REQUIRED_FIELDS = {
     "version",
     "kind",
@@ -120,6 +127,89 @@ def _positive(value, name):
     if value == 0:
         raise StoreError(f"{name} must be a positive integer")
     return value
+
+
+def validate_beat(beat, mode="branch", final=False):
+    """Return beat contract violations. Empty means the beat is shippable."""
+    problems = []
+    n = beat.get("n", "?")
+    state = beat.get("state")
+    raw_slots = beat.get("slots")
+    if raw_slots is None:
+        slots = {}
+    elif not isinstance(raw_slots, dict):
+        problems.append(f"beat {n}: slots must be an object")
+        slots = {}
+    else:
+        slots = raw_slots
+
+    if state not in BEAT_STATES:
+        problems.append(
+            f"beat {n}: state {state!r} is not one of {', '.join(BEAT_STATES)}"
+        )
+    for key in slots:
+        if key not in BEAT_SLOTS:
+            problems.append(f"beat {n}: unknown slot {key!r}")
+    resolution_kind = beat.get("resolution_kind", "delivery")
+    if resolution_kind not in RESOLUTION_KINDS:
+        problems.append(
+            f"beat {n}: resolution_kind must be delivery or decision"
+        )
+    if not slots.get("what"):
+        problems.append(f"beat {n}: no what")
+    if state in ("clean", "accepted") and not slots.get("proof"):
+        problems.append(f"beat {n}: {state} with no proof")
+    if state == "accepted" and mode == "report":
+        receipt_fields = [
+            name for name in ("landed", "branch", "delivery_kind") if name in beat
+        ]
+        if receipt_fields:
+            problems.append(
+                f"beat {n}: report outcome cannot have delivery receipt fields: "
+                + ", ".join(receipt_fields)
+            )
+        delivery = beat.get("delivery")
+        if (
+            isinstance(delivery, dict)
+            and delivery.get("state") not in (None, "none")
+        ):
+            problems.append(
+                f"beat {n}: report outcome cannot have "
+                f"{delivery.get('state')} delivery"
+            )
+    elif state == "accepted":
+        if final and not beat.get("landed"):
+            problems.append(f"beat {n}: accepted, nothing landed")
+        if beat.get("landed"):
+            expected_delivery = {
+                "branch": "commit",
+                "review": "review",
+            }[mode]
+            if beat.get("delivery_kind") != expected_delivery:
+                problems.append(
+                    f"beat {n}: landed as {beat.get('delivery_kind')!r}, "
+                    f"expected {expected_delivery} delivery"
+                )
+            elif mode == "branch" and not beat.get("branch"):
+                problems.append(f"beat {n}: commit delivery has no branch")
+            elif mode == "review" and beat.get("branch"):
+                problems.append(
+                    f"beat {n}: review delivery unexpectedly names a branch"
+                )
+    if state == "decided" and not beat.get("call"):
+        problems.append(f"beat {n}: decided, nothing recorded")
+    if beat.get("landed") and state != "accepted":
+        problems.append(f"beat {n}: landed {beat['landed']} but state is {state!r}")
+    if state == "flag":
+        for key in ("risk", "fix"):
+            if not slots.get(key):
+                problems.append(f"beat {n}: flag with no {key}")
+    proof = slots.get("proof")
+    if proof and not isinstance(proof, str):
+        problems.append(f"beat {n}: proof is {type(proof).__name__}, not text")
+    elif proof and not PROOF_EVIDENCE.search(proof):
+        problems.append(f"beat {n}: proof names no command or path:line")
+    return problems
 
 
 def _fsync_directory(path):
@@ -557,11 +647,36 @@ class SessionStore:
                             )
                         accept_seqs[beat_n] = action["seq"]
                 delivery_kind = self._expected_delivery_kind(session)
+                report = self._audience_mode(session) == "report"
                 for beat in beats:
+                    accept_seq = accept_seqs.get(beat["n"])
+                    if (
+                        report
+                        and beat.get("state") == "accepted"
+                        and accept_seq is None
+                    ):
+                        raise MigrationError(
+                            f"accepted legacy beat {beat['n']} has no accept action"
+                        )
+                    if report and beat.get("state") == "accepted":
+                        problems = validate_beat(beat, "report", final=True)
+                        if problems:
+                            raise MigrationError(
+                                f"accepted report beat {beat['n']} is not shippable: "
+                                + "; ".join(problems)
+                            )
+                    if report and any(
+                        field in beat
+                        for field in ("landed", "branch", "delivery_kind")
+                    ):
+                        raise MigrationError(
+                            f"report legacy beat {beat['n']} has external delivery fields"
+                        )
                     state, delivery = self._delivery_from_document(
                         beat,
-                        cause_seq=accept_seqs.get(beat["n"]),
+                        cause_seq=accept_seq,
                         kind=delivery_kind,
+                        report=report,
                     )
                     if state == "pending" and delivery["cause_seq"] is None:
                         raise MigrationError(
@@ -790,8 +905,10 @@ class SessionStore:
         if audience is not None:
             if not isinstance(audience, dict):
                 raise StoreError("session audience must be an object")
-            if audience.get("mode") not in ("branch", "review"):
-                raise StoreError("session audience mode must be branch or review")
+            if audience.get("mode") not in AUDIENCE_MODES:
+                raise StoreError(
+                    "session audience mode must be branch, review, or report"
+                )
         delivery_branch = body.get("delivery_branch")
         if delivery_branch is not None and (
             not isinstance(delivery_branch, str)
@@ -810,6 +927,19 @@ class SessionStore:
                 raise StoreError("session legacy_pr has an unsupported shape")
             if _legacy_pr_identity(legacy_pr) != legacy_pr:
                 raise StoreError("session legacy_pr identity is invalid")
+        audience_mode = audience.get("mode") if isinstance(audience, dict) else None
+        if audience_mode == "report" and "target" not in body:
+            raise StoreError("report audience requires a frozen PR target")
+        if (
+            audience_mode == "review"
+            and "target" not in body
+            and legacy_pr is None
+        ):
+            raise StoreError(
+                "review audience requires a frozen PR target or legacy PR marker"
+            )
+        if audience_mode == "report" and body.get("lands") not in (None, []):
+            raise StoreError("report audience cannot have lands")
         if "execution_policy" in body:
             if "target" not in body:
                 raise StoreError("session execution_policy requires a frozen target")
@@ -1029,13 +1159,26 @@ class SessionStore:
             canonical.setdefault("resolution_kind", "delivery")
         return canonical
 
-    def _expected_delivery_kind(self, session):
+    def _audience_mode(self, session):
         audience = session.get("audience")
         if not isinstance(audience, dict):
             return None
-        return {"branch": "commit", "review": "review"}.get(audience.get("mode"))
+        mode = audience.get("mode")
+        return mode if mode in AUDIENCE_MODES else None
 
-    def _delivery_from_document(self, beat, cause_seq=None, kind=None):
+    def _expected_delivery_kind(self, session):
+        return {"branch": "commit", "review": "review"}.get(
+            self._audience_mode(session)
+        )
+
+    def _pr_audience(self, target):
+        if target["state"] == "open" and target["merged_at"] is None:
+            return {"mode": "review", "why": "the frozen PR is open"}
+        return {"mode": "report", "why": "the frozen PR is not open"}
+
+    def _delivery_from_document(
+        self, beat, cause_seq=None, kind=None, report=False
+    ):
         if beat.get("state") != "accepted":
             return "none", None
         kind = beat.get("delivery_kind") or kind
@@ -1047,6 +1190,8 @@ class SessionStore:
                 "cause_seq": cause_seq,
                 "kind": kind,
             }
+        if report:
+            return "none", None
         return "pending", {"cause_seq": cause_seq, "kind": kind}
 
     def _optional_dump(self, value):
@@ -1072,6 +1217,7 @@ class SessionStore:
         allow_new_target=False,
         allow_new_branch=False,
         allow_new_execution_policy=False,
+        allow_new_audience=False,
     ):
         version, body = self._session_document(document)
         row = self._session_row(db)
@@ -1121,8 +1267,15 @@ class SessionStore:
                 )
             else:
                 raise Conflict("session delivery_branch cannot change once pinned")
-        current_mode = self._expected_delivery_kind(current)
-        incoming_mode = self._expected_delivery_kind(body)
+        current_audience = current.get("audience", _MISSING)
+        incoming_audience = body.get("audience", _MISSING)
+        if current_target is not _MISSING and current_audience != incoming_audience:
+            if current_audience is _MISSING and allow_new_audience:
+                pass
+            else:
+                raise Conflict("session audience cannot change once target is frozen")
+        current_mode = self._audience_mode(current)
+        incoming_mode = self._audience_mode(body)
         if current_mode != incoming_mode:
             has_accept = db.execute(
                 "SELECT EXISTS(SELECT 1 FROM actions WHERE kind = 'accept')"
@@ -1409,6 +1562,8 @@ class SessionStore:
                         current["execution_policy"] = self._execution_policy(
                             target, "no_exec"
                         )
+                        current["audience"] = self._pr_audience(target)
+                        current.pop("delivery_branch", None)
                         if self._save_session(
                             db,
                             current,
@@ -1418,12 +1573,27 @@ class SessionStore:
                             self._bump_render(db)
                     elif frozen != target:
                         raise Conflict("session target cannot change once frozen")
-                    elif "execution_policy" not in current:
-                        current["execution_policy"] = self._execution_policy(
-                            target, "no_exec"
-                        )
+                    else:
+                        allow_new_policy = "execution_policy" not in current
+                        allow_new_audience = "audience" not in current
+                        if allow_new_audience:
+                            has_work = db.execute(
+                                "SELECT EXISTS(SELECT 1 FROM beats) OR "
+                                "EXISTS(SELECT 1 FROM actions)"
+                            ).fetchone()[0]
+                            if not has_work:
+                                current["audience"] = self._pr_audience(target)
+                            else:
+                                allow_new_audience = False
+                        if allow_new_policy:
+                            current["execution_policy"] = self._execution_policy(
+                                target, "no_exec"
+                            )
                         if self._save_session(
-                            db, current, allow_new_execution_policy=True
+                            db,
+                            current,
+                            allow_new_execution_policy=allow_new_policy,
+                            allow_new_audience=allow_new_audience,
                         ):
                             self._bump_render(db)
             finally:
@@ -1504,7 +1674,31 @@ class SessionStore:
         target = session.get("target")
         if target is not None and "trusted_context_sha256" not in target:
             return "PR session has no frozen trusted context"
+        if (
+            target is not None
+            and self._audience_mode(session) != self._pr_audience(target)["mode"]
+        ):
+            return "PR session audience does not match its frozen lifecycle"
         return None
+
+    def replacement_reason(self):
+        with self._read() as db:
+            session = json.loads(self._session_row(db)["body_json"])
+            target = session.get("target")
+            policy = (
+                self._legacy_pr_execution_policy(session)
+                if target is None
+                else session.get("execution_policy")
+            )
+            reason = self._replacement_reason(session, policy)
+            if reason:
+                return reason
+            if target is not None:
+                try:
+                    self._required_execution_policy(session)
+                except StoreError as error:
+                    return str(error)
+            return None
 
     def check_execution(self):
         target = self.verify_target_files()
@@ -1691,7 +1885,7 @@ class SessionStore:
     def put_beat(self, document):
         beat = self._beat_document(document)
         with self._first_work_write() as db:
-            self._session_execution_policy(db)
+            session, _execution_policy = self._session_execution_policy(db)
             row = db.execute(
                 "SELECT body_json, delivery_state, delivery_json FROM beats WHERE n = ?",
                 (beat["n"],),
@@ -1713,6 +1907,18 @@ class SessionStore:
                     else:
                         beat.pop("resolution_kind", None)
                 if current.get("state") == "accepted":
+                    if self._audience_mode(session) == "report":
+                        frozen_fields = ("tier", "claim", "where", "slots", "diff")
+                        changed_fields = [
+                            field
+                            for field in frozen_fields
+                            if beat.get(field, _MISSING) != current.get(field, _MISSING)
+                        ]
+                        if changed_fields:
+                            raise Conflict(
+                                f"accepted report beat {beat['n']} cannot change "
+                                + ", ".join(changed_fields)
+                            )
                     current_slots = current.get("slots")
                     incoming_slots = beat.get("slots")
                     if incoming_slots is not None and not isinstance(incoming_slots, dict):
@@ -1921,15 +2127,32 @@ class SessionStore:
                         and delivery_state == "landed"
                     ):
                         raise Conflict(f"beat {n} has already landed")
+                    if kind == "accept" and self._audience_mode(session) == "report":
+                        accepted = _copy(beat)
+                        accepted["state"] = "accepted"
+                        if note:
+                            accepted["call"] = note
+                        problems = validate_beat(accepted, "report", final=True)
+                        if problems:
+                            raise Conflict(
+                                "report acceptance requires a shippable beat: "
+                                + "; ".join(problems)
+                            )
                     beat["state"] = RESOLVE[kind]
                     if kind == "accept":
+                        audience_mode = self._audience_mode(session)
                         delivery_kind = self._expected_delivery_kind(session)
-                        if delivery_kind is None:
-                            raise Conflict("session has no branch or review audience")
-                        delivery_state, delivery = "pending", {
-                            "cause_seq": seq,
-                            "kind": delivery_kind,
-                        }
+                        if audience_mode == "report":
+                            delivery_state, delivery = "none", None
+                        elif delivery_kind is None:
+                            raise Conflict(
+                                "session has no branch, review, or report audience"
+                            )
+                        else:
+                            delivery_state, delivery = "pending", {
+                                "cause_seq": seq,
+                                "kind": delivery_kind,
+                            }
                     else:
                         delivery_state, delivery = "none", None
                 if note:
@@ -2114,14 +2337,29 @@ class SessionStore:
                 raise Conflict(f"action {seq} has not been applied")
             if row["kind"] == "accept":
                 beat = self._beat_row(db, row["beat_n"])
+                beat_state = json.loads(beat["body_json"]).get("state")
                 delivery = beat["delivery_state"]
                 detail = json.loads(beat["delivery_json"]) if beat["delivery_json"] else {}
+                session = json.loads(self._session_row(db)["body_json"])
+                audience_mode = self._audience_mode(session)
                 superseded = db.execute(
                     "SELECT EXISTS(SELECT 1 FROM actions WHERE seq > ? AND beat_n = ? "
                     "AND kind = 'decide' AND state IN ('applied', 'acked'))",
                     (seq, row["beat_n"]),
                 ).fetchone()[0]
-                if detail.get("kind") != "review" and delivery != "landed" and not superseded:
+                can_ack_without_landing = (
+                    (audience_mode == "review" and detail.get("kind") == "review")
+                    or (
+                        audience_mode == "report"
+                        and delivery == "none"
+                        and not detail
+                    )
+                )
+                if beat_state != "accepted" and not superseded:
+                    raise Conflict(
+                        f"accepted action {seq} no longer resolves to an accepted beat"
+                    )
+                if not can_ack_without_landing and delivery != "landed" and not superseded:
                     raise Conflict(f"accepted action {seq} has not landed")
             db.execute(
                 "UPDATE actions SET state = 'acked', acked_at = ? WHERE seq = ?",
@@ -2261,6 +2499,9 @@ class SessionStore:
             row = self._beat_row(db, beat_n)
             beat = json.loads(row["body_json"])
             current = json.loads(row["delivery_json"]) if row["delivery_json"] else None
+            session = json.loads(self._session_row(db)["body_json"])
+            if self._audience_mode(session) == "report":
+                raise Conflict("report inclusion has no external delivery to fail")
             desired = {
                 "error": error,
                 "owed": owed,

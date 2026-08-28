@@ -1058,6 +1058,9 @@ def check(store, require_open=False, api=load_pr):
     target = store.verify_target_files()
     if target["kind"] != "github_pr":
         raise SnapshotError("frozen target is not a GitHub pull request")
+    replacement_reason = store.replacement_reason()
+    if replacement_reason:
+        raise TargetMoved(replacement_reason)
     current = _identity(api(target["repo"], target["number"]))
     expected = {
         name: target[name]

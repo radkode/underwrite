@@ -39,7 +39,16 @@ class ReviewModeContract(unittest.TestCase):
 
     def test_the_audience_shape_is_explicit(self):
         text = self.skill()
-        self.assertIn("audience{mode: branch|review, why}", text)
+        self.assertIn("audience{mode: branch|review|report, why}", text)
+
+    def test_pr_capture_freezes_audience_from_lifecycle(self):
+        text = self.skill()
+
+        self.assertIn("open PR | `review`", text)
+        self.assertIn("non-open PR, merged or closed without merge | `report`", text)
+        self.assertIn("target, `no-exec` policy, and derived audience in one transaction", text)
+        self.assertIn("Never silently reclassify", text)
+        self.assertIn("do not send it\nback through `patch-session`", text)
 
 
 class ActionDeliveryContract(unittest.TestCase):
@@ -91,11 +100,16 @@ class DelegatedActionContract(unittest.TestCase):
     def test_visible_actions_map_to_the_existing_protocol(self):
         text = self.skill()
 
-        for label in ("Implement", "Include in review", "Record decision"):
+        for label in (
+            "Implement",
+            "Include in review",
+            "Include in report",
+            "Record decision",
+        ):
             with self.subTest(label=label):
                 self.assertIn(label, text)
-        self.assertIn("both post the canonical `accept` action", text)
-        self.assertIn("Record decision posts the\nexisting `decide` action", text)
+        self.assertIn("all post the canonical `accept` action", text)
+        self.assertIn("Record decision posts the existing `decide` action", text)
 
     def test_decision_only_beats_declare_their_resolution_kind(self):
         text = self.skill()
@@ -132,8 +146,40 @@ class DelegatedActionContract(unittest.TestCase):
         self.assertNotIn("patch already\nwritten and run", text)
         self.assertIn("Implement applies and verifies a branch fix", text)
         self.assertIn("Include in review queues a finding", text)
+        self.assertIn("Include in report records a finding", text)
         self.assertIn("Record decision stores an answer", text)
-        self.assertIn("both record the existing `accept` action", text)
+        self.assertIn("all record the existing `accept` action", text)
+
+
+class ReportModeContract(unittest.TestCase):
+    def skill(self):
+        return SKILL.read_text(encoding="utf-8")
+
+    def test_report_accept_is_the_terminal_durable_outcome(self):
+        text = self.skill()
+
+        self.assertIn("In `report` mode, Include in report posts `accept`", text)
+        self.assertIn("the accepted beat in SQLite is the durable report outcome", text)
+        self.assertIn("Acknowledge the applied accept immediately", text)
+        self.assertIn("Do not call `land`", text)
+        self.assertIn("Acceptance freezes the agent-authored finding text", text)
+        self.assertIn("acceptance validates and freezes the agent-authored finding", text)
+
+    def test_report_mode_has_no_external_delivery(self):
+        text = self.skill()
+
+        self.assertIn("**Report mode.**", text)
+        self.assertIn("does not create a GitHub effect", text)
+        self.assertIn("`report.html` is a regenerable projection", text)
+        self.assertIn("accepted report beats require no `landed` value", text)
+
+    def test_github_422_is_treated_as_ambiguous(self):
+        text = self.skill()
+
+        self.assertNotIn("A 422 here means the audience call was wrong upstream", text)
+        self.assertIn("A 422 is ambiguous", text)
+        self.assertIn("stable marker and exact frozen head", text)
+        self.assertIn("author cannot approve their own PR", text)
 
 
 class FrozenSnapshotContract(unittest.TestCase):
@@ -153,7 +199,7 @@ class FrozenSnapshotContract(unittest.TestCase):
     def test_pr_snapshots_never_authorize_branch_side_effects(self):
         text = self.skill()
 
-        self.assertIn("capture freezes `no-exec` with the target", text)
+        self.assertIn("capture freezes the target, `no-exec` policy", text)
         self.assertIn("Do not check out or execute the head", text)
         self.assertIn("the page and store always refuse branch acceptance", text)
         self.assertIn("PR targets never enter this path", text)

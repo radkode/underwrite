@@ -52,6 +52,26 @@ CLEAN = {
     "n": 2, "tier": "core", "state": "clean", "claim": "load-bearing", "where": "b.py:1",
     "slots": {"what": "x", "proof": "b.py:1"},
 }
+REPORT_TARGET = {
+    "version": 1,
+    "kind": "github_pr",
+    "repo": "acme/widget",
+    "number": 7,
+    "state": "closed",
+    "merged_at": None,
+    "base_sha": "a" * 40,
+    "head_sha": "b" * 40,
+    "head_repo_id": 123,
+    "head_repo": "acme/widget",
+    "head_ref": "feature",
+    "merge_base_sha": "c" * 40,
+    "changed_files": 1,
+    "diff_sha256": "d" * 64,
+    "diff_bytes": 5,
+    "trusted_context_sha256": "e" * 64,
+    "trusted_context_bytes": 3,
+}
+REVIEW_TARGET = {**REPORT_TARGET, "state": "open"}
 
 
 class SessionTest(unittest.TestCase):
@@ -827,18 +847,6 @@ class Requests(Served):
         self.assertEqual(status, 200)
         self.assertIn('data-action="accept">Implement</button>', page)
 
-    def test_the_live_page_offers_review_inclusion_through_accept(self):
-        session, _beats = self.session.store.snapshot()
-        self.session.store.put_session({
-            **session,
-            "audience": {"mode": "review", "why": "another reviewer owns the PR"},
-        })
-
-        status, page = self.get("/")
-
-        self.assertEqual(status, 200)
-        self.assertIn('data-action="accept">Include in review</button>', page)
-
     def test_the_live_page_offers_the_explicit_decision_action(self):
         self.session.store.put_beat({**FLAG, "resolution_kind": "decision"})
 
@@ -858,6 +866,73 @@ class Requests(Served):
         self.assertEqual(self.get("/../../../etc/passwd")[0], 404)
 
 
+class ReviewRequests(Served):
+    def session_document(self):
+        return {
+            "repo": "acme/widget",
+            "cursor": 2,
+            "audience": {
+                "mode": "review",
+                "why": "the frozen PR is open",
+            },
+            "target": REVIEW_TARGET,
+        }
+
+    def test_the_live_page_offers_review_inclusion_through_accept(self):
+        status, page = self.get("/")
+
+        self.assertEqual(status, 200)
+        self.assertIn('data-action="accept">Include in review</button>', page)
+
+
+class ReportRequests(Served):
+    def session_document(self):
+        return {
+            "repo": "acme/widget",
+            "cursor": 2,
+            "audience": {
+                "mode": "report",
+                "why": "the frozen PR is not open",
+            },
+            "target": REPORT_TARGET,
+        }
+
+    def test_report_accept_is_terminal_over_http(self):
+        page_status, page = self.get("/")
+        action_status, body = self.post(
+            "/act", {"n": 1, "action": "accept", "note": "include it"}
+        )
+        action = json.loads(body)
+
+        self.assertEqual(page_status, 200)
+        self.assertIn('data-action="accept">Include in report</button>', page)
+        self.assertIn("Outcome: report only", page)
+        self.assertEqual(action_status, 200)
+        self.assertEqual(action["result"]["delivery"], "none")
+        self.assertIn("Included in report", self.get("/fragment")[1])
+        ack_status, ack_body = self.post("/ack", {"seq": action["seq"]})
+        self.assertEqual(ack_status, 200)
+        self.assertEqual(json.loads(ack_body), {"handled_seq": 1})
+        self.assertFalse(self.session.store.reconcile()["recovery"])
+
+    def test_unproven_report_finding_cannot_be_included_over_http(self):
+        invalid = self.session.store.snapshot()[1][0]
+        invalid["slots"]["proof"] = "trust me"
+        self.session.store.put_beat(invalid)
+
+        page_status, page = self.get("/")
+        action_status, body = self.post(
+            "/act", {"n": 1, "action": "accept", "note": "include it"}
+        )
+
+        self.assertEqual(page_status, 200)
+        self.assertIn("Complete finding evidence before inclusion", page)
+        self.assertNotIn('data-action="accept">Include in report</button>', page)
+        self.assertEqual(action_status, 409)
+        self.assertIn("requires a shippable beat", body)
+        self.assertEqual(self.beat(1)["state"], "flag")
+
+
 class LegacyPrRequests(Served):
     def session_document(self):
         return {
@@ -874,7 +949,7 @@ class LegacyPrRequests(Served):
         )
 
         self.assertEqual(page_status, 200)
-        self.assertIn("Legacy PR requires a supervised replacement", page)
+        self.assertIn("PR session requires a supervised replacement", page)
         self.assertNotIn('data-action="accept"', page)
         self.assertIn('data-action="note">Save note</button>', page)
         self.assertEqual(action_status, 409)

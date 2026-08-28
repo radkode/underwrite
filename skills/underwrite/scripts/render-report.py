@@ -28,10 +28,13 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from session_store import SessionStore, StoreError
-
-SLOTS = ("what", "why", "proof", "risk", "prior", "fix")
-STATES = ("clean", "flag", "unverified", "accepted", "dropped", "decided")
+from session_store import (
+    AUDIENCE_MODES,
+    BEAT_SLOTS as SLOTS,
+    SessionStore,
+    StoreError,
+    validate_beat,
+)
 
 # state -> (css suffix, token shown before the claim)
 # `decided` borrows the accepted palette on purpose: the reviewer said yes to both, and
@@ -54,12 +57,6 @@ SECTIONS = (
 )
 
 LANDS_TAG = {"landed": "Landed", "ready": "Ready", "open": "Your call"}
-
-# proof has to point at something a reader can re-run or open, or say up front
-# that it does not. "inferred" is the documented honest answer, not a failure.
-# The path arm wants a letter rather than a dot: requiring an extension turned
-# Makefile:12 and CODEOWNERS:8 into unproven, and a letter still keeps 10:30 out.
-PROOF_EVIDENCE = re.compile(r"`[^`]+`|\b[\w./-]*[A-Za-z][\w./-]*:\d+|^inferred\b")
 
 # Only for --standalone. The viewport tag is load-bearing: report.css has a
 # 620px breakpoint that never fires without it.
@@ -329,7 +326,7 @@ def md(text):
 
 def session_mode(session):
     audience = session.get("audience")
-    if isinstance(audience, dict) and audience.get("mode") in ("branch", "review"):
+    if isinstance(audience, dict) and audience.get("mode") in AUDIENCE_MODES:
         return audience["mode"]
     return "branch"
 
@@ -350,10 +347,25 @@ def execution_mode(session):
     return None
 
 
+def frozen_pr_mode(session):
+    target = session.get("target")
+    if not isinstance(target, dict) or target.get("kind") != "github_pr":
+        return None
+    if target.get("state") == "open" and target.get("merged_at") is None:
+        return "review"
+    return "report"
+
+
 def replacement_required(session):
     target = session.get("target")
-    if isinstance(target, dict) and target.get("kind") == "github_pr":
-        return "trusted_context_sha256" not in target
+    expected = frozen_pr_mode(session)
+    if session_mode(session) == "report" and expected != "report":
+        return True
+    if expected is not None:
+        return (
+            "trusted_context_sha256" not in target
+            or session_mode(session) != expected
+        )
     return (
         target is None
         and isinstance(session.get("legacy_pr"), dict)
@@ -362,61 +374,7 @@ def replacement_required(session):
 
 def validate(beat, mode="branch", final=False):
     """Return a list of problems. Empty means the beat is shippable."""
-    problems = []
-    n = beat.get("n", "?")
-    state = beat.get("state")
-    slots = beat.get("slots") or {}
-
-    if state not in STATES:
-        problems.append(f"beat {n}: state {state!r} is not one of {', '.join(STATES)}")
-    for key in slots:
-        if key not in SLOTS:
-            problems.append(f"beat {n}: unknown slot {key!r}")
-    resolution_kind = beat.get("resolution_kind", "delivery")
-    if resolution_kind not in ("delivery", "decision"):
-        problems.append(
-            f"beat {n}: resolution_kind must be delivery or decision"
-        )
-    if not slots.get("what"):
-        problems.append(f"beat {n}: no what")
-    if state in ("clean", "accepted") and not slots.get("proof"):
-        problems.append(f"beat {n}: {state} with no proof")
-    # Live reports may show delegated work in flight. Final reports require its receipt.
-    if final and state == "accepted" and not beat.get("landed"):
-        problems.append(f"beat {n}: accepted, nothing landed")
-    if state == "accepted" and beat.get("landed"):
-        expected_delivery = "commit" if mode == "branch" else "review"
-        if beat.get("delivery_kind") != expected_delivery:
-            problems.append(
-                f"beat {n}: landed as {beat.get('delivery_kind')!r}, "
-                f"expected {expected_delivery} delivery"
-            )
-        elif expected_delivery == "commit" and not beat.get("branch"):
-            problems.append(f"beat {n}: commit delivery has no branch")
-        elif expected_delivery == "review" and beat.get("branch"):
-            problems.append(f"beat {n}: review delivery unexpectedly names a branch")
-    # The escape from that rule, for the flag whose answer is a call rather than a patch.
-    # Then the words are the whole artifact, and a decided beat with none of them is the
-    # same silence the rule above exists to catch.
-    if state == "decided" and not beat.get("call"):
-        problems.append(f"beat {n}: decided, nothing recorded")
-    # The mirror, and the shape a decision taken in words leaves when it never reaches
-    # the server: the fix committed, the beat still open, and the rule above looking
-    # straight past it because it keys on the state that was never set.
-    if beat.get("landed") and state != "accepted":
-        problems.append(f"beat {n}: landed {beat['landed']} but state is {state!r}")
-    if state == "flag":
-        for key in ("risk", "fix"):
-            if not slots.get(key):
-                problems.append(f"beat {n}: flag with no {key}")
-    proof = slots.get("proof")
-    if proof and not isinstance(proof, str):
-        # Reported rather than raised: searching a number threw TypeError straight
-        # past main(), so the one step that promises never to fail did.
-        problems.append(f"beat {n}: proof is {type(proof).__name__}, not text")
-    elif proof and not PROOF_EVIDENCE.search(proof):
-        problems.append(f"beat {n}: proof names no command or path:line")
-    return problems
+    return validate_beat(beat, mode, final)
 
 
 def diff_html(lines):
@@ -432,6 +390,18 @@ def delivery_html(beat, mode, replacement=False, untrusted_pr=False):
     if beat.get("state") != "accepted":
         return ""
     delivery = beat.get("delivery")
+    if (
+        mode == "report"
+        and not any(field in beat for field in ("landed", "branch", "delivery_kind"))
+        and (
+            not isinstance(delivery, dict)
+            or delivery.get("state") in (None, "none")
+        )
+    ):
+        return (
+            '<div class="call delivery"><span class="lbl">'
+            "Included in report</span></div>"
+        )
     if not isinstance(delivery, dict):
         return ""
     state = delivery.get("state")
@@ -467,22 +437,22 @@ def delivery_html(beat, mode, replacement=False, untrusted_pr=False):
             f'{" ".join(detail)}</div>'
         )
     if state == "pending":
-        label = (
-            "Implementation pending"
-            if mode == "branch"
-            else "Included, review pending"
-        )
+        label = {
+            "branch": "Implementation pending",
+            "review": "Included, review pending",
+            "report": "Report inclusion pending",
+        }[mode]
         return (
             '<div class="call delivery pending">'
             f'<span class="lbl">{label}</span></div>'
         )
     if state != "failed":
         return ""
-    label = (
-        "Implementation failed"
-        if mode == "branch"
-        else "Review publication failed"
-    )
+    label = {
+        "branch": "Implementation failed",
+        "review": "Review publication failed",
+        "report": "Report inclusion failed",
+    }[mode]
     detail = []
     if delivery.get("error"):
         detail.append(f'<span class="delivery-error">{md(delivery["error"])}</span>')
@@ -507,7 +477,8 @@ def beat_html(
     untrusted_pr=False,
 ):
     suffix, token = STATE_STYLE.get(beat.get("state"), ("unver", "UNVERIFIED"))
-    slots = beat.get("slots") or {}
+    raw_slots = beat.get("slots")
+    slots = raw_slots if isinstance(raw_slots, dict) else {}
     n = beat.get("n", "?")
 
     chip = '<span class="unproven">unproven</span>' if problems else ""
@@ -530,7 +501,7 @@ def beat_html(
     delivery = delivery_html(beat, mode, replacement, untrusted_pr)
     if delivery:
         body.append(delivery)
-    if beat.get("landed"):
+    if beat.get("landed") and mode != "report":
         branch = beat.get("branch")
         body.append(
             '<div class="shipped"><span class="lbl">Landed</span>'
@@ -542,15 +513,22 @@ def beat_html(
         flag = beat.get("state") == "flag"
         if flag:
             decision_only = beat.get("resolution_kind") == "decision"
+            report_accept_problems = []
+            if mode == "report" and not decision_only:
+                accepted = dict(beat, state="accepted")
+                report_accept_problems = validate(accepted, "report", final=True)
             blocked = not decision_only and (
-                replacement or (mode == "branch" and untrusted_pr)
+                replacement
+                or (mode == "branch" and untrusted_pr)
+                or bool(report_accept_problems)
             )
             if blocked:
-                message = (
-                    "Legacy PR requires a supervised replacement"
-                    if replacement
-                    else "No-exec policy blocks implementation"
-                )
+                if replacement:
+                    message = "PR session requires a supervised replacement"
+                elif mode == "branch" and untrusted_pr:
+                    message = "No-exec policy blocks implementation"
+                else:
+                    message = "Complete finding evidence before inclusion"
                 controls = (
                     f'<span class="execution-blocked">{message}</span>'
                     '<button class="act" data-action="drop">Drop</button>'
@@ -558,16 +536,16 @@ def beat_html(
                 )
                 placeholder = (
                     "record a note before replacing this session"
-                    if replacement
-                    else "record a note, or switch the session to review delivery"
+                    if replacement or (mode == "branch" and untrusted_pr)
+                    else "record a note while the finding is completed"
                 )
             else:
                 action = "decide" if decision_only else "accept"
-                label = (
-                    "Record decision"
-                    if decision_only
-                    else "Implement" if mode == "branch" else "Include in review"
-                )
+                label = "Record decision" if decision_only else {
+                    "branch": "Implement",
+                    "review": "Include in review",
+                    "report": "Include in report",
+                }[mode]
                 controls = (
                     f'<button class="act primary" data-action="{action}">{label}</button>'
                     '<button class="act" data-action="drop">Drop</button>'
@@ -659,7 +637,7 @@ def body_html(session, beats, problems_by_n, live=False):
             f'<span class="hint">{hint}</span></div>{cards}</section>'
         )
 
-    if session.get("lands"):
+    if session.get("lands") and mode != "report":
         rows = "".join(
             f'<div class="next-row {attr(l.get("state", "open"))}">'
             f'<span class="tag">{LANDS_TAG.get(l.get("state"), "Your call")}</span>'
@@ -703,6 +681,8 @@ def render(session, beats, css, problems_by_n, live=False):
         f'{md(session.get("title", ""))}</h1>'
     )
     facts_values = list(session.get("facts") or [])
+    if session_mode(session) == "report":
+        facts_values.append("Outcome: report only")
     policy = session.get("execution_policy")
     execution = execution_mode(session)
     if isinstance(policy, dict):
@@ -741,14 +721,18 @@ def render(session, beats, css, problems_by_n, live=False):
 def load(root, css_path, final=False):
     """Read a session off disk. Returns (session, beats, problems_by_n, problems)."""
     legacy = not (root / "session.sqlite3").exists()
-    if not legacy:
-        session, beats = SessionStore(root).presentation_snapshot()
-    else:
+    if legacy:
         session = json.loads((root / "session.json").read_text(encoding="utf-8"))
-        beats = [
-            json.loads(p.read_text(encoding="utf-8"))
-            for p in sorted((root / "beats").glob("*.json"))
-        ]
+        if session_mode(session) == "report":
+            session, beats = SessionStore(root).presentation_snapshot()
+            legacy = False
+        else:
+            beats = [
+                json.loads(p.read_text(encoding="utf-8"))
+                for p in sorted((root / "beats").glob("*.json"))
+            ]
+    else:
+        session, beats = SessionStore(root).presentation_snapshot()
     css = css_path.read_text(encoding="utf-8")
 
     problems_by_n, problems = {}, []
@@ -760,11 +744,14 @@ def load(root, css_path, final=False):
         session["audience"] = {}
         mode = "branch"
     else:
-        if audience.get("mode") not in ("branch", "review"):
-            problems.append("session audience mode must be branch or review")
+        if audience.get("mode") not in AUDIENCE_MODES:
+            problems.append("session audience mode must be branch, review, or report")
         mode = session_mode(session)
     policy = session.get("execution_policy")
     target = session.get("target")
+    expected_mode = frozen_pr_mode(session)
+    if mode == "report" and expected_mode != "report":
+        problems.append("report audience requires a frozen non-open PR target")
     if isinstance(target, dict) and target.get("kind") == "github_pr":
         if policy is None:
             problems.append("PR session has no execution policy")
@@ -775,10 +762,23 @@ def load(root, css_path, final=False):
                 problems.append("session execution_policy trust must be untrusted")
             if policy.get("mode") != "no_exec":
                 problems.append("session execution_policy mode must be no_exec")
+        if mode != expected_mode:
+            problems.append(
+                f"session audience mode {mode} does not match frozen PR lifecycle "
+                f"mode {expected_mode}"
+            )
     if legacy:
-        expected_delivery = "commit" if mode == "branch" else "review"
+        expected_delivery = {
+            "branch": "commit",
+            "review": "review",
+            "report": None,
+        }[mode]
         for beat in beats:
-            if beat.get("state") == "accepted" and beat.get("landed"):
+            if (
+                expected_delivery is not None
+                and beat.get("state") == "accepted"
+                and beat.get("landed")
+            ):
                 beat.setdefault("delivery_kind", expected_delivery)
     for beat in beats:
         found = validate(beat, mode, final)
@@ -822,7 +822,7 @@ def main():
     ap.add_argument(
         "--final",
         action="store_true",
-        help="require every accepted beat to name its commit or posted review",
+        help="require every accepted beat to have its audience outcome",
     )
     args = ap.parse_args()
 
