@@ -62,17 +62,19 @@ class SessionTest(unittest.TestCase):
         self.addCleanup(shutil.rmtree, self.root, True)
         (self.root / "beats").mkdir()
         (self.root / "session.json").write_text(
-            json.dumps({
-                "repo": "acme/widget",
-                "number": 1,
-                "cursor": 2,
-                "audience": {"mode": "branch", "why": "the author owns the branch"},
-            }),
+            json.dumps(self.session_document()),
             encoding="utf-8",
         )
         for beat in (FLAG, CLEAN):
             self.put(beat)
         self.session = self.open_session()
+
+    def session_document(self):
+        return {
+            "repo": "acme/widget",
+            "cursor": 2,
+            "audience": {"mode": "branch", "why": "the author owns the branch"},
+        }
 
     def open_session(self):
         session = serve.Session(self.root, serve.rr().default_css())
@@ -854,6 +856,36 @@ class Requests(Served):
 
     def test_a_traversing_path_answers_404_without_opening_anything(self):
         self.assertEqual(self.get("/../../../etc/passwd")[0], 404)
+
+
+class LegacyPrRequests(Served):
+    def session_document(self):
+        return {
+            "repo": "acme/widget",
+            "number": 1,
+            "cursor": 2,
+            "audience": {"mode": "branch", "why": "the author owns the branch"},
+        }
+
+    def test_a_pre_target_legacy_pr_blocks_implementation_over_http(self):
+        page_status, page = self.get("/")
+        action_status, body = self.post(
+            "/act", {"n": 1, "action": "accept", "note": "yes"}
+        )
+
+        self.assertEqual(page_status, 200)
+        self.assertIn("Legacy PR requires a supervised replacement", page)
+        self.assertNotIn('data-action="accept"', page)
+        self.assertIn('data-action="note">Save note</button>', page)
+        self.assertEqual(action_status, 409)
+        self.assertIn("supervised replacement", body)
+
+        note_status, _note_body = self.post(
+            "/act", {"n": 1, "action": "note", "note": "carry this forward"}
+        )
+        self.assertEqual(note_status, 200)
+        self.assertEqual(self.beat(1)["state"], "flag")
+        self.assertEqual(self.beat(1)["call"], "carry this forward")
 
 
 class Forgery(Served):

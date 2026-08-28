@@ -334,6 +334,32 @@ def session_mode(session):
     return "branch"
 
 
+def execution_mode(session):
+    policy = session.get("execution_policy")
+    if isinstance(policy, dict) and policy.get("mode") == "no_exec":
+        return policy["mode"]
+    legacy_pr = session.get("legacy_pr")
+    if (
+        "target" not in session
+        and isinstance(legacy_pr, dict)
+        and isinstance(legacy_pr.get("number"), int)
+        and not isinstance(legacy_pr.get("number"), bool)
+        and legacy_pr["number"] > 0
+    ):
+        return "no_exec"
+    return None
+
+
+def replacement_required(session):
+    target = session.get("target")
+    if isinstance(target, dict) and target.get("kind") == "github_pr":
+        return "trusted_context_sha256" not in target
+    return (
+        target is None
+        and isinstance(session.get("legacy_pr"), dict)
+    )
+
+
 def validate(beat, mode="branch", final=False):
     """Return a list of problems. Empty means the beat is shippable."""
     problems = []
@@ -402,13 +428,44 @@ def diff_html(lines):
     return f'<div class="diff"><pre>{"".join(out)}</pre></div>'
 
 
-def delivery_html(beat, mode):
+def delivery_html(beat, mode, replacement=False, untrusted_pr=False):
     if beat.get("state") != "accepted":
         return ""
     delivery = beat.get("delivery")
     if not isinstance(delivery, dict):
         return ""
     state = delivery.get("state")
+    blocked_delivery = (
+        replacement
+        or (
+            untrusted_pr
+            and delivery.get("kind") == "commit"
+        )
+    ) and state in ("pending", "failed")
+    if blocked_delivery:
+        warning = (
+            "Do not publish or execute this delivery. Start a supervised replacement."
+            if replacement
+            else "Do not execute target code. Start a supervised replacement."
+        )
+        detail = [
+            f'<span class="delivery-error">{warning}</span>'
+        ]
+        if delivery.get("error"):
+            detail.append(
+                '<span class="delivery-error">Recorded failure: '
+                f'{md(delivery["error"])}</span>'
+            )
+        if delivery.get("owed"):
+            detail.append(
+                '<span class="delivery-owed">Previously recorded obligation: '
+                f'{md(delivery["owed"])}</span>'
+            )
+        return (
+            '<div class="call delivery failed">'
+            '<span class="lbl">Blocked, replacement required</span>'
+            f'{" ".join(detail)}</div>'
+        )
     if state == "pending":
         label = (
             "Implementation pending"
@@ -440,7 +497,15 @@ def delivery_html(beat, mode):
     )
 
 
-def beat_html(beat, problems, expanded, live=False, mode="branch"):
+def beat_html(
+    beat,
+    problems,
+    expanded,
+    live=False,
+    mode="branch",
+    replacement=False,
+    untrusted_pr=False,
+):
     suffix, token = STATE_STYLE.get(beat.get("state"), ("unver", "UNVERIFIED"))
     slots = beat.get("slots") or {}
     n = beat.get("n", "?")
@@ -462,7 +527,7 @@ def beat_html(beat, problems, expanded, live=False, mode="branch"):
             '<div class="call"><span class="lbl">Your call · beat '
             f'{n}</span><q>{md(beat["call"])}</q></div>'
         )
-    delivery = delivery_html(beat, mode)
+    delivery = delivery_html(beat, mode, replacement, untrusted_pr)
     if delivery:
         body.append(delivery)
     if beat.get("landed"):
@@ -477,21 +542,42 @@ def beat_html(beat, problems, expanded, live=False, mode="branch"):
         flag = beat.get("state") == "flag"
         if flag:
             decision_only = beat.get("resolution_kind") == "decision"
-            action = "decide" if decision_only else "accept"
-            label = (
-                "Record decision"
-                if decision_only
-                else "Implement" if mode == "branch" else "Include in review"
+            blocked = not decision_only and (
+                replacement or (mode == "branch" and untrusted_pr)
             )
-            controls = (
-                f'<button class="act primary" data-action="{action}">{label}</button>'
-                '<button class="act" data-action="drop">Drop</button>'
-            )
-            placeholder = (
-                "record the decision in your own words"
-                if decision_only
-                else "or put it in your own words"
-            )
+            if blocked:
+                message = (
+                    "Legacy PR requires a supervised replacement"
+                    if replacement
+                    else "No-exec policy blocks implementation"
+                )
+                controls = (
+                    f'<span class="execution-blocked">{message}</span>'
+                    '<button class="act" data-action="drop">Drop</button>'
+                    '<button class="act" data-action="note">Save note</button>'
+                )
+                placeholder = (
+                    "record a note before replacing this session"
+                    if replacement
+                    else "record a note, or switch the session to review delivery"
+                )
+            else:
+                action = "decide" if decision_only else "accept"
+                label = (
+                    "Record decision"
+                    if decision_only
+                    else "Implement" if mode == "branch" else "Include in review"
+                )
+                controls = (
+                    f'<button class="act primary" data-action="{action}">{label}</button>'
+                    '<button class="act" data-action="drop">Drop</button>'
+                    '<button class="act" data-action="note">Save note</button>'
+                )
+                placeholder = (
+                    "record the decision in your own words"
+                    if decision_only
+                    else "or put it in your own words"
+                )
         else:
             controls = '<button class="act" data-action="note">Save note</button>'
             placeholder = "note this for the record"
@@ -518,6 +604,11 @@ def beat_html(beat, problems, expanded, live=False, mode="branch"):
 def body_html(session, beats, problems_by_n, live=False):
     """Everything below the masthead. This is what /fragment re-serves on a change."""
     mode = session_mode(session)
+    replacement = replacement_required(session)
+    target = session.get("target")
+    untrusted_pr = (
+        isinstance(target, dict) and target.get("kind") == "github_pr"
+    ) or isinstance(session.get("legacy_pr"), dict)
     counts = {}
     for beat in beats:
         counts[beat.get("state")] = counts.get(beat.get("state"), 0) + 1
@@ -553,7 +644,13 @@ def body_html(session, beats, problems_by_n, live=False):
             continue
         cards = "".join(
             beat_html(
-                b, problems_by_n.get(b.get("n")), expanded, live=live, mode=mode
+                b,
+                problems_by_n.get(b.get("n")),
+                expanded,
+                live=live,
+                mode=mode,
+                replacement=replacement,
+                untrusted_pr=untrusted_pr,
             )
             for b in picked
         )
@@ -605,8 +702,21 @@ def render(session, beats, css, problems_by_n, live=False):
         f'</div><h1><span class="num">{html.escape(label)}</span> '
         f'{md(session.get("title", ""))}</h1>'
     )
-    if session.get("facts"):
-        facts = "".join(f"<span>{md(f)}</span>" for f in session["facts"])
+    facts_values = list(session.get("facts") or [])
+    policy = session.get("execution_policy")
+    execution = execution_mode(session)
+    if isinstance(policy, dict):
+        policy_mode = {
+            "no_exec": "No-exec",
+        }.get(policy.get("mode"), str(policy.get("mode", "unknown")))
+        facts_values.append(f"Execution: {policy_mode}")
+        if policy.get("trust"):
+            facts_values.append(f"Trust: {policy['trust']} PR head")
+    elif execution == "no_exec":
+        facts_values.append("Execution: No-exec, legacy PR")
+        facts_values.append("Trust: untrusted PR head")
+    if facts_values:
+        facts = "".join(f"<span>{md(f)}</span>" for f in facts_values)
         parts.append(f'<div class="facts">{facts}</div>')
     if live:
         parts.append(
@@ -653,6 +763,18 @@ def load(root, css_path, final=False):
         if audience.get("mode") not in ("branch", "review"):
             problems.append("session audience mode must be branch or review")
         mode = session_mode(session)
+    policy = session.get("execution_policy")
+    target = session.get("target")
+    if isinstance(target, dict) and target.get("kind") == "github_pr":
+        if policy is None:
+            problems.append("PR session has no execution policy")
+        elif not isinstance(policy, dict):
+            problems.append("session execution_policy must be an object")
+        else:
+            if policy.get("trust") != "untrusted":
+                problems.append("session execution_policy trust must be untrusted")
+            if policy.get("mode") != "no_exec":
+                problems.append("session execution_policy mode must be no_exec")
     if legacy:
         expected_delivery = "commit" if mode == "branch" else "review"
         for beat in beats:

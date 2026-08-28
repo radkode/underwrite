@@ -2,6 +2,8 @@
 """Operate an underwrite session through its transactional store."""
 
 import argparse
+import base64
+import binascii
 import json
 import sqlite3
 import sys
@@ -18,7 +20,10 @@ from pr_snapshot import (  # noqa: E402
     capture,
     check,
     check_commit,
+    check_controller,
     check_worktree,
+    context_log,
+    read_blob,
     review_identity,
     review_receipt,
 )
@@ -58,6 +63,27 @@ def application_input(source, reconciliation=False):
     return value["result"], value.get("session"), beats, evidence
 
 
+def path_token(path):
+    return base64.urlsafe_b64encode(path.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def path_from_token(token):
+    if not isinstance(token, str) or not token or any(
+        character not in "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+        for character in token
+    ):
+        raise StoreError("blob path token must be unpadded URL-safe base64")
+    try:
+        path = base64.b64decode(
+            token + "=" * (-len(token) % 4), altchars=b"-_", validate=True
+        ).decode("utf-8")
+    except (UnicodeError, binascii.Error) as error:
+        raise StoreError("blob path token must encode UTF-8 text") from error
+    if path_token(path) != token:
+        raise StoreError("blob path token is not canonical")
+    return path
+
+
 def parser():
     ap = Usage(prog="sessionctl.py")
     commands = ap.add_subparsers(dest="command", required=True)
@@ -70,6 +96,33 @@ def parser():
     snapshot_pr.add_argument("session")
     snapshot_pr.add_argument("repo")
     snapshot_pr.add_argument("pr", type=int)
+    snapshot_pr.add_argument("--controller-root", required=True)
+
+    check_controller_command = commands.add_parser("check-controller")
+    check_controller_command.add_argument("session")
+    check_controller_command.add_argument("controller_root")
+
+    freeze_execution = commands.add_parser("freeze-execution")
+    freeze_execution.add_argument("session")
+    freeze_execution.add_argument(
+        "--mode", choices=("no-exec",), required=True
+    )
+
+    check_execution = commands.add_parser("check-execution")
+    check_execution.add_argument("session")
+
+    trusted_context = commands.add_parser("trusted-context")
+    trusted_context.add_argument("session")
+
+    context = commands.add_parser("context-log")
+    context.add_argument("session")
+    context.add_argument("--limit", type=int, default=20)
+
+    blob = commands.add_parser("read-blob")
+    blob.add_argument("session")
+    blob.add_argument("side", choices=("base", "head"))
+    blob.add_argument("path_token")
+    blob.add_argument("--max-bytes", type=int, default=1_000_000)
 
     check_pr = commands.add_parser("check-pr")
     check_pr.add_argument("session")
@@ -155,7 +208,29 @@ def run(args):
 
     if args.command == "snapshot-pr":
         store = SessionStore(args.session)
-        result = capture(store, args.repo, args.pr)
+        result = capture(store, args.repo, args.pr, args.controller_root)
+    elif args.command == "check-controller":
+        return check_controller(SessionStore(args.session), args.controller_root)
+    elif args.command == "freeze-execution":
+        store = SessionStore(args.session)
+        result = store.freeze_execution(args.mode.replace("-", "_"))
+    elif args.command == "check-execution":
+        return SessionStore(args.session).check_execution()
+    elif args.command == "trusted-context":
+        return SessionStore(args.session).read_trusted_context()
+    elif args.command == "context-log":
+        result = context_log(SessionStore(args.session), args.limit)
+        result["path_tokens"] = [
+            {"path": path, "token": path_token(path)} for path in result["paths"]
+        ]
+        return result
+    elif args.command == "read-blob":
+        return read_blob(
+            SessionStore(args.session),
+            args.side,
+            path_from_token(args.path_token),
+            args.max_bytes,
+        )
     elif args.command == "check-pr":
         store = SessionStore(args.session)
         return check(store, require_open=args.require_open)

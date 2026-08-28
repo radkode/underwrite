@@ -351,6 +351,79 @@ class DelegatedActionControls(unittest.TestCase):
             html,
         )
 
+    def test_no_exec_branch_flags_do_not_offer_implementation(self):
+        html = self.render(
+            {
+                "repo": "r",
+                "audience": {"mode": "branch"},
+                "target": {
+                    "kind": "github_pr",
+                    "trusted_context_sha256": "a" * 64,
+                },
+                "execution_policy": {"trust": "untrusted", "mode": "no_exec"},
+            },
+            self.flag(),
+        )
+
+        self.assertIn("No-exec policy blocks implementation", html)
+        self.assertNotIn('data-action="accept"', html)
+        self.assertIn('data-action="drop"', html)
+
+    def test_no_exec_review_flags_still_offer_inclusion(self):
+        html = self.render(
+            {
+                "repo": "r",
+                "audience": {"mode": "review"},
+                "execution_policy": {"trust": "untrusted", "mode": "no_exec"},
+            },
+            self.flag(),
+        )
+
+        self.assertIn("Include in review", html)
+
+    def test_a_pre_target_legacy_pr_hides_implementation(self):
+        html = self.render(
+            {
+                "repo": "acme/widget",
+                "number": 7,
+                "legacy_pr": {"repo": "acme/widget", "number": 7},
+                "audience": {"mode": "branch"},
+            },
+            self.flag(),
+        )
+
+        self.assertIn("Legacy PR requires a supervised replacement", html)
+        self.assertNotIn('data-action="accept"', html)
+        self.assertIn('data-action="note">Save note</button>', html)
+        self.assertIn("Execution: No-exec, legacy PR", html)
+
+    def test_a_contextless_legacy_review_cannot_queue_delivery(self):
+        html = self.render(
+            {
+                "repo": "acme/widget",
+                "audience": {"mode": "review"},
+                "target": {"kind": "github_pr"},
+                "execution_policy": {"trust": "untrusted", "mode": "no_exec"},
+            },
+            self.flag(),
+        )
+
+        self.assertIn("Legacy PR requires a supervised replacement", html)
+        self.assertNotIn("Include in review", html)
+        self.assertNotIn('data-action="accept"', html)
+
+    def test_the_execution_policy_is_visible_in_the_masthead(self):
+        html = self.render(
+            {
+                "repo": "r",
+                "execution_policy": {"trust": "untrusted", "mode": "no_exec"},
+            },
+            self.flag(),
+        )
+
+        self.assertIn("Execution: No-exec", html)
+        self.assertIn("Trust: untrusted PR head", html)
+
     def test_decision_only_flags_record_the_decision_directly(self):
         html = self.render(
             {"repo": "r", "audience": {"mode": "branch"}},
@@ -406,6 +479,75 @@ class DelegatedActionControls(unittest.TestCase):
         self.assertIn("tests &lt;failed&gt;", html)
         self.assertIn("Next attempt:", html)
         self.assertIn("repair <code>fixture.py:2</code>", html)
+
+    def test_untrusted_pr_commit_delivery_requires_replacement(self):
+        session = {
+            "repo": "r",
+            "audience": {"mode": "branch"},
+            "target": {
+                "kind": "github_pr",
+                "trusted_context_sha256": "frozen",
+            },
+        }
+        html = rr.render(
+            session,
+            [beat(state="accepted", delivery={
+                "state": "pending",
+                "kind": "commit",
+            })],
+            "",
+            {},
+        )
+        failed = rr.render(
+            session,
+            [beat(state="accepted", delivery={
+                "state": "failed",
+                "kind": "commit",
+                "error": "tests failed",
+                "owed": "repair the fixture",
+            })],
+            "",
+            {},
+        )
+
+        self.assertIn("Blocked, replacement required", html)
+        self.assertIn("Do not execute target code", html)
+        self.assertNotIn("Implementation pending", html)
+        self.assertIn("Recorded failure: tests failed", failed)
+        self.assertIn("Previously recorded obligation: repair the fixture", failed)
+        self.assertNotIn("Implementation failed", failed)
+        self.assertNotIn("Next attempt:", failed)
+
+    def test_contextless_pr_review_delivery_requires_replacement(self):
+        sessions = (
+            {
+                "repo": "r",
+                "audience": {"mode": "review"},
+                "target": {"kind": "github_pr"},
+                "execution_policy": {"trust": "untrusted", "mode": "no_exec"},
+            },
+            {
+                "repo": "r",
+                "number": 7,
+                "audience": {"mode": "review"},
+                "legacy_pr": {"repo": "r/project", "number": 7},
+            },
+        )
+        for session in sessions:
+            with self.subTest(session=session):
+                html = rr.render(
+                    session,
+                    [beat(state="accepted", delivery={
+                        "state": "pending",
+                        "kind": "review",
+                    })],
+                    "",
+                    {},
+                )
+
+                self.assertIn("Blocked, replacement required", html)
+                self.assertIn("Do not publish or execute this delivery", html)
+                self.assertNotIn("Included, review pending", html)
 
     def test_failed_review_delivery_names_publication(self):
         html = rr.render(
@@ -787,6 +929,22 @@ class RenderCli(unittest.TestCase):
 
         self.assertEqual(done.returncode, 2)
         self.assertIn("session audience mode must be branch or review", done.stderr)
+
+    def test_a_legacy_pr_without_an_execution_policy_fails_closed(self):
+        self.session({
+            "target": {
+                "kind": "github_pr",
+                "repo": "acme/widget",
+                "number": 42,
+                "head_sha": "a" * 40,
+            }
+        })
+        self.put(beat(n=1))
+
+        done = self.run_cli()
+
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("PR session has no execution policy", done.stderr)
 
     def test_a_cursor_that_disagrees_with_the_beats_exits_2(self):
         """The one problem no per-beat check can see: a beat that never got written

@@ -28,10 +28,11 @@ GitHub review, and Record decision stores an answer whose words complete the wor
 
 **Ingest.** Freezes the PR's exact base and head, fetches both into a bare repository, and
 builds their three-dot diff locally. That avoids remote display limits and binds every
-later check to full commit IDs. It then reads the last twenty commits touching those paths
-and the two or three earlier PRs the squash-merge subjects point at. That last one is not
-padding: prior work in the same area is reliably where the best finding comes from,
-because it is the context a diff cannot show you.
+later check to full commit IDs. The same capture freezes governing instructions from the
+base, separately from the untrusted head. It then reads the last twenty base commits
+touching those paths and the two or three earlier PRs the squash-merge subjects point at.
+That last one is not padding: prior work in the same area is reliably where the best
+finding comes from, because it is the context a diff cannot show you.
 
 **Orient.** A short reconstruction of what the change is for, plus a claim check comparing
 the PR description against what the diff actually does. You confirm or correct it, and
@@ -53,21 +54,43 @@ PRIOR  #2 pinned break-check to 0.6.0 citing this exact failure mode
 FIX    npx --yes @arethetypeswrong/cli@0.18.5
 ```
 
-`PROOF` names a command that was run or a file that was read. `inferred` is a legal value.
-A claim with neither does not ship.
+`PROOF` names a command run under the session's execution policy, or a file that was read.
+`inferred` is a legal value. A claim with neither does not ship.
 
 `FIX` is the smallest concrete implementation intent, review recommendation, or decision
-owed. In branch mode, choosing Implement authorizes Underwrite to apply that intent and
-run verification. It does not claim that an exact patch already exists.
+owed. For local branch and working-tree targets, choosing Implement authorizes Underwrite
+to apply that intent and run verification. It does not claim that an exact patch already
+exists. PR snapshots are no-exec and keep implementation unavailable.
 
-**Land.** The medium is decided at ingest, from whether anyone will read it. A merged or
-self-authored PR with no other reviewers lands as commits on a branch created lazily at
-the first requested implementation, so a session with no implementations leaves no trace.
-Anything with a real audience lands as a single GitHub review, anchor-validated first
-because one bad anchor rejects the whole thing. The review carries the frozen full head as
-`commit_id`, so a PR update cannot silently move the delivery onto code that was never
-walked. A stable hidden marker distinguishes that delivery from every older review on the
-same commit.
+**Land.** The medium is decided at ingest, from whether anyone will read it. Local branch
+and working-tree targets may land requested implementations as commits. An open PR with a
+review audience lands as a single GitHub review, anchor-validated first because one bad
+anchor rejects the whole thing. The review carries the frozen full head as `commit_id`, so
+a PR update cannot silently move the delivery onto code that was never walked. A stable
+hidden marker distinguishes that delivery from every older review on the same commit.
+
+## Trust and execution
+
+Start a PR review from a clean checkout of its base, never from the PR head. Keep that
+controller checkout on the base for the whole session. A controller may load repository
+instructions before Underwrite begins, so discovering the mistake later is not enough:
+stop and restart from the base checkout.
+
+Every PR head is untrusted executable input, regardless of author, fork, audience, review,
+or merge state. Underwrite reads the head, PR conversation, linked issues, and command
+output as data. Governing repository instructions come only from the frozen base revision.
+Changed `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, `CLAUDE.local.md`, contribution
+guidance, and ADRs are reviewed like any other change; they do not govern their own review.
+
+Every PR session freezes `no-exec` atomically with its target. Underwrite may inspect the
+hash-bound diff and frozen Git objects through its static readers, but it does not check
+out the head, install, build, test, lint, run repo scripts or interpreters, or invoke Git
+hooks and filters. Review comments, notes, navigation, and recorded decisions still work.
+
+Underwrite does not currently create or attest a host sandbox, so it never accepts a
+caller-supplied sandbox label as authorization. A future execution path needs a host-issued
+receipt bound to the frozen target and verified tree. Until that boundary exists, all PR
+code remains no-exec. Audience and execution policy are separate decisions.
 
 ## The page drives
 
@@ -76,29 +99,32 @@ in as they are walked, ordered by what is owed rather than by what was walked: o
 expanded at the top, chosen resolutions next, clean beats collapsed to one line each that
 still carry their proof.
 
-Decisions happen there too. An open branch flag carries Implement and Drop. Review mode
-uses Include in review and Drop. A policy question whose answer completes the work carries
-Record decision. Each has a field for putting the call in your own words, and Next beat
-advances the walk from anywhere. Clicking is what unblocks the terminal side, which parks
-on the server between beats rather than spinning. The terminal still takes the same
-answers in words, so closing the tab never strands a session.
+Decisions happen there too. A PR in branch mode shows that implementation is blocked and
+keeps Drop and Save note available. Review mode uses Include in review and Drop. Local
+branch and working-tree sessions retain Implement. A policy question whose answer
+completes the work carries Record decision.
+Each has a field for putting the call in your own words, and Next beat advances the walk
+from anywhere. Clicking is what unblocks the terminal side, which parks on the server
+between beats rather than spinning. The terminal still takes the same answers in words,
+so closing the tab never strands a session.
 
 The labels describe the delegated effect without changing the durable protocol. Implement
 and Include in review both record the existing `accept` action. Record decision uses the
 existing `decide` action.
 
+A no-exec PR review flow looks like this:
+
 ```
 terminal                     browser
 --------                     -------
 presents beat 5    ------>   beat 5 appears, FLAG, expanded
-(parked on /await)           [ Implement ]  [ Drop ]  [ your words ]
+(parked on /await)           [ Include in review ]  [ Drop ]  [ your words ]
                    <------   POST /act with canonical accept and stable IDs
 SQLite records the call, pending delivery, and application receipt
-applies the stated fix
-runs verification
-commits 961eb58
-records the landing ------>  beat 5 shows ACCEPTED, Landed, and 961eb58
+the frozen head remains unexecuted
 presents beat 6    ------>   beat 6 arrives
+final approval     ------>   one anchor-validated GitHub review is posted
+records the landing ------>  accepted beats show the review URL
 ```
 
 The server is loopback-only and takes no path from any request: every read and write is a
@@ -121,6 +147,8 @@ decisions.jsonl  derived compatibility export of reviewer actions
 ack.json         derived compatibility export of the handled cursor
 pr.json          GitHub metadata captured with the target
 pr.diff          frozen local three-dot diff, hash-bound to the target
+pr.bundle        frozen base and head Git objects, hash-bound to the target
+trusted-context.json  frozen base instructions, hash-bound to the target
 report.html      rendered, regenerable
 ```
 
@@ -131,11 +159,14 @@ absolute application receipt. A crash before commit changes nothing; a crash aft
 resumes from the stored result without moving twice. Compatibility JSON is regenerated
 from SQLite and is never authoritative once the database exists. The `snapshot-pr`
 command in `sessionctl.py` records the write-once target, including the head repository
-and ref.
+and ref, plus the trusted base context and Git object bundle. It records the no-exec
+policy in the same transaction. `read-blob` and `context-log` are the argv-safe gateways
+for inspecting those frozen objects without checking out the PR.
 `check-pr` refuses a moved base, head, route, or lifecycle before an external effect, while
-`pin-branch` freezes the fixes branch for a merged PR and `check-worktree` pins branch
-changes to the frozen head plus commits already recorded by the session. The frozen diff
-is checked by byte count and SHA-256.
+`check-controller` requires the clean controller to remain at the frozen base. The frozen
+diff, trusted context, and object bundle are checked by byte count and SHA-256.
+Controller cleanliness is rechecked immediately before capture freezes the target. It is
+a point-in-time precondition, not an attestation against a concurrent local writer.
 
 `render-report.py` turns a session into the page and validates it on the way through. A
 flag with no fix, a clean beat with no proof, or a proof naming no command gets an

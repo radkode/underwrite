@@ -13,9 +13,19 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-DB_SCHEMA_VERSION = 3
+DB_SCHEMA_VERSION = 4
 SCHEMA_VERSION = 1
 DELIVERY_VERSION = 1
+EXECUTION_POLICY_VERSION = 1
+EXECUTION_MODES = ("no_exec",)
+BLOCKED_COMMIT_DELIVERY_REASON = (
+    "untrusted PR commit delivery requires a supervised replacement; "
+    "do not execute target code"
+)
+BLOCKED_REPLACEMENT_DELIVERY_SUFFIX = (
+    "; start a supervised replacement; do not perform external delivery"
+)
+MAX_OBJECT_BUNDLE_MEMORY_BYTES = 64 * 1024 * 1024
 ACTIONS = ("accept", "drop", "decide", "note", "next", "back", "skip")
 NAVIGATION = ("next", "back", "skip")
 RESOLVE = {"accept": "accepted", "drop": "dropped", "decide": "decided"}
@@ -25,7 +35,7 @@ RESOLUTION_KINDS = ("delivery", "decision")
 _MISSING = object()
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
-_TARGET_FIELDS = {
+_TARGET_REQUIRED_FIELDS = {
     "version",
     "kind",
     "repo",
@@ -42,6 +52,20 @@ _TARGET_FIELDS = {
     "diff_sha256",
     "diff_bytes",
 }
+_TARGET_OPTIONAL_FIELDS = {
+    "trusted_context_sha256",
+    "trusted_context_bytes",
+    "object_bundle_sha256",
+    "object_bundle_bytes",
+}
+_TARGET_FIELDS = _TARGET_REQUIRED_FIELDS | _TARGET_OPTIONAL_FIELDS
+_EXECUTION_TARGET_FIELDS = (
+    "repo",
+    "number",
+    "base_sha",
+    "head_sha",
+    "diff_sha256",
+)
 
 
 class StoreError(ValueError):
@@ -66,6 +90,23 @@ def _dump(value):
 
 def _copy(value):
     return json.loads(_dump(value))
+
+
+def _legacy_pr_identity(document):
+    if not isinstance(document, dict):
+        return None
+    number = document.get("number")
+    repo = document.get("repo")
+    if (
+        isinstance(number, bool)
+        or not isinstance(number, int)
+        or number <= 0
+        or not isinstance(repo, str)
+        or repo.count("/") != 1
+        or not all(part.strip() for part in repo.split("/"))
+    ):
+        return None
+    return {"repo": repo, "number": number}
 
 
 def _non_negative(value, name):
@@ -211,6 +252,12 @@ class SessionStore:
             db.close()
 
     @contextlib.contextmanager
+    def _first_work_write(self):
+        with self._session_lock():
+            with self._write() as db:
+                yield db
+
+    @contextlib.contextmanager
     def _read(self):
         db = self._connect()
         try:
@@ -275,7 +322,7 @@ class SessionStore:
             version = db.execute("PRAGMA user_version").fetchone()[0]
             if version == DB_SCHEMA_VERSION:
                 return
-            if version not in (1, 2):
+            if version not in (1, 2, 3):
                 raise StoreError(f"unsupported session database version {version}")
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
@@ -305,7 +352,9 @@ class SessionStore:
                     "CREATE UNIQUE INDEX IF NOT EXISTS session_identity "
                     "ON session(session_id)"
                 )
-            self._restore_failed_fix_intents(db)
+            if version in (1, 2):
+                self._restore_failed_fix_intents(db)
+            self._default_legacy_execution_policy(db)
             db.execute(f"PRAGMA user_version = {DB_SCHEMA_VERSION}")
             db.execute("COMMIT")
         except Exception:
@@ -314,6 +363,67 @@ class SessionStore:
             raise
         finally:
             db.close()
+
+    def _default_legacy_execution_policy(self, db):
+        row = self._session_row(db)
+        body = json.loads(row["body_json"])
+        had_legacy_pr = "legacy_pr" in body
+        had_execution_policy = "execution_policy" in body
+        body.pop("legacy_pr", None)
+        body.pop("execution_policy", None)
+        target = body.get("target")
+        if target is None:
+            identity = _legacy_pr_identity(body)
+            if identity is not None:
+                body["legacy_pr"] = identity
+            self._session_document(body)
+            if had_legacy_pr or had_execution_policy or identity is not None:
+                db.execute(
+                    "UPDATE session SET body_json = ?, "
+                    "render_revision = render_revision + 1 WHERE singleton = 1",
+                    (_dump(body),),
+                )
+            self._migrate_application_sessions(db)
+            return
+        # Versions before v4 had no trusted execution-policy gateway. Never honor a
+        # similarly named field that arrived through their permissive session document.
+        body["execution_policy"] = self._execution_policy(target, "no_exec")
+        self._session_document(body)
+        db.execute(
+            "UPDATE session SET body_json = ?, render_revision = render_revision + 1 "
+            "WHERE singleton = 1",
+            (_dump(body),),
+        )
+        self._migrate_application_sessions(
+            db, target=target, policy=body["execution_policy"]
+        )
+
+    def _migrate_application_sessions(self, db, target=None, policy=None):
+        rows = db.execute(
+            "SELECT seq, result_json FROM actions WHERE result_json IS NOT NULL"
+        ).fetchall()
+        for row in rows:
+            application = json.loads(row["result_json"])
+            session = application.get("session")
+            if not isinstance(session, dict):
+                continue
+            session.pop("legacy_pr", None)
+            session.pop("execution_policy", None)
+            if target is not None:
+                if session.get("target") != target:
+                    continue
+                session["execution_policy"] = _copy(policy)
+            else:
+                if session.get("target") is not None:
+                    continue
+                identity = _legacy_pr_identity(session)
+                if identity is not None:
+                    session["legacy_pr"] = identity
+            _version, application["session"] = self._session_document(session)
+            db.execute(
+                "UPDATE actions SET result_json = ? WHERE seq = ?",
+                (_dump(application), row["seq"]),
+            )
 
     def _restore_failed_fix_intents(self, db):
         changed = False
@@ -381,7 +491,8 @@ class SessionStore:
             if version != DB_SCHEMA_VERSION:
                 raise StoreError(f"unsupported session database version {version}")
             row = db.execute(
-                "SELECT session_id, format_version FROM session WHERE singleton = 1"
+                "SELECT session_id, format_version, body_json FROM session "
+                "WHERE singleton = 1"
             ).fetchone()
             if row is None:
                 raise StoreError("session database has no session row")
@@ -391,6 +502,7 @@ class SessionStore:
                 raise StoreError(
                     f"unsupported session format version {row['format_version']}"
                 )
+            self._session_document(json.loads(row["body_json"]))
         finally:
             db.close()
 
@@ -411,7 +523,24 @@ class SessionStore:
             try:
                 db.execute("BEGIN IMMEDIATE")
                 self._create_schema(db)
-                version, body = self._session_document(session)
+                legacy_session = _copy(session)
+                exported_legacy_pr = legacy_session.pop("legacy_pr", None)
+                legacy_session.pop("execution_policy", None)
+                if "target" not in legacy_session:
+                    identity = _legacy_pr_identity(legacy_session)
+                    if (
+                        isinstance(exported_legacy_pr, dict)
+                        and _legacy_pr_identity(exported_legacy_pr)
+                        == exported_legacy_pr
+                    ):
+                        legacy_session["legacy_pr"] = _copy(exported_legacy_pr)
+                    elif identity is not None:
+                        legacy_session["legacy_pr"] = identity
+                version, body = self._session_document(legacy_session)
+                if "target" in body:
+                    body["execution_policy"] = self._execution_policy(
+                        body["target"], "no_exec"
+                    )
                 db.execute(
                     "INSERT INTO session "
                     "(singleton, session_id, format_version, render_revision, body_json) "
@@ -673,13 +802,27 @@ class SessionStore:
             raise StoreError("session delivery_branch must be a valid non-empty name")
         if "target" in body:
             body["target"] = self._target_document(body["target"])
+        legacy_pr = body.get("legacy_pr")
+        if legacy_pr is not None:
+            if "target" in body:
+                raise StoreError("session legacy_pr cannot accompany a frozen target")
+            if not isinstance(legacy_pr, dict) or set(legacy_pr) != {"repo", "number"}:
+                raise StoreError("session legacy_pr has an unsupported shape")
+            if _legacy_pr_identity(legacy_pr) != legacy_pr:
+                raise StoreError("session legacy_pr identity is invalid")
+        if "execution_policy" in body:
+            if "target" not in body:
+                raise StoreError("session execution_policy requires a frozen target")
+            body["execution_policy"] = self._execution_policy_document(
+                body["execution_policy"], body["target"]
+            )
         return version, body
 
     def _target_document(self, document):
         if not isinstance(document, dict):
             raise StoreError("session target must be an object")
         target = _copy(document)
-        missing = sorted(_TARGET_FIELDS - set(target))
+        missing = sorted(_TARGET_REQUIRED_FIELDS - set(target))
         unknown = sorted(set(target) - _TARGET_FIELDS)
         if missing:
             raise StoreError(f"session target is missing {', '.join(missing)}")
@@ -731,7 +874,139 @@ class SessionStore:
         ):
             raise StoreError("session target diff_sha256 must be a SHA-256 digest")
         _non_negative(target["diff_bytes"], "session target diff_bytes")
+        for digest_name, size_name, label in (
+            (
+                "trusted_context_sha256",
+                "trusted_context_bytes",
+                "trusted context",
+            ),
+            ("object_bundle_sha256", "object_bundle_bytes", "object bundle"),
+        ):
+            present = [name for name in (digest_name, size_name) if name in target]
+            if present and len(present) != 2:
+                raise StoreError(
+                    f"session target {label} digest and size must appear together"
+                )
+            if not present:
+                continue
+            if (
+                not isinstance(target[digest_name], str)
+                or not _SHA256.fullmatch(target[digest_name])
+            ):
+                raise StoreError(
+                    f"session target {digest_name} must be a SHA-256 digest"
+                )
+            _non_negative(
+                target[size_name],
+                f"session target {size_name}",
+            )
         return target
+
+    def _execution_target(self, target):
+        bound = {name: target[name] for name in _EXECUTION_TARGET_FIELDS}
+        if "trusted_context_sha256" in target:
+            bound["trusted_context_sha256"] = target["trusted_context_sha256"]
+        if "object_bundle_sha256" in target:
+            bound["object_bundle_sha256"] = target["object_bundle_sha256"]
+        return bound
+
+    def _execution_policy(self, target, mode):
+        if mode not in EXECUTION_MODES:
+            raise StoreError(
+                "execution mode must be one of " + ", ".join(EXECUTION_MODES)
+            )
+        return {
+            "version": EXECUTION_POLICY_VERSION,
+            "trust": "untrusted",
+            "mode": mode,
+            "target": self._execution_target(target),
+        }
+
+    def _execution_policy_document(self, document, target):
+        if not isinstance(document, dict):
+            raise StoreError("session execution_policy must be an object")
+        mode = document.get("mode")
+        expected = self._execution_policy(target, mode)
+        if document != expected:
+            raise StoreError(
+                "session execution_policy does not match its frozen target"
+            )
+        return expected
+
+    def _trusted_context_document(self, data, target):
+        try:
+            context = json.loads(data.decode("utf-8"))
+        except (UnicodeError, json.JSONDecodeError) as error:
+            raise StoreError("trusted context is not valid UTF-8 JSON") from error
+        if not isinstance(context, dict):
+            raise StoreError("trusted context must contain an object")
+        if set(context) != {"version", "base_sha", "files"}:
+            raise StoreError("trusted context has an unsupported shape")
+        if type(context["version"]) is not int or context["version"] != 1:
+            raise StoreError("trusted context version must be 1")
+        if context["base_sha"] != target["base_sha"]:
+            raise StoreError("trusted context base_sha does not match the frozen target")
+        files = context["files"]
+        if not isinstance(files, list):
+            raise StoreError("trusted context files must be an array")
+        paths = []
+        for index, entry in enumerate(files):
+            if not isinstance(entry, dict) or set(entry) != {
+                "path",
+                "mode",
+                "blob_sha",
+                "content",
+            }:
+                raise StoreError(
+                    f"trusted context file {index} has an unsupported shape"
+                )
+            path = entry["path"]
+            parts = path.split("/") if isinstance(path, str) else []
+            if (
+                not isinstance(path, str)
+                or not path
+                or path.startswith("/")
+                or any(part in ("", ".", "..") for part in parts)
+                or any(ord(character) < 32 for character in path)
+            ):
+                raise StoreError(
+                    f"trusted context file {index} path must be repo-relative text"
+                )
+            if not isinstance(entry["mode"], str) or not re.fullmatch(
+                r"[0-7]{6}", entry["mode"]
+            ):
+                raise StoreError(f"trusted context file {index} mode is invalid")
+            if entry["mode"] not in ("100644", "100755"):
+                raise StoreError(
+                    f"trusted context file {index} must be a regular file"
+                )
+            if not isinstance(entry["blob_sha"], str) or not _FULL_SHA.fullmatch(
+                entry["blob_sha"]
+            ):
+                raise StoreError(f"trusted context file {index} blob_sha is invalid")
+            if not isinstance(entry["content"], str):
+                raise StoreError(f"trusted context file {index} content must be text")
+            content = entry["content"].encode("utf-8")
+            framed = b"blob " + str(len(content)).encode("ascii") + b"\0" + content
+            if hashlib.sha1(framed).hexdigest() != entry["blob_sha"]:
+                raise StoreError(
+                    f"trusted context file {index} content does not match blob_sha"
+                )
+            paths.append(path)
+        if paths != sorted(paths) or len(paths) != len(set(paths)):
+            raise StoreError("trusted context files must have unique sorted paths")
+        canonical = (
+            json.dumps(
+                context,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        if data != canonical:
+            raise StoreError("trusted context JSON is not canonical")
+        return context
 
     def _beat_document(self, document):
         if not isinstance(document, dict):
@@ -796,6 +1071,7 @@ class SessionStore:
         allow_new_lands=False,
         allow_new_target=False,
         allow_new_branch=False,
+        allow_new_execution_policy=False,
     ):
         version, body = self._session_document(document)
         row = self._session_row(db)
@@ -809,6 +1085,31 @@ class SessionStore:
                 raise Conflict("session target must be recorded through freeze-target")
             else:
                 raise Conflict("session target cannot change once frozen")
+        current_policy = current.get("execution_policy", _MISSING)
+        incoming_policy = body.get("execution_policy", _MISSING)
+        if current_policy != incoming_policy:
+            if current_policy is _MISSING and allow_new_execution_policy:
+                pass
+            elif current_policy is _MISSING:
+                raise Conflict(
+                    "session execution_policy must be recorded through freeze-execution"
+                )
+            else:
+                raise Conflict("session execution_policy cannot change once frozen")
+        current_legacy_pr = current.get("legacy_pr", _MISSING)
+        incoming_legacy_pr = body.get("legacy_pr", _MISSING)
+        if current_legacy_pr != incoming_legacy_pr:
+            if current_legacy_pr is _MISSING:
+                raise Conflict(
+                    "targetless PR sessions must be created through snapshot-pr"
+                )
+            raise Conflict("session legacy PR identity cannot change")
+        if (
+            current_legacy_pr is _MISSING
+            and current_target is _MISSING
+            and _legacy_pr_identity(body) is not None
+        ):
+            raise Conflict("targetless PR sessions must be created through snapshot-pr")
         current_branch = current.get("delivery_branch", _MISSING)
         incoming_branch = body.get("delivery_branch", _MISSING)
         if current_target is not _MISSING and current_branch != incoming_branch:
@@ -945,6 +1246,12 @@ class SessionStore:
             raise Conflict("session lands must be changed through land")
         if "target" in patch:
             raise Conflict("session target must be changed through freeze-target")
+        if "execution_policy" in patch:
+            raise Conflict(
+                "session execution_policy must be changed through freeze-execution"
+            )
+        if "legacy_pr" in patch:
+            raise Conflict("session legacy PR identity cannot change")
         if "delivery_branch" in patch:
             raise Conflict(
                 "session delivery_branch must be changed through pin-branch"
@@ -996,9 +1303,23 @@ class SessionStore:
                     self._bump_render(db)
         return self.snapshot()[0]
 
-    def freeze_target(self, document, diff_source, metadata_source):
+    def freeze_target(
+        self,
+        document,
+        diff_source,
+        metadata_source,
+        trusted_context_source=None,
+        object_bundle_source=None,
+    ):
         target = _copy(document)
-        for name in ("diff_sha256", "diff_bytes"):
+        for name in (
+            "diff_sha256",
+            "diff_bytes",
+            "trusted_context_sha256",
+            "trusted_context_bytes",
+            "object_bundle_sha256",
+            "object_bundle_bytes",
+        ):
             if name in target:
                 raise StoreError(f"freeze-target computes {name}")
 
@@ -1013,11 +1334,35 @@ class SessionStore:
                     metadata_source, self.root, "pr.json"
                 )
                 staged.append(metadata)
+                trusted_context = None
+                if trusted_context_source is not None:
+                    trusted_context, context_sha256, context_bytes = _stage_copy(
+                        trusted_context_source, self.root, "trusted-context.json"
+                    )
+                    staged.append(trusted_context)
+                    target.update({
+                        "trusted_context_sha256": context_sha256,
+                        "trusted_context_bytes": context_bytes,
+                    })
+                object_bundle = None
+                if object_bundle_source is not None:
+                    object_bundle, bundle_sha256, bundle_bytes = _stage_copy(
+                        object_bundle_source, self.root, "pr.bundle"
+                    )
+                    staged.append(object_bundle)
+                    target.update({
+                        "object_bundle_sha256": bundle_sha256,
+                        "object_bundle_bytes": bundle_bytes,
+                    })
                 target.update({
                     "diff_sha256": diff_sha256,
                     "diff_bytes": diff_bytes,
                 })
                 target = self._target_document(target)
+                if trusted_context is not None:
+                    self._trusted_context_document(
+                        trusted_context.read_bytes(), target
+                    )
 
                 with self._read() as db:
                     current = json.loads(self._session_row(db)["body_json"])
@@ -1036,6 +1381,14 @@ class SessionStore:
 
                 os.replace(str(metadata), str(self.root / "pr.json"))
                 staged.remove(metadata)
+                if trusted_context is not None:
+                    os.replace(
+                        str(trusted_context), str(self.root / "trusted-context.json")
+                    )
+                    staged.remove(trusted_context)
+                if object_bundle is not None:
+                    os.replace(str(object_bundle), str(self.root / "pr.bundle"))
+                    staged.remove(object_bundle)
                 os.replace(str(diff), str(self.root / "pr.diff"))
                 staged.remove(diff)
                 _fsync_directory(self.root)
@@ -1053,10 +1406,26 @@ class SessionStore:
                                 "session target must be frozen before beats or actions"
                             )
                         current["target"] = target
-                        if self._save_session(db, current, allow_new_target=True):
+                        current["execution_policy"] = self._execution_policy(
+                            target, "no_exec"
+                        )
+                        if self._save_session(
+                            db,
+                            current,
+                            allow_new_target=True,
+                            allow_new_execution_policy=True,
+                        ):
                             self._bump_render(db)
                     elif frozen != target:
                         raise Conflict("session target cannot change once frozen")
+                    elif "execution_policy" not in current:
+                        current["execution_policy"] = self._execution_policy(
+                            target, "no_exec"
+                        )
+                        if self._save_session(
+                            db, current, allow_new_execution_policy=True
+                        ):
+                            self._bump_render(db)
             finally:
                 for path in staged:
                     try:
@@ -1071,6 +1440,165 @@ class SessionStore:
             target = session.get("target")
             if target is None:
                 raise Conflict("session has no frozen target")
+            return target
+
+    def freeze_execution(self, mode):
+        with self._write() as db:
+            current = json.loads(self._session_row(db)["body_json"])
+            target = current.get("target")
+            if target is None:
+                raise Conflict("session has no frozen target")
+            desired = self._execution_policy(target, mode)
+            frozen = current.get("execution_policy")
+            if frozen is not None:
+                frozen = self._execution_policy_document(frozen, target)
+                if frozen != desired:
+                    raise Conflict(
+                        "session execution_policy cannot change once frozen"
+                    )
+                return frozen
+            has_work = db.execute(
+                "SELECT EXISTS(SELECT 1 FROM beats) OR "
+                "EXISTS(SELECT 1 FROM actions)"
+            ).fetchone()[0]
+            if has_work:
+                raise Conflict(
+                    "session execution_policy must be frozen before beats or actions"
+                )
+            current["execution_policy"] = desired
+            if self._save_session(
+                db, current, allow_new_execution_policy=True
+            ):
+                self._bump_render(db)
+            return desired
+
+    def _required_execution_policy(self, session):
+        target = session.get("target")
+        if target is None:
+            raise Conflict("session has no frozen target")
+        policy = session.get("execution_policy")
+        if policy is None:
+            raise Conflict("session has no frozen execution policy")
+        return self._execution_policy_document(policy, target)
+
+    def _legacy_pr_execution_policy(self, session):
+        identity = session.get("legacy_pr")
+        if not isinstance(identity, dict):
+            return None
+        return {
+            "version": EXECUTION_POLICY_VERSION,
+            "trust": "untrusted",
+            "mode": "no_exec",
+            "legacy": True,
+        }
+
+    def _session_execution_policy(self, db):
+        session = json.loads(self._session_row(db)["body_json"])
+        if session.get("target") is None:
+            return session, self._legacy_pr_execution_policy(session)
+        return session, self._required_execution_policy(session)
+
+    def _replacement_reason(self, session, policy):
+        if policy is not None and policy.get("legacy"):
+            return "legacy PR session has no frozen target"
+        target = session.get("target")
+        if target is not None and "trusted_context_sha256" not in target:
+            return "PR session has no frozen trusted context"
+        return None
+
+    def check_execution(self):
+        target = self.verify_target_files()
+        with self._read() as db:
+            session = json.loads(self._session_row(db)["body_json"])
+            policy = self._required_execution_policy(session)
+        if policy["target"] != self._execution_target(target):
+            raise Conflict("session execution_policy target does not match")
+        if policy["mode"] == "no_exec":
+            raise Conflict("session execution policy forbids target code execution")
+        self.read_trusted_context()
+        return policy
+
+    def read_trusted_context(self):
+        with self._session_lock():
+            target = self.frozen_target()
+            expected_digest = target.get("trusted_context_sha256")
+            expected_size = target.get("trusted_context_bytes")
+            if expected_digest is None or expected_size is None:
+                raise Conflict("session has no frozen trusted context")
+            path = self.root / "trusted-context.json"
+            try:
+                data = path.read_bytes()
+            except FileNotFoundError as error:
+                raise Conflict("frozen trusted context is missing") from error
+            digest = hashlib.sha256(data).hexdigest()
+            if len(data) != expected_size or digest != expected_digest:
+                raise Conflict("frozen trusted context does not match")
+            return self._trusted_context_document(data, target)
+
+    def read_object_bundle(self):
+        with self._session_lock():
+            target = self.frozen_target()
+            expected_digest = target.get("object_bundle_sha256")
+            expected_size = target.get("object_bundle_bytes")
+            if expected_digest is None or expected_size is None:
+                raise Conflict("session has no frozen Git object bundle")
+            if expected_size > MAX_OBJECT_BUNDLE_MEMORY_BYTES:
+                raise Conflict(
+                    "frozen Git object bundle is too large to read into memory"
+                )
+            path = self.root / "pr.bundle"
+            try:
+                data = path.read_bytes()
+            except FileNotFoundError as error:
+                raise Conflict("frozen Git object bundle is missing") from error
+            digest = hashlib.sha256(data).hexdigest()
+            if len(data) != expected_size or digest != expected_digest:
+                raise Conflict("frozen Git object bundle does not match")
+            return data
+
+    def copy_verified_object_bundle(self, destination):
+        destination = Path(destination)
+        with self._session_lock():
+            target = self.frozen_target()
+            expected_digest = target.get("object_bundle_sha256")
+            expected_size = target.get("object_bundle_bytes")
+            if expected_digest is None or expected_size is None:
+                raise Conflict("session has no frozen Git object bundle")
+            source = self.root / "pr.bundle"
+            digest, size = hashlib.sha256(), 0
+            created = False
+            try:
+                try:
+                    incoming = source.open("rb")
+                except FileNotFoundError as error:
+                    raise Conflict("frozen Git object bundle is missing") from error
+                try:
+                    outgoing = destination.open("xb")
+                except OSError as error:
+                    incoming.close()
+                    raise StoreError(
+                        "verified Git object bundle destination cannot be created"
+                    ) from error
+                created = True
+                with incoming, outgoing:
+                    while True:
+                        chunk = incoming.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        outgoing.write(chunk)
+                        digest.update(chunk)
+                        size += len(chunk)
+                    outgoing.flush()
+                    os.fsync(outgoing.fileno())
+                if size != expected_size or digest.hexdigest() != expected_digest:
+                    raise Conflict("frozen Git object bundle does not match")
+            except Exception:
+                if created:
+                    try:
+                        destination.unlink()
+                    except FileNotFoundError:
+                        pass
+                raise
             return target
 
     def review_marker(self):
@@ -1108,6 +1636,28 @@ class SessionStore:
                 raise Conflict("frozen target projection pr.diff is missing") from error
             if size != target["diff_bytes"] or digest != target["diff_sha256"]:
                 raise Conflict("frozen target projection pr.diff does not match")
+            if "trusted_context_sha256" in target:
+                path = self.root / "trusted-context.json"
+                try:
+                    digest, size = _file_identity(path)
+                except FileNotFoundError as error:
+                    raise Conflict("frozen trusted context is missing") from error
+                if (
+                    size != target["trusted_context_bytes"]
+                    or digest != target["trusted_context_sha256"]
+                ):
+                    raise Conflict("frozen trusted context does not match")
+            if "object_bundle_sha256" in target:
+                path = self.root / "pr.bundle"
+                try:
+                    digest, size = _file_identity(path)
+                except FileNotFoundError as error:
+                    raise Conflict("frozen Git object bundle is missing") from error
+                if (
+                    size != target["object_bundle_bytes"]
+                    or digest != target["object_bundle_sha256"]
+                ):
+                    raise Conflict("frozen Git object bundle does not match")
             return target
 
     def branch_position(self):
@@ -1140,7 +1690,8 @@ class SessionStore:
 
     def put_beat(self, document):
         beat = self._beat_document(document)
-        with self._write() as db:
+        with self._first_work_write() as db:
+            self._session_execution_policy(db)
             row = db.execute(
                 "SELECT body_json, delivery_state, delivery_json FROM beats WHERE n = ?",
                 (beat["n"],),
@@ -1305,9 +1856,10 @@ class SessionStore:
         ):
             raise StoreError("session_id must be non-empty text")
 
-        with self._write() as db:
+        with self._first_work_write() as db:
             if session_id is not None and self._session_row(db)["session_id"] != session_id:
                 raise Conflict("session identity does not match")
+            session, execution_policy = self._session_execution_policy(db)
             existing = db.execute(
                 "SELECT * FROM actions WHERE action_id = ?", (action_id,)
             ).fetchone()
@@ -1315,6 +1867,22 @@ class SessionStore:
                 if (existing["beat_n"], existing["kind"], existing["note"]) != (n, kind, note):
                     raise Conflict(f"action_id {action_id!r} names a different action")
                 return self._action(existing)
+            if kind == "accept" and execution_policy is not None:
+                replacement_reason = self._replacement_reason(
+                    session, execution_policy
+                )
+                if replacement_reason:
+                    raise Conflict(
+                        replacement_reason
+                        + "; start a supervised replacement session"
+                    )
+                if (
+                    execution_policy["mode"] == "no_exec"
+                    and self._expected_delivery_kind(session) == "commit"
+                ):
+                    raise Conflict(
+                        "branch implementation is disabled for untrusted PR snapshots"
+                    )
             if kind == "decide" and not note:
                 raise StoreError("decide requires a non-empty note")
 
@@ -1355,7 +1923,6 @@ class SessionStore:
                         raise Conflict(f"beat {n} has already landed")
                     beat["state"] = RESOLVE[kind]
                     if kind == "accept":
-                        session = json.loads(self._session_row(db)["body_json"])
                         delivery_kind = self._expected_delivery_kind(session)
                         if delivery_kind is None:
                             raise Conflict("session has no branch or review audience")
@@ -1401,12 +1968,43 @@ class SessionStore:
         with self._read() as db:
             return self._action(self._head_row(db))
 
-    def _application_input(self, result, session, beats):
+    def _application_input(
+        self,
+        result,
+        session,
+        beats,
+        reference_session=_MISSING,
+        authoritative=False,
+    ):
         if not isinstance(result, dict):
             raise StoreError("result must be an absolute object")
         normalized_session = None
         if session is not None:
-            _version, normalized_session = self._session_document(session)
+            candidate = _copy(session)
+            if isinstance(reference_session, dict):
+                stored_target = reference_session.get("target")
+                if (
+                    stored_target is not None
+                    and candidate.get("target") == stored_target
+                ):
+                    candidate.pop("legacy_pr", None)
+                    candidate.pop("execution_policy", None)
+                    if "execution_policy" in reference_session:
+                        candidate["execution_policy"] = _copy(
+                            reference_session["execution_policy"]
+                        )
+                elif stored_target is None and candidate.get("target") is None:
+                    supplied_marker = candidate.pop("legacy_pr", None)
+                    candidate.pop("execution_policy", None)
+                    identity = _legacy_pr_identity(candidate)
+                    stored_marker = reference_session.get("legacy_pr")
+                    if isinstance(stored_marker, dict) and (
+                        authoritative or supplied_marker == stored_marker
+                    ):
+                        candidate["legacy_pr"] = _copy(stored_marker)
+                    elif identity is not None:
+                        candidate["legacy_pr"] = identity
+            _version, normalized_session = self._session_document(candidate)
         normalized_beats = tuple(
             sorted(
                 (self._canonical_beat(self._beat_document(beat)) for beat in beats),
@@ -1426,18 +2024,37 @@ class SessionStore:
                 self._canonical_beat(beat) if isinstance(beat, dict) else beat
                 for beat in value.get("beats", [])
             ]
+        current_session = current.get("session")
+        incoming_session = application.get("session")
+        if (
+            isinstance(current_session, dict)
+            and isinstance(incoming_session, dict)
+            and "execution_policy" not in incoming_session
+            and incoming_session.get("target") == current_session.get("target")
+            and isinstance(current_session.get("execution_policy"), dict)
+            and current_session["execution_policy"].get("mode") == "no_exec"
+        ):
+            incoming_session["execution_policy"] = _copy(
+                current_session["execution_policy"]
+            )
         return current == application
 
     def apply(self, seq, result, session=None, beats=()):
         _positive(seq, "seq")
-        application, normalized_session, normalized_beats = self._application_input(
-            result, session, beats
-        )
         with self._write() as db:
             row = db.execute("SELECT * FROM actions WHERE seq = ?", (seq,)).fetchone()
             if row is None:
                 raise StoreError(f"no action {seq}")
             if row["state"] in ("applied", "acked"):
+                stored = json.loads(row["result_json"])
+                application, _normalized_session, _normalized_beats = (
+                    self._application_input(
+                        result,
+                        session,
+                        beats,
+                        reference_session=stored.get("session"),
+                    )
+                )
                 if not self._same_application(row, application):
                     raise Conflict(f"action {seq} already has a different application")
                 return self._action(row)
@@ -1446,6 +2063,14 @@ class SessionStore:
             self._require_head(db, seq)
             if row["kind"] not in NAVIGATION:
                 raise Conflict(f"action {seq} must be reconciled, not applied")
+            current_session = json.loads(self._session_row(db)["body_json"])
+            application, normalized_session, normalized_beats = self._application_input(
+                result,
+                session,
+                beats,
+                reference_session=current_session,
+                authoritative=True,
+            )
             if normalized_session is None:
                 raise StoreError("navigation apply requires the absolute session document")
 
@@ -1544,7 +2169,7 @@ class SessionStore:
             row = self._beat_row(db, beat_n)
             beat = json.loads(row["body_json"])
             current = json.loads(row["delivery_json"]) if row["delivery_json"] else None
-            session = json.loads(self._session_row(db)["body_json"])
+            session, execution_policy = self._session_execution_policy(db)
             expected_kind = self._expected_delivery_kind(session)
             if expected_kind != kind:
                 raise Conflict(
@@ -1576,6 +2201,19 @@ class SessionStore:
                 if current != desired:
                     raise Conflict(f"beat {beat_n} already landed as {current.get('artifact')}")
                 return self._delivery_receipt(seq, beat_n, "landed", current)
+            replacement_reason = self._replacement_reason(session, execution_policy)
+            if replacement_reason:
+                raise Conflict(
+                    replacement_reason + "; start a supervised replacement session"
+                )
+            if (
+                kind == "commit"
+                and execution_policy is not None
+                and execution_policy["mode"] == "no_exec"
+            ):
+                raise Conflict(
+                    "commit delivery is disabled for untrusted PR snapshots"
+                )
             if beat.get("state") != "accepted":
                 raise Conflict(f"beat {beat_n} is {beat.get('state')}, not accepted")
 
@@ -1667,6 +2305,18 @@ class SessionStore:
     def reconcile(self):
         with self._read() as db:
             head = self._action(self._head_row(db))
+            session, execution_policy = self._session_execution_policy(db)
+            replacement_reason = self._replacement_reason(
+                session, execution_policy
+            )
+            block_commit_delivery = (
+                execution_policy is not None
+                and execution_policy["mode"] == "no_exec"
+                and (
+                    session.get("target", {}).get("kind") == "github_pr"
+                    or isinstance(session.get("legacy_pr"), dict)
+                )
+            )
             pending, failed = [], []
             for row in db.execute(
                 "SELECT n, delivery_state, delivery_json FROM beats "
@@ -1676,6 +2326,14 @@ class SessionStore:
                     "beat_n": row["n"],
                     **(json.loads(row["delivery_json"]) if row["delivery_json"] else {}),
                 }
+                if replacement_reason:
+                    item["blocked"] = True
+                    item["blocked_reason"] = (
+                        replacement_reason + BLOCKED_REPLACEMENT_DELIVERY_SUFFIX
+                    )
+                elif block_commit_delivery and item.get("kind") == "commit":
+                    item["blocked"] = True
+                    item["blocked_reason"] = BLOCKED_COMMIT_DELIVERY_REASON
                 (pending if row["delivery_state"] == "pending" else failed).append(item)
             produced = db.execute("SELECT COALESCE(MAX(seq), 0) FROM actions").fetchone()[0]
             handled = self._handled_seq(db)
@@ -1694,18 +2352,32 @@ class SessionStore:
         _positive(seq, "seq")
         if not isinstance(evidence, str) or not evidence.strip():
             raise StoreError("evidence must be non-empty text")
-        application, normalized_session, normalized_beats = self._application_input(
-            result, session, beats
-        )
         with self._write() as db:
             row = self._action_row(db, seq)
             if row["state"] in ("applied", "acked"):
+                stored = json.loads(row["result_json"])
+                application, _normalized_session, _normalized_beats = (
+                    self._application_input(
+                        result,
+                        session,
+                        beats,
+                        reference_session=stored.get("session"),
+                    )
+                )
                 if not self._same_application(row, application):
                     raise Conflict(f"action {seq} already has a different application")
                 return self._action(row)
             if row["state"] == "abandoned":
                 raise Conflict(f"action {seq} was abandoned")
             self._require_head(db, seq)
+            current_session = json.loads(self._session_row(db)["body_json"])
+            application, normalized_session, normalized_beats = self._application_input(
+                result,
+                session,
+                beats,
+                reference_session=current_session,
+                authoritative=True,
+            )
             if normalized_session is None and not normalized_beats:
                 raise StoreError("reconcile requires an observed session or beat document")
             if normalized_session is not None:
