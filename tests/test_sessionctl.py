@@ -20,7 +20,6 @@ SPEC.loader.exec_module(session_store)
 
 SESSION = {
     "repo": "acme/widget",
-    "number": 7,
     "cursor": 1,
     "lands": [],
     "audience": {"mode": "branch", "why": "the author owns the branch"},
@@ -247,6 +246,19 @@ class TargetCommands(SessionCtlCase):
         subprocess.run(
             ["git", "-C", str(self.repo), "branch", "-M", "feature"], check=True
         )
+        self.base = subprocess.run(
+            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+        (self.repo / "base.txt").write_text("base\nhead\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(self.repo), "add", "base.txt"], check=True)
+        subprocess.run(
+            ["git", "-C", str(self.repo), "commit", "-m", "head"],
+            check=True,
+            capture_output=True,
+        )
         self.head = subprocess.run(
             ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
             check=True,
@@ -259,7 +271,7 @@ class TargetCommands(SessionCtlCase):
             "merged_at": None,
             "base": {
                 "ref": "main",
-                "sha": "a" * 40,
+                "sha": self.base,
                 "repo": {
                     "full_name": "acme/widget",
                     "clone_url": "https://example.test/acme/widget.git",
@@ -273,8 +285,18 @@ class TargetCommands(SessionCtlCase):
         }
         diff = self.root / "captured.diff"
         metadata = self.root / "captured.json"
+        trusted_context = self.root / "trusted-context-input.json"
         diff.write_text("diff\n", encoding="utf-8")
         metadata.write_text(json.dumps(self.metadata), encoding="utf-8")
+        trusted_context.write_text(
+            json.dumps(
+                {"version": 1, "base_sha": self.base, "files": []},
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
         self.store().freeze_target(
             {
                 "version": 1,
@@ -283,17 +305,59 @@ class TargetCommands(SessionCtlCase):
                 "number": 7,
                 "state": "open",
                 "merged_at": None,
-                "base_sha": "a" * 40,
+                "base_sha": self.base,
                 "head_sha": self.head,
                 "head_repo_id": 123,
                 "head_repo": "acme/widget",
                 "head_ref": "feature",
-                "merge_base_sha": "c" * 40,
+                "merge_base_sha": self.base,
                 "changed_files": 1,
             },
             diff,
             metadata,
+            trusted_context,
+            self.bundle(),
         )
+
+    def bundle(self):
+        bundle = self.root / "captured.bundle"
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "update-ref",
+                "refs/underwrite/base",
+                self.base,
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "update-ref",
+                "refs/underwrite/head",
+                self.head,
+            ],
+            check=True,
+        )
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(self.repo),
+                "bundle",
+                "create",
+                str(bundle),
+                "refs/underwrite/base",
+                "refs/underwrite/head",
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return bundle
 
     def gh(self, metadata):
         binary = self.root / "bin"
@@ -317,46 +381,79 @@ class TargetCommands(SessionCtlCase):
         self.assertEqual(changed.returncode, 2)
         self.assertIn("head_sha changed", changed.stderr)
 
-    def test_check_worktree_and_commit_land_use_the_recorded_position(self):
+    def test_no_exec_blocks_worktree_checks_land_and_branch_acceptance(self):
         pinned = self.success("pin-branch", self.root, "feature")
         self.assertEqual(pinned["delivery_branch"], "feature")
-        checked = self.success("check-worktree", self.root, self.repo)
-        self.assertEqual(checked["head_sha"], self.head)
-        store = self.store()
-        store.put_beat(FLAG)
-        action = store.produce("accept-1", 1, "accept", "yes")
-        (self.repo / "fix.txt").write_text("fix\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(self.repo), "add", "fix.txt"], check=True)
-        subprocess.run(
-            ["git", "-C", str(self.repo), "commit", "-m", "fix"],
-            check=True,
-            capture_output=True,
-        )
-        artifact = subprocess.run(
-            ["git", "-C", str(self.repo), "rev-parse", "HEAD"],
-            check=True,
-            capture_output=True,
-            text=True,
-        ).stdout.strip()
-
-        landed = self.success(
+        hostile = self.root / "missing-hostile-repo"
+        checked = self.invoke("check-worktree", self.root, hostile)
+        landed = self.invoke(
             "land",
             self.root,
-            action["seq"],
-            1,
-            artifact,
+            "1",
+            "1",
+            "c" * 40,
             "--kind",
             "commit",
             "--branch",
             "feature",
             "--repo-root",
-            self.repo,
+            hostile,
+        )
+        self.assertEqual(checked.returncode, 1)
+        self.assertEqual(landed.returncode, 1)
+        self.assertIn("forbids target code execution", checked.stderr)
+        self.assertIn("forbids target code execution", landed.stderr)
+        store = self.store()
+        store.put_beat(FLAG)
+        with self.assertRaisesRegex(session_store.Conflict, "disabled"):
+            store.produce("accept-1", 1, "accept", "yes")
+
+    def test_execution_policy_commands_are_target_bound_and_fail_closed(self):
+        context = self.success("trusted-context", self.root)
+        self.assertEqual(context, {"version": 1, "base_sha": self.base, "files": []})
+
+        policy = self.success(
+            "freeze-execution", self.root, "--mode", "no-exec"
+        )
+        self.assertEqual(policy["mode"], "no_exec")
+        self.assertEqual(
+            self.success("freeze-execution", self.root, "--mode", "no-exec"),
+            policy,
+        )
+        blocked = self.invoke("check-execution", self.root)
+        changed = self.invoke(
+            "freeze-execution", self.root, "--mode", "sandboxed"
         )
 
-        self.assertEqual(landed["artifact"], artifact)
+        self.assertEqual(blocked.returncode, 1)
+        self.assertIn("forbids target code execution", blocked.stderr)
+        self.assertEqual(changed.returncode, 1)
+        self.assertIn("invalid choice", changed.stderr)
+
+    def test_check_execution_never_authorizes_target_code(self):
+        blocked = self.invoke("check-execution", self.root)
+
+        self.assertEqual(blocked.returncode, 1)
+        self.assertIn("forbids target code execution", blocked.stderr)
+
+    def test_static_object_commands_read_only_the_frozen_bundle(self):
+        context = self.success("context-log", self.root, "--limit", 20)
+        token = context["path_tokens"][0]["token"]
+        base = self.success("read-blob", self.root, "base", token)
+        head = self.success("read-blob", self.root, "head", token)
+
+        self.assertEqual(base["content"], "base\n")
+        self.assertEqual(head["content"], "base\nhead\n")
+        self.assertEqual(base["encoding"], "utf-8")
+        self.assertEqual(context["paths"], ["base.txt"])
         self.assertEqual(
-            self.success("check-worktree", self.root, self.repo)["head_sha"], artifact
+            context["path_tokens"], [{"path": "base.txt", "token": "YmFzZS50eHQ"}]
         )
+        self.assertEqual(context["commits"][0]["subject"], "base")
+
+        invalid = self.invoke("read-blob", self.root, "head", "../base.txt")
+        self.assertEqual(invalid.returncode, 1)
+        self.assertIn("path token", invalid.stderr)
 
     def test_review_receipt_returns_only_a_response_for_the_frozen_head(self):
         marker = self.success("review-marker", self.root)["marker"]

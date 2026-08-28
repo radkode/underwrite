@@ -503,6 +503,11 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
   align-items: center;
 }
 .acts.walk { padding-top: 2px; }
+.execution-blocked {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--unver);
+}
 .act {
   font-family: var(--mono);
   font-size: 11px;

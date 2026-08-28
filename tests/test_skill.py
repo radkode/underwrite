@@ -148,21 +148,17 @@ class FrozenSnapshotContract(unittest.TestCase):
         self.assertLess(snapshot, context)
         self.assertNotIn("gh pr diff", text)
         self.assertIn("local three-dot diff", text)
-        self.assertIn("check-pr` again after those reads", text)
+        self.assertIn("Run `check-pr` and `check-controller` again after those reads", text)
 
-    def test_pr_movement_stops_branch_side_effects(self):
+    def test_pr_snapshots_never_authorize_branch_side_effects(self):
         text = self.skill()
-        start = text.index("On accept, in `branch` mode")
-        end = text.index("In `review` mode", start)
-        rule = text[start:end]
 
-        self.assertIn("immediately before checkout or\nimplementation", rule)
-        self.assertIn("again immediately before the commit", rule)
-        self.assertIn("supervised replacement session", rule)
-        self.assertIn('pin-branch "$R" <fixes-branch>', rule)
-        self.assertGreaterEqual(rule.count('check-worktree "$R" "$PWD"'), 2)
-        self.assertIn("full SHA", rule)
-        self.assertIn('--repo-root "$PWD"', rule)
+        self.assertIn("capture freezes `no-exec` with the target", text)
+        self.assertIn("Do not check out or execute the head", text)
+        self.assertIn("the page and store always refuse branch acceptance", text)
+        self.assertIn("PR targets never enter this path", text)
+        self.assertIn("supervised replacement session", text)
+        self.assertNotIn('check-worktree "$R" "$PWD"', text)
 
     def test_review_validation_and_delivery_share_the_frozen_head(self):
         text = self.skill()

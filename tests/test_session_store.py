@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Focused contracts for the transactional underwrite session store."""
 import importlib.util
+import hashlib
 import json
 import shutil
 import sqlite3
@@ -22,7 +23,6 @@ SPEC.loader.exec_module(session_store)
 
 SESSION = {
     "repo": "acme/widget",
-    "number": 7,
     "cursor": 1,
     "lands": [],
     "audience": {"mode": "branch", "why": "the author owns the branch"},
@@ -94,6 +94,26 @@ class FrozenTargets(unittest.TestCase):
         metadata.write_text(json.dumps({"capture": suffix}), encoding="utf-8")
         return diff, metadata
 
+    def context_input(self, suffix="1", document=None):
+        if document is None:
+            document = {
+                "version": 1,
+                "base_sha": self.target(suffix)["base_sha"],
+                "files": [],
+            }
+        path = self.root / f"trusted-context-{suffix}.json"
+        path.write_text(
+            json.dumps(
+                document,
+                ensure_ascii=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return path
+
     def freeze(self, suffix="1"):
         diff, metadata = self.inputs(suffix)
         return self.store.freeze_target(self.target(suffix), diff, metadata)
@@ -116,6 +136,7 @@ class FrozenTargets(unittest.TestCase):
             }))
 
         target = self.store.freeze_target(self.target(), diff, metadata)
+        self.store.freeze_execution("no_exec")
         with self.assertRaisesRegex(session_store.Conflict, "cannot change"):
             self.store.put_session(SESSION)
         with self.assertRaisesRegex(session_store.Conflict, "freeze-target"):
@@ -124,6 +145,7 @@ class FrozenTargets(unittest.TestCase):
         action = self.store.produce("nav-1", None, "next", "")
         without_target = dict(self.store.snapshot()[0])
         without_target.pop("target")
+        without_target.pop("execution_policy")
         with self.assertRaisesRegex(session_store.Conflict, "cannot change"):
             self.store.apply(action["seq"], {"kind": "walk"}, session=without_target)
         self.assertEqual(self.store.head()["state"], "produced")
@@ -137,6 +159,418 @@ class FrozenTargets(unittest.TestCase):
 
         self.assertNotIn("target", self.store.snapshot()[0])
         self.assertFalse((self.root / "pr.diff").exists())
+
+    def test_target_and_no_exec_policy_are_frozen_atomically(self):
+        target = self.freeze()
+
+        policy = self.store.snapshot()[0]["execution_policy"]
+        self.assertEqual(policy["trust"], "untrusted")
+        self.assertEqual(policy["mode"], "no_exec")
+        self.assertEqual(policy["target"]["head_sha"], target["head_sha"])
+        self.store.put_beat(FLAG)
+        self.store.produce("nav-1", None, "next", "")
+
+    def test_execution_policy_is_target_bound_write_once_and_idempotent(self):
+        diff, metadata = self.inputs()
+        target = self.store.freeze_target(
+            self.target(), diff, metadata, self.context_input()
+        )
+        before = self.store.delivery_state()["render_revision"]
+        policy = self.store.freeze_execution("no_exec")
+        after = self.store.delivery_state()["render_revision"]
+
+        self.assertEqual(policy, {
+            "version": 1,
+            "trust": "untrusted",
+            "mode": "no_exec",
+            "target": {
+                "repo": target["repo"],
+                "number": target["number"],
+                "base_sha": target["base_sha"],
+                "head_sha": target["head_sha"],
+                "diff_sha256": target["diff_sha256"],
+                "trusted_context_sha256": target["trusted_context_sha256"],
+            },
+        })
+        self.assertEqual(after, before)
+        self.assertEqual(self.store.freeze_execution("no_exec"), policy)
+        self.assertEqual(self.store.delivery_state()["render_revision"], after)
+        with self.assertRaisesRegex(session_store.StoreError, "one of no_exec"):
+            self.store.freeze_execution("sandboxed")
+        with self.assertRaisesRegex(session_store.Conflict, "freeze-execution"):
+            self.store.patch_session({"execution_policy": policy})
+        without_policy = dict(self.store.snapshot()[0])
+        without_policy.pop("execution_policy")
+        with self.assertRaisesRegex(session_store.Conflict, "cannot change"):
+            self.store.put_session(without_policy)
+
+    def test_target_code_execution_is_not_a_supported_policy(self):
+        self.freeze()
+
+        with self.assertRaisesRegex(session_store.StoreError, "one of no_exec"):
+            self.store.freeze_execution("sandboxed")
+
+        policy = self.store.freeze_execution("no_exec")
+        self.assertEqual(policy["mode"], "no_exec")
+        with self.assertRaisesRegex(session_store.Conflict, "forbids"):
+            self.store.check_execution()
+
+    def test_trusted_context_is_semantically_validated_and_hash_verified(self):
+        content = "review from the frozen base\n"
+        encoded = content.encode("utf-8")
+        blob_sha = hashlib.sha1(
+            b"blob " + str(len(encoded)).encode("ascii") + b"\0" + encoded
+        ).hexdigest()
+        context = {
+            "version": 1,
+            "base_sha": self.target()["base_sha"],
+            "files": [{
+                "path": "AGENTS.md",
+                "mode": "100644",
+                "blob_sha": blob_sha,
+                "content": content,
+            }],
+        }
+        diff, metadata = self.inputs()
+        target = self.store.freeze_target(
+            self.target(), diff, metadata, self.context_input(document=context)
+        )
+
+        self.assertEqual(self.store.read_trusted_context(), context)
+        policy = self.store.freeze_execution("no_exec")
+        with self.assertRaisesRegex(session_store.Conflict, "forbids"):
+            self.store.check_execution()
+        self.assertEqual(
+            policy["target"]["trusted_context_sha256"],
+            target["trusted_context_sha256"],
+        )
+
+        (self.root / "trusted-context.json").write_text("{}\n", encoding="utf-8")
+        with self.assertRaisesRegex(session_store.Conflict, "does not match"):
+            self.store.read_trusted_context()
+        with self.assertRaisesRegex(session_store.Conflict, "does not match"):
+            self.store.check_execution()
+
+    def test_trusted_context_rejects_a_governing_symlink(self):
+        content = "rules.md"
+        encoded = content.encode("utf-8")
+        blob_sha = hashlib.sha1(
+            b"blob " + str(len(encoded)).encode("ascii") + b"\0" + encoded
+        ).hexdigest()
+        context = {
+            "version": 1,
+            "base_sha": self.target()["base_sha"],
+            "files": [{
+                "path": "AGENTS.md",
+                "mode": "120000",
+                "blob_sha": blob_sha,
+                "content": content,
+            }],
+        }
+        diff, metadata = self.inputs()
+
+        with self.assertRaisesRegex(session_store.StoreError, "regular file"):
+            self.store.freeze_target(
+                self.target(), diff, metadata, self.context_input(document=context)
+            )
+
+        self.assertNotIn("target", self.store.snapshot()[0])
+
+    def test_a_context_for_a_different_base_is_never_frozen(self):
+        context = {
+            "version": 1,
+            "base_sha": "f" * 40,
+            "files": [],
+        }
+        diff, metadata = self.inputs()
+
+        with self.assertRaisesRegex(session_store.StoreError, "base_sha"):
+            self.store.freeze_target(
+                self.target(), diff, metadata, self.context_input(document=context)
+            )
+
+        self.assertNotIn("target", self.store.snapshot()[0])
+        self.assertFalse((self.root / "trusted-context.json").exists())
+
+    def test_no_exec_is_independent_of_audience(self):
+        diff, metadata = self.inputs()
+        self.store.freeze_target(
+            self.target(), diff, metadata, self.context_input()
+        )
+        policy = self.store.freeze_execution("no_exec")
+        self.store.patch_session({
+            "audience": {"mode": "branch", "why": "the author owns the branch"}
+        })
+        self.store.put_beat(FLAG)
+
+        with self.assertRaisesRegex(session_store.Conflict, "disabled"):
+            self.store.produce("accept-1", 1, "accept", "yes")
+
+        self.store.patch_session({
+            "audience": {"mode": "review", "why": "another reviewer owns the PR"}
+        })
+        accepted = self.store.produce("accept-2", 1, "accept", "include it")
+        landed = self.store.land(
+            accepted["seq"], 1, "https://example.test/review/1", "review"
+        )
+        self.assertEqual(landed["kind"], "review")
+        self.assertEqual(self.store.snapshot()[0]["execution_policy"], policy)
+
+    def test_a_v3_pr_without_trusted_context_requires_replacement(self):
+        self.freeze()
+        self.store.freeze_execution("no_exec")
+        self.store.patch_session({
+            "audience": {"mode": "review", "why": "another reviewer owns the PR"}
+        })
+        self.store.put_beat(FLAG)
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            row = db.execute(
+                "SELECT body_json FROM session WHERE singleton = 1"
+            ).fetchone()
+            body = json.loads(row[0])
+            body.pop("execution_policy")
+            db.execute(
+                "UPDATE session SET body_json = ? WHERE singleton = 1",
+                (json.dumps(body),),
+            )
+            db.execute("PRAGMA user_version = 3")
+
+        self.store = session_store.SessionStore(self.root)
+
+        self.assertEqual(
+            self.store.snapshot()[0]["execution_policy"]["mode"], "no_exec"
+        )
+        with self.assertRaisesRegex(
+            session_store.Conflict, "no frozen trusted context.*replacement"
+        ):
+            self.store.produce("accept-1", 1, "accept", "include it")
+
+    def test_a_v3_contextless_review_delivery_requires_replacement(self):
+        self.freeze()
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            row = db.execute(
+                "SELECT body_json FROM session WHERE singleton = 1"
+            ).fetchone()
+            body = json.loads(row[0])
+            body.pop("execution_policy")
+            db.execute(
+                "UPDATE session SET body_json = ? WHERE singleton = 1",
+                (json.dumps(body),),
+            )
+        with mock.patch.object(
+            session_store, "EXECUTION_MODES", ("sandboxed", "no_exec")
+        ), mock.patch.object(
+            session_store.SessionStore, "_replacement_reason", return_value=None
+        ):
+            self.store.freeze_execution("sandboxed")
+            self.store.patch_session({
+                "audience": {"mode": "review", "why": "another reviewer owns the PR"}
+            })
+            self.store.put_beat(FLAG)
+            action = self.store.produce("accept-1", 1, "accept", "include it")
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            db.execute("PRAGMA user_version = 3")
+
+        upgraded = session_store.SessionStore(self.root)
+        pending = upgraded.reconcile()["pending_deliveries"]
+
+        self.assertEqual(len(pending), 1)
+        self.assertTrue(pending[0]["blocked"])
+        self.assertIn("do not perform external delivery", pending[0]["blocked_reason"])
+        with self.assertRaisesRegex(session_store.Conflict, "supervised replacement"):
+            upgraded.land(
+                action["seq"], 1, "https://example.test/review/1", "review"
+            )
+
+    def test_v3_pr_sessions_discard_claimed_sandboxing_and_block_new_commit_land(self):
+        diff, metadata = self.inputs()
+        self.store.freeze_target(
+            self.target(), diff, metadata, self.context_input()
+        )
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            row = db.execute(
+                "SELECT body_json FROM session WHERE singleton = 1"
+            ).fetchone()
+            body = json.loads(row[0])
+            body.pop("execution_policy")
+            db.execute(
+                "UPDATE session SET body_json = ? WHERE singleton = 1",
+                (json.dumps(body),),
+            )
+        with mock.patch.object(
+            session_store, "EXECUTION_MODES", ("sandboxed", "no_exec")
+        ):
+            self.store.freeze_execution("sandboxed")
+            self.store.patch_session({
+                "audience": {"mode": "branch", "why": "the author owns the branch"}
+            })
+            self.store.put_beat(FLAG)
+            action = self.store.produce("accept-1", 1, "accept", "yes")
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            db.execute("PRAGMA user_version = 3")
+
+        self.store = session_store.SessionStore(self.root)
+
+        self.assertEqual(
+            self.store.snapshot()[0]["execution_policy"]["mode"], "no_exec"
+        )
+        pending = self.store.reconcile()["pending_deliveries"]
+        self.assertEqual(len(pending), 1)
+        self.assertTrue(pending[0]["blocked"])
+        self.assertIn("do not execute target code", pending[0]["blocked_reason"])
+        with self.assertRaisesRegex(session_store.Conflict, "disabled"):
+            self.store.land(action["seq"], 1, "c" * 40, "commit", branch="feature")
+
+    def test_v3_applied_navigation_replay_uses_the_migrated_execution_policy(self):
+        diff, metadata = self.inputs()
+        self.store.freeze_target(
+            self.target(), diff, metadata, self.context_input()
+        )
+        action = self.store.produce("nav-1", None, "next", "")
+        moved = dict(self.store.snapshot()[0], cursor=2, current_beat=2)
+        original_v3_session = dict(moved)
+        original_v3_session.update({
+            "execution_policy": {"mode": "user metadata"},
+            "legacy_pr": {"repo": "other/project", "number": 99},
+        })
+        result = {"kind": "walk", "cursor": 2, "current_beat": 2, "tier": "core"}
+        applied = self.store.apply(action["seq"], result, session=moved)
+
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            row = db.execute(
+                "SELECT body_json FROM session WHERE singleton = 1"
+            ).fetchone()
+            body = json.loads(row[0])
+            body.update({
+                "execution_policy": {"mode": "user metadata"},
+                "legacy_pr": {"repo": "other/project", "number": 99},
+            })
+            db.execute(
+                "UPDATE session SET body_json = ? WHERE singleton = 1",
+                (json.dumps(body),),
+            )
+            row = db.execute(
+                "SELECT result_json FROM actions WHERE seq = ?", (action["seq"],)
+            ).fetchone()
+            application = json.loads(row[0])
+            application["session"] = dict(original_v3_session)
+            db.execute(
+                "UPDATE actions SET result_json = ? WHERE seq = ?",
+                (json.dumps(application), action["seq"]),
+            )
+            db.execute("PRAGMA user_version = 3")
+
+        self.store = session_store.SessionStore(self.root)
+        current, _beats = self.store.snapshot()
+
+        self.assertEqual(
+            self.store.apply(
+                action["seq"], result, session=original_v3_session
+            ),
+            applied,
+        )
+        self.assertEqual(
+            self.store.apply(action["seq"], result, session=current), applied
+        )
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            row = db.execute(
+                "SELECT result_json FROM actions WHERE seq = ?", (action["seq"],)
+            ).fetchone()
+        application = json.loads(row[0])
+        self.assertEqual(
+            application["session"]["execution_policy"],
+            current["execution_policy"],
+        )
+
+    def test_v3_produced_navigation_uses_the_migrated_execution_policy(self):
+        diff, metadata = self.inputs()
+        self.store.freeze_target(
+            self.target(), diff, metadata, self.context_input()
+        )
+        first = self.store.produce("nav-1", None, "next", "")
+        second = self.store.produce("nav-2", None, "back", "")
+        original = dict(self.store.snapshot()[0])
+        original.pop("execution_policy")
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            row = db.execute(
+                "SELECT body_json FROM session WHERE singleton = 1"
+            ).fetchone()
+            body = json.loads(row[0])
+            body.pop("execution_policy")
+            db.execute(
+                "UPDATE session SET body_json = ? WHERE singleton = 1",
+                (json.dumps(body),),
+            )
+            db.execute("PRAGMA user_version = 3")
+
+        self.store = session_store.SessionStore(self.root)
+        moved = dict(original, cursor=2, current_beat=2)
+        result = {"kind": "walk", "cursor": 2, "current_beat": 2}
+        self.assertEqual(
+            self.store.apply(first["seq"], result, session=moved)["state"],
+            "applied",
+        )
+        self.store.ack(first["seq"])
+        current, beats = self.store.snapshot()
+        current.pop("execution_policy")
+        self.assertEqual(
+            self.store.reconcile_action(
+                second["seq"],
+                result,
+                session=current,
+                beats=beats,
+                evidence="the migrated target session is already on disk",
+            )["state"],
+            "applied",
+        )
+
+    def test_no_exec_migration_keeps_an_exact_landed_commit_replay_idempotent(self):
+        diff, metadata = self.inputs()
+        self.store.freeze_target(
+            self.target(), diff, metadata, self.context_input()
+        )
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            row = db.execute(
+                "SELECT body_json FROM session WHERE singleton = 1"
+            ).fetchone()
+            body = json.loads(row[0])
+            body.pop("execution_policy")
+            db.execute(
+                "UPDATE session SET body_json = ? WHERE singleton = 1",
+                (json.dumps(body),),
+            )
+        with mock.patch.object(
+            session_store, "EXECUTION_MODES", ("sandboxed", "no_exec")
+        ):
+            self.store.freeze_execution("sandboxed")
+            self.store.patch_session({
+                "audience": {"mode": "branch", "why": "the author owns the branch"}
+            })
+            self.store.put_beat(FLAG)
+            action = self.store.produce("accept-1", 1, "accept", "yes")
+            landed = self.store.land(
+                action["seq"], 1, "c" * 40, "commit", branch="feature"
+            )
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            row = db.execute(
+                "SELECT body_json FROM session WHERE singleton = 1"
+            ).fetchone()
+            body = json.loads(row[0])
+            body.pop("execution_policy")
+            db.execute(
+                "UPDATE session SET body_json = ? WHERE singleton = 1",
+                (json.dumps(body),),
+            )
+            db.execute("PRAGMA user_version = 3")
+
+        self.store = session_store.SessionStore(self.root)
+
+        self.assertEqual(
+            self.store.land(
+                action["seq"], 1, "c" * 40, "commit", branch="feature"
+            ),
+            landed,
+        )
 
     def test_a_delivery_branch_is_write_once_through_its_gateway(self):
         self.freeze()
@@ -179,6 +613,46 @@ class FrozenTargets(unittest.TestCase):
         with self.assertRaisesRegex(session_store.Conflict, "does not match"):
             self.store.read_verified_target_diff()
 
+    def test_object_bundle_is_hash_bound_and_verified_on_every_read(self):
+        diff, metadata = self.inputs()
+        bundle = self.root / "captured.bundle"
+        bundle.write_bytes(b"exact Git objects\n")
+
+        target = self.store.freeze_target(
+            self.target(), diff, metadata, None, bundle
+        )
+
+        self.assertEqual(self.store.read_object_bundle(), b"exact Git objects\n")
+        copied = self.root / "verified-copy.bundle"
+        self.assertEqual(self.store.copy_verified_object_bundle(copied), target)
+        self.assertEqual(copied.read_bytes(), b"exact Git objects\n")
+        with mock.patch.object(
+            session_store, "MAX_OBJECT_BUNDLE_MEMORY_BYTES", 1
+        ):
+            with self.assertRaisesRegex(session_store.Conflict, "too large"):
+                self.store.read_object_bundle()
+        self.assertEqual(
+            target["object_bundle_sha256"],
+            hashlib.sha256(b"exact Git objects\n").hexdigest(),
+        )
+        self.assertEqual(target["object_bundle_bytes"], 18)
+        self.assertEqual(
+            self.store.snapshot()[0]["execution_policy"]["target"][
+                "object_bundle_sha256"
+            ],
+            target["object_bundle_sha256"],
+        )
+
+        (self.root / "pr.bundle").write_bytes(b"tampered\n")
+        bad_copy = self.root / "bad-copy.bundle"
+        with self.assertRaisesRegex(session_store.Conflict, "does not match"):
+            self.store.copy_verified_object_bundle(bad_copy)
+        self.assertFalse(bad_copy.exists())
+        with self.assertRaisesRegex(session_store.Conflict, "does not match"):
+            self.store.read_object_bundle()
+        with self.assertRaisesRegex(session_store.Conflict, "does not match"):
+            self.store.verify_target_files()
+
     def test_concurrent_different_freezes_cannot_split_identity_and_diff(self):
         first = self.inputs("1")
         second = self.inputs("2")
@@ -207,6 +681,63 @@ class FrozenTargets(unittest.TestCase):
         expected = b"diff 1\n" if frozen["base_sha"] == "a" * 40 else b"diff 2\n"
         self.assertEqual((self.root / "pr.diff").read_bytes(), expected)
 
+    def test_target_publication_serializes_with_the_first_beat(self):
+        diff, metadata = self.inputs()
+        publishing = threading.Event()
+        release = threading.Event()
+        beat_started = threading.Event()
+        frozen, freeze_errors, beat_errors = [], [], []
+        replace = session_store.os.replace
+
+        def paused_replace(source, destination):
+            if Path(destination) == self.root / "pr.json":
+                publishing.set()
+                if not release.wait(5):
+                    raise RuntimeError("timed out waiting to publish target")
+            return replace(source, destination)
+
+        def freeze():
+            try:
+                frozen.append(
+                    self.store.freeze_target(self.target(), diff, metadata)
+                )
+            except Exception as error:
+                freeze_errors.append(error)
+
+        def add_beat():
+            beat_started.set()
+            try:
+                self.store.put_beat(FLAG)
+            except Exception as error:
+                beat_errors.append(error)
+
+        with mock.patch.object(session_store.os, "replace", paused_replace):
+            freeze_thread = threading.Thread(target=freeze)
+            freeze_thread.start()
+            self.assertTrue(publishing.wait(5))
+
+            beat_thread = threading.Thread(target=add_beat)
+            beat_thread.start()
+            self.assertTrue(beat_started.wait(5))
+            beat_thread.join(0.5)
+            beat_was_blocked = beat_thread.is_alive()
+
+            release.set()
+            freeze_thread.join(5)
+            beat_thread.join(5)
+
+        self.assertTrue(beat_was_blocked)
+        self.assertFalse(freeze_thread.is_alive())
+        self.assertFalse(beat_thread.is_alive())
+        self.assertEqual(freeze_errors, [])
+        self.assertEqual(len(frozen), 1)
+        self.assertEqual(beat_errors, [])
+        self.assertEqual(self.store.snapshot()[1][0]["n"], 1)
+        self.assertEqual(
+            self.store.snapshot()[0]["execution_policy"]["mode"], "no_exec"
+        )
+        self.assertEqual(self.store.verify_target_files(), frozen[0])
+
     def test_a_failed_database_save_publishes_no_target_and_retry_repairs_it(self):
         diff, metadata = self.inputs()
         with mock.patch.object(
@@ -221,6 +752,341 @@ class FrozenTargets(unittest.TestCase):
 
 
 class CreatingAndMigrating(StoreCase):
+    def test_v3_produced_navigation_uses_the_migrated_legacy_marker(self):
+        first = self.store.produce("nav-1", None, "next", "")
+        second = self.store.produce("nav-2", None, "back", "")
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            row = db.execute(
+                "SELECT body_json FROM session WHERE singleton = 1"
+            ).fetchone()
+            original = json.loads(row[0])
+            original["number"] = 7
+            db.execute(
+                "UPDATE session SET body_json = ? WHERE singleton = 1",
+                (json.dumps(original),),
+            )
+            db.execute("PRAGMA user_version = 3")
+
+        upgraded = session_store.SessionStore(self.root)
+        moved = dict(original, cursor=2, current_beat=2)
+        result = {"kind": "walk", "cursor": 2, "current_beat": 2}
+        self.assertEqual(
+            upgraded.apply(first["seq"], result, session=moved)["state"],
+            "applied",
+        )
+        upgraded.ack(first["seq"])
+        current, beats = upgraded.snapshot()
+        current.pop("legacy_pr")
+        self.assertEqual(
+            upgraded.reconcile_action(
+                second["seq"],
+                result,
+                session=current,
+                beats=beats,
+                evidence="the migrated legacy session is already on disk",
+            )["state"],
+            "applied",
+        )
+
+    def test_legacy_marker_wins_over_changed_visible_identity_on_replay(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / "beats").mkdir()
+        (root / "session.json").write_text(
+            json.dumps({**SESSION, "number": 7}), encoding="utf-8"
+        )
+        store = session_store.SessionStore(root)
+        store.patch_session({"repo": "other/project", "number": 99})
+        first = store.produce("nav-1", None, "next", "")
+        moved = dict(store.snapshot()[0], cursor=2, current_beat=2)
+        result = {"kind": "walk", "cursor": 2, "current_beat": 2}
+        applied = store.apply(first["seq"], result, session=moved)
+
+        self.assertEqual(store.apply(first["seq"], result, session=moved), applied)
+        store.ack(first["seq"])
+        second = store.produce("nav-2", None, "back", "")
+        current, beats = store.snapshot()
+        reconciled = store.reconcile_action(
+            second["seq"],
+            result,
+            session=current,
+            beats=beats,
+            evidence="the diverged legacy identity is already on disk",
+        )
+        self.assertEqual(
+            store.reconcile_action(
+                second["seq"],
+                result,
+                session=current,
+                beats=beats,
+                evidence="the same receipt is replayed",
+            ),
+            reconciled,
+        )
+
+    def test_v3_navigation_receipt_keeps_its_own_historical_identity(self):
+        action = self.store.produce("nav-1", None, "next", "")
+        moved = dict(self.store.snapshot()[0], cursor=2, current_beat=2)
+        result = {"kind": "walk", "cursor": 2, "current_beat": 2}
+        applied = self.store.apply(action["seq"], result, session=moved)
+
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            row = db.execute(
+                "SELECT body_json FROM session WHERE singleton = 1"
+            ).fetchone()
+            current = json.loads(row[0])
+            current["number"] = 7
+            db.execute(
+                "UPDATE session SET body_json = ? WHERE singleton = 1",
+                (json.dumps(current),),
+            )
+            db.execute("PRAGMA user_version = 3")
+
+        upgraded = session_store.SessionStore(self.root)
+
+        self.assertEqual(
+            upgraded.snapshot()[0]["legacy_pr"],
+            {"repo": "acme/widget", "number": 7},
+        )
+        self.assertEqual(
+            upgraded.apply(action["seq"], result, session=moved), applied
+        )
+        self.assertEqual(
+            session_store.SessionStore(self.root).snapshot()[0],
+            upgraded.snapshot()[0],
+        )
+
+    def test_v3_targetless_pr_navigation_replays_old_and_current_envelopes(self):
+        action = self.store.produce("nav-1", None, "next", "")
+        moved = dict(self.store.snapshot()[0], cursor=2, current_beat=2)
+        result = {"kind": "walk", "cursor": 2, "current_beat": 2}
+        applied = self.store.apply(action["seq"], result, session=moved)
+        original_v3_session = dict(moved)
+        original_v3_session.update({
+            "number": 7,
+            "legacy_pr": {"repo": "other/project", "number": 99},
+            "execution_policy": {"mode": "sandboxed"},
+        })
+
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            row = db.execute(
+                "SELECT body_json FROM session WHERE singleton = 1"
+            ).fetchone()
+            body = json.loads(row[0])
+            body.update(original_v3_session)
+            db.execute(
+                "UPDATE session SET body_json = ? WHERE singleton = 1",
+                (json.dumps(body),),
+            )
+            row = db.execute(
+                "SELECT result_json FROM actions WHERE seq = ?", (action["seq"],)
+            ).fetchone()
+            application = json.loads(row[0])
+            application["session"] = dict(original_v3_session)
+            db.execute(
+                "UPDATE actions SET result_json = ? WHERE seq = ?",
+                (json.dumps(application), action["seq"]),
+            )
+            db.execute("PRAGMA user_version = 3")
+
+        self.store = session_store.SessionStore(self.root)
+        current, _beats = self.store.snapshot()
+
+        self.assertEqual(
+            current["legacy_pr"], {"repo": "acme/widget", "number": 7}
+        )
+        self.assertNotIn("execution_policy", current)
+        self.assertEqual(
+            self.store.apply(
+                action["seq"], result, session=original_v3_session
+            ),
+            applied,
+        )
+        self.assertEqual(
+            self.store.apply(action["seq"], result, session=current), applied
+        )
+
+    def test_legacy_import_discards_a_user_execution_policy(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / "beats").mkdir()
+        (root / "session.json").write_text(
+            json.dumps({
+                **SESSION,
+                "number": 7,
+                "execution_policy": {"mode": "sandboxed"},
+            }),
+            encoding="utf-8",
+        )
+
+        session = session_store.SessionStore(root).snapshot()[0]
+
+        self.assertNotIn("execution_policy", session)
+        self.assertEqual(
+            session["legacy_pr"], {"repo": "acme/widget", "number": 7}
+        )
+
+    def test_legacy_import_preserves_a_valid_legacy_pr_marker_fail_closed(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / "beats").mkdir()
+        (root / "session.json").write_text(
+            json.dumps({
+                **SESSION,
+                "legacy_pr": {"repo": "other/project", "number": 99},
+            }),
+            encoding="utf-8",
+        )
+
+        store = session_store.SessionStore(root)
+
+        self.assertEqual(
+            store.snapshot()[0]["legacy_pr"],
+            {"repo": "other/project", "number": 99},
+        )
+
+    def test_export_reimport_preserves_legacy_pr_after_visible_identity_is_removed(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / "beats").mkdir()
+        (root / "session.json").write_text(
+            json.dumps({
+                **SESSION,
+                "number": 7,
+                "audience": {"mode": "branch", "why": "the author owns the branch"},
+            }),
+            encoding="utf-8",
+        )
+        (root / "beats" / "01.json").write_text(
+            json.dumps(FLAG), encoding="utf-8"
+        )
+        store = session_store.SessionStore(root)
+        marker = store.snapshot()[0]["legacy_pr"]
+        store.patch_session({"repo": None, "number": None})
+        store.export_json()
+        (root / "session.sqlite3").unlink()
+
+        restored = session_store.SessionStore(root)
+
+        self.assertEqual(restored.snapshot()[0]["legacy_pr"], marker)
+        with self.assertRaisesRegex(
+            session_store.Conflict, "supervised replacement"
+        ):
+            restored.produce("accept-1", 1, "accept", "yes")
+
+    def test_v3_upgrade_discards_a_user_legacy_pr_field(self):
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            row = db.execute(
+                "SELECT body_json FROM session WHERE singleton = 1"
+            ).fetchone()
+            body = json.loads(row[0])
+            body["legacy_pr"] = "user metadata"
+            db.execute(
+                "UPDATE session SET body_json = ? WHERE singleton = 1",
+                (json.dumps(body),),
+            )
+            db.execute("PRAGMA user_version = 3")
+
+        upgraded = session_store.SessionStore(self.root)
+
+        self.assertNotIn("legacy_pr", upgraded.snapshot()[0])
+
+    def test_v3_targetless_pr_discards_a_user_execution_policy(self):
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            row = db.execute(
+                "SELECT body_json FROM session WHERE singleton = 1"
+            ).fetchone()
+            body = json.loads(row[0])
+            body["number"] = 7
+            body["execution_policy"] = {"mode": "sandboxed"}
+            db.execute(
+                "UPDATE session SET body_json = ? WHERE singleton = 1",
+                (json.dumps(body),),
+            )
+            db.execute("PRAGMA user_version = 3")
+
+        session = session_store.SessionStore(self.root).snapshot()[0]
+
+        self.assertNotIn("execution_policy", session)
+        self.assertEqual(
+            session["legacy_pr"], {"repo": "acme/widget", "number": 7}
+        )
+
+    def test_v3_targetless_non_pr_discards_a_user_execution_policy(self):
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            row = db.execute(
+                "SELECT body_json FROM session WHERE singleton = 1"
+            ).fetchone()
+            body = json.loads(row[0])
+            body["execution_policy"] = {"mode": "user metadata"}
+            db.execute(
+                "UPDATE session SET body_json = ? WHERE singleton = 1",
+                (json.dumps(body),),
+            )
+            db.execute("PRAGMA user_version = 3")
+
+        first = session_store.SessionStore(self.root).snapshot()[0]
+        second = session_store.SessionStore(self.root).snapshot()[0]
+
+        self.assertNotIn("execution_policy", first)
+        self.assertEqual(second, first)
+
+    def test_a_pre_target_legacy_pr_requires_supervised_replacement(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / "beats").mkdir()
+        (root / "session.json").write_text(
+            json.dumps({**SESSION, "number": 7}), encoding="utf-8"
+        )
+        (root / "beats" / "01.json").write_text(
+            json.dumps(FLAG), encoding="utf-8"
+        )
+        store = session_store.SessionStore(root)
+
+        with self.assertRaisesRegex(
+            session_store.Conflict, "supervised replacement"
+        ):
+            store.produce("accept-1", 1, "accept", "yes")
+
+        session, _beats = store.snapshot()
+        without_marker = dict(session)
+        without_marker.pop("legacy_pr")
+        without_marker.pop("repo")
+        without_marker.pop("number")
+        with self.assertRaisesRegex(
+            session_store.Conflict, "legacy PR identity cannot change"
+        ):
+            store.put_session(without_marker)
+
+        store.patch_session({"repo": None, "number": None})
+        with self.assertRaisesRegex(
+            session_store.Conflict, "supervised replacement"
+        ):
+            store.produce("accept-2", 1, "accept", "yes")
+
+        action = store.produce("nav-1", None, "next", "")
+        moved = dict(store.snapshot()[0], cursor=2, current_beat=2)
+        result = {"kind": "walk", "cursor": 2, "current_beat": 2}
+        self.assertEqual(
+            store.apply(action["seq"], result, session=moved)["state"],
+            "applied",
+        )
+        store.ack(action["seq"])
+        recovery = store.produce("nav-2", None, "back", "")
+        current, beats = store.snapshot()
+        self.assertEqual(
+            store.reconcile_action(
+                recovery["seq"],
+                {"kind": "walk", "cursor": 2, "current_beat": 2},
+                session=current,
+                beats=beats,
+                evidence="the legacy session is already on disk",
+            )["state"],
+            "applied",
+        )
+
+        self.assertEqual(store.snapshot()[1][0]["state"], "flag")
+
     def downgrade_to_pre_identity_v1(self, format_version=1):
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
             db.execute("PRAGMA foreign_keys = OFF")
@@ -241,7 +1107,7 @@ class CreatingAndMigrating(StoreCase):
 
     def test_the_database_and_export_format_are_versioned(self):
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
             self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "delete")
         db = self.store._connect()
         try:
@@ -252,6 +1118,16 @@ class CreatingAndMigrating(StoreCase):
         session, beats = self.store.snapshot()
         self.assertEqual(session["schema_version"], 1)
         self.assertEqual([beat["n"] for beat in beats], [1, 2])
+
+    def test_v3_non_pr_sessions_do_not_gain_a_pr_execution_policy(self):
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            db.execute("PRAGMA user_version = 3")
+
+        upgraded = session_store.SessionStore(self.root)
+
+        self.assertNotIn("execution_policy", upgraded.snapshot()[0])
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
 
     def test_the_session_identity_survives_restart_but_not_recreation(self):
         first = self.store.delivery_state()["session_id"]
@@ -276,7 +1152,7 @@ class CreatingAndMigrating(StoreCase):
         self.assertEqual(upgraded.head()["action_id"], action["action_id"])
         self.assertTrue(upgraded.delivery_state()["session_id"])
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
             columns = {row[1] for row in db.execute("PRAGMA table_info(session)")}
         self.assertIn("session_id", columns)
 
@@ -298,7 +1174,7 @@ class CreatingAndMigrating(StoreCase):
         failed = upgraded.presentation_snapshot()[1][0]["delivery"]
         self.assertEqual(failed["owed"], "retry with the fixture")
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 3)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
 
     def test_a_v2_upgrade_removes_a_failure_injected_fix(self):
         beat = self.beat(1)
@@ -380,13 +1256,13 @@ class CreatingAndMigrating(StoreCase):
         (self.root / "session.sqlite3").unlink()
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
             self.assertEqual(db.execute("PRAGMA journal_mode = WAL").fetchone()[0], "wal")
-            db.execute("PRAGMA user_version = 4")
+            db.execute("PRAGMA user_version = 5")
 
         with self.assertRaisesRegex(session_store.StoreError, "newer than supported"):
             session_store.SessionStore(self.root)
 
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
             self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
 
     def test_legacy_actions_without_an_ack_migrate_as_handled(self):
@@ -428,6 +1304,43 @@ class CreatingAndMigrating(StoreCase):
             store.reconcile()["pending_deliveries"],
             [{"beat_n": 1, "cause_seq": 1, "kind": "commit"}],
         )
+
+    def test_a_pending_legacy_pr_review_is_blocked_for_replacement(self):
+        (self.root / "session.sqlite3").unlink()
+        (self.root / "session.json").write_text(
+            json.dumps({
+                **SESSION,
+                "number": 7,
+                "audience": {"mode": "review", "why": "another reviewer owns the PR"},
+            }),
+            encoding="utf-8",
+        )
+        accepted = dict(FLAG, state="accepted", call="include it")
+        (self.root / "beats" / "01.json").write_text(
+            json.dumps(accepted), encoding="utf-8"
+        )
+        (self.root / "decisions.jsonl").write_text(
+            json.dumps({
+                "seq": 1,
+                "action_id": "legacy-review",
+                "n": 1,
+                "action": "accept",
+                "note": "include it",
+                "delivery_version": 1,
+            }) + "\n",
+            encoding="utf-8",
+        )
+        (self.root / "ack.json").write_text(
+            json.dumps({"version": 1, "handled_seq": 0}), encoding="utf-8"
+        )
+
+        pending = session_store.SessionStore(self.root).reconcile()[
+            "pending_deliveries"
+        ]
+
+        self.assertEqual(pending[0]["kind"], "review")
+        self.assertTrue(pending[0]["blocked"])
+        self.assertIn("do not perform external delivery", pending[0]["blocked_reason"])
 
     def test_a_pending_legacy_accept_without_an_action_is_refused(self):
         (self.root / "session.sqlite3").unlink()
