@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -113,6 +114,7 @@ class Capturing(SnapshotCase):
         self.assertEqual(
             self.store.snapshot()[0]["execution_policy"]["mode"], "no_exec"
         )
+        self.assertEqual(self.store.snapshot()[0]["audience"]["mode"], "review")
         self.assertIsNone(json.loads((self.session / "pr.json").read_text())["head"]["repo"])
         self.assertEqual(api.call_count, 2)
 
@@ -780,9 +782,25 @@ class Capturing(SnapshotCase):
 
         self.assertEqual(target["base_sha"], self.base)
         self.assertEqual(target["state"], "closed")
+        self.assertEqual(self.store.snapshot()[0]["audience"]["mode"], "report")
         self.assertNotIn(
             "after-merge.txt", (self.session / "pr.diff").read_text(encoding="utf-8")
         )
+
+    def test_a_closed_unmerged_pr_uses_report_audience(self):
+        metadata = self.metadata(state="closed", merged_at=None)
+
+        target = pr_snapshot.capture(
+            self.store,
+            "acme/widget",
+            7,
+            self.work,
+            api=mock.Mock(side_effect=[metadata, metadata]),
+        )
+
+        self.assertEqual(target["state"], "closed")
+        self.assertIsNone(target["merged_at"])
+        self.assertEqual(self.store.snapshot()[0]["audience"]["mode"], "report")
 
     def test_capture_ignores_hostile_diff_configuration(self):
         marker = self.root / "external-ran"
@@ -912,6 +930,18 @@ class Guarding(SnapshotCase):
             api=mock.Mock(side_effect=[metadata, metadata]),
         )
 
+    def mutate_session(self, mutate):
+        with sqlite3.connect(str(self.session / "session.sqlite3")) as db:
+            row = db.execute(
+                "SELECT body_json FROM session WHERE singleton = 1"
+            ).fetchone()
+            body = json.loads(row[0])
+            mutate(body)
+            db.execute(
+                "UPDATE session SET body_json = ? WHERE singleton = 1",
+                (json.dumps(body),),
+            )
+
     def test_check_rejects_head_base_and_lifecycle_drift(self):
         for current, field in (
             (self.metadata(head__sha=self.common), "head_sha"),
@@ -952,6 +982,32 @@ class Guarding(SnapshotCase):
 
         api.assert_not_called()
 
+    def test_check_rejects_an_audience_that_requires_replacement(self):
+        self.mutate_session(
+            lambda body: body.update(
+                audience={"mode": "branch", "why": "historical session"}
+            )
+        )
+        api = mock.Mock()
+
+        with self.assertRaisesRegex(pr_snapshot.TargetMoved, "frozen lifecycle"):
+            pr_snapshot.check(self.store, api=api)
+
+        api.assert_not_called()
+
+    def test_check_rejects_a_target_without_trusted_context(self):
+        def remove_context(body):
+            body["target"].pop("trusted_context_sha256")
+            body["target"].pop("trusted_context_bytes")
+
+        self.mutate_session(remove_context)
+        api = mock.Mock()
+
+        with self.assertRaisesRegex(pr_snapshot.TargetMoved, "trusted context"):
+            pr_snapshot.check(self.store, api=api)
+
+        api.assert_not_called()
+
     def test_verified_bundle_reads_exact_base_and_head_blobs(self):
         with mock.patch.object(
             self.store,
@@ -980,13 +1036,10 @@ class Guarding(SnapshotCase):
             pr_snapshot.read_blob(self.store, "head", "head.txt", 1024)
 
     def test_no_exec_worktree_guards_never_touch_the_supplied_repo(self):
-        self.store.patch_session({
-            "audience": {"mode": "branch", "why": "the author owns the branch"}
-        })
         with mock.patch.object(pr_snapshot, "_git") as git:
             with self.assertRaisesRegex(session_store.Conflict, "forbids"):
                 pr_snapshot.check_worktree(self.store, self.root / "hostile")
-            with self.assertRaisesRegex(session_store.Conflict, "forbids"):
+            with self.assertRaisesRegex(session_store.Conflict, "branch delivery mode"):
                 pr_snapshot.check_commit(
                     self.store,
                     self.root / "hostile",

@@ -11,6 +11,7 @@ import importlib.util
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -46,6 +47,38 @@ def beat(**kw):
     }
     out.update(kw)
     return out
+
+
+def report_session(repo="r"):
+    return {
+        "repo": repo,
+        "audience": {"mode": "report", "why": "the frozen PR is not open"},
+        "target": {
+            "kind": "github_pr",
+            "state": "closed",
+            "merged_at": None,
+            "trusted_context_sha256": "a" * 64,
+        },
+        "execution_policy": {"trust": "untrusted", "mode": "no_exec"},
+    }
+
+
+def pr_target(state="closed", merged_at=None):
+    return {
+        "version": 1,
+        "kind": "github_pr",
+        "repo": "acme/widget",
+        "number": 42,
+        "state": state,
+        "merged_at": merged_at,
+        "base_sha": "a" * 40,
+        "head_sha": "b" * 40,
+        "head_repo_id": 123,
+        "head_repo": "acme/widget",
+        "head_ref": "feature",
+        "merge_base_sha": "c" * 40,
+        "changed_files": 1,
+    }
 
 
 class BeatValidation(unittest.TestCase):
@@ -112,6 +145,44 @@ class BeatValidation(unittest.TestCase):
             [],
         )
 
+    def test_a_final_report_accept_is_terminal_without_a_receipt(self):
+        self.assertEqual(
+            rr.validate(
+                beat(state="accepted", delivery={"state": "none"}),
+                "report",
+                final=True,
+            ),
+            [],
+        )
+
+    def test_a_report_accept_rejects_delivery_receipt_fields(self):
+        accepted = beat(
+            state="accepted",
+            landed="https://example.test/review/2",
+            branch="jacek/fix",
+            delivery_kind="review",
+        )
+        problems = rr.validate(accepted, "report", final=True)
+
+        self.assertIn("report outcome cannot have delivery receipt fields", problems[0])
+        self.assertIn("landed, branch, delivery_kind", problems[0])
+        page = rr.render(
+            report_session(),
+            [accepted],
+            "",
+            {1: problems},
+        )
+        self.assertNotIn('<span class="lbl">Landed</span>', page)
+
+    def test_a_report_accept_rejects_non_terminal_delivery_state(self):
+        problems = rr.validate(
+            beat(state="accepted", delivery={"state": "pending", "kind": "review"}),
+            "report",
+            final=True,
+        )
+
+        self.assertIn("report outcome cannot have pending delivery", problems[0])
+
     def test_a_landing_must_match_the_audience(self):
         branch = rr.validate(beat(
             state="accepted",
@@ -156,6 +227,10 @@ class BeatValidation(unittest.TestCase):
     def test_unknown_slot_is_rejected(self):
         problems = rr.validate(beat(slots={"what": "x", "proof": "a.ts:1", "notes": "y"}))
         self.assertIn("unknown slot 'notes'", problems[0])
+
+    def test_slots_must_be_an_object(self):
+        problems = rr.validate(beat(slots=["what", "proof"]))
+        self.assertIn("slots must be an object", problems[0])
 
     def test_unknown_state_is_rejected(self):
         problems = rr.validate(beat(state="probably-fine"))
@@ -351,13 +426,51 @@ class DelegatedActionControls(unittest.TestCase):
             html,
         )
 
-    def test_no_exec_branch_flags_do_not_offer_implementation(self):
+    def test_report_flags_offer_inclusion_in_the_local_report(self):
+        html = self.render(report_session(), self.flag())
+
+        self.assertIn(
+            '<button class="act primary" data-action="accept">Include in report</button>',
+            html,
+        )
+        self.assertIn("Outcome: report only", html)
+        self.assertNotIn("Include in review", html)
+
+        included = rr.render(
+            report_session(),
+            [beat(state="accepted", delivery={"state": "none"})],
+            "",
+            {},
+        )
+        self.assertIn("Included in report", included)
+
+        malformed = report_session()
+        malformed["lands"] = [{
+            "state": "ready",
+            "what": "external work",
+            "where": "elsewhere",
+        }]
+        without_lands = rr.render(malformed, [self.flag()], "", {})
+        self.assertNotIn("What lands", without_lands)
+
+    def test_unproven_report_flags_do_not_offer_inclusion(self):
+        invalid = self.flag()
+        invalid["slots"]["proof"] = "trust me"
+
+        html = self.render(report_session(), invalid)
+
+        self.assertIn("Complete finding evidence before inclusion", html)
+        self.assertNotIn('data-action="accept">Include in report</button>', html)
+
+    def test_a_pr_audience_that_conflicts_with_frozen_lifecycle_is_blocked(self):
         html = self.render(
             {
                 "repo": "r",
-                "audience": {"mode": "branch"},
+                "audience": {"mode": "report"},
                 "target": {
                     "kind": "github_pr",
+                    "state": "open",
+                    "merged_at": None,
                     "trusted_context_sha256": "a" * 64,
                 },
                 "execution_policy": {"trust": "untrusted", "mode": "no_exec"},
@@ -365,7 +478,26 @@ class DelegatedActionControls(unittest.TestCase):
             self.flag(),
         )
 
-        self.assertIn("No-exec policy blocks implementation", html)
+        self.assertIn("PR session requires a supervised replacement", html)
+        self.assertNotIn('data-action="accept"', html)
+
+    def test_historical_pr_branch_flags_require_replacement(self):
+        html = self.render(
+            {
+                "repo": "r",
+                "audience": {"mode": "branch"},
+                "target": {
+                    "kind": "github_pr",
+                    "state": "open",
+                    "merged_at": None,
+                    "trusted_context_sha256": "a" * 64,
+                },
+                "execution_policy": {"trust": "untrusted", "mode": "no_exec"},
+            },
+            self.flag(),
+        )
+
+        self.assertIn("PR session requires a supervised replacement", html)
         self.assertNotIn('data-action="accept"', html)
         self.assertIn('data-action="drop"', html)
 
@@ -392,7 +524,7 @@ class DelegatedActionControls(unittest.TestCase):
             self.flag(),
         )
 
-        self.assertIn("Legacy PR requires a supervised replacement", html)
+        self.assertIn("PR session requires a supervised replacement", html)
         self.assertNotIn('data-action="accept"', html)
         self.assertIn('data-action="note">Save note</button>', html)
         self.assertIn("Execution: No-exec, legacy PR", html)
@@ -408,7 +540,7 @@ class DelegatedActionControls(unittest.TestCase):
             self.flag(),
         )
 
-        self.assertIn("Legacy PR requires a supervised replacement", html)
+        self.assertIn("PR session requires a supervised replacement", html)
         self.assertNotIn("Include in review", html)
         self.assertNotIn('data-action="accept"', html)
 
@@ -480,12 +612,14 @@ class DelegatedActionControls(unittest.TestCase):
         self.assertIn("Next attempt:", html)
         self.assertIn("repair <code>fixture.py:2</code>", html)
 
-    def test_untrusted_pr_commit_delivery_requires_replacement(self):
+    def test_historical_pr_commit_delivery_requires_replacement(self):
         session = {
             "repo": "r",
             "audience": {"mode": "branch"},
             "target": {
                 "kind": "github_pr",
+                "state": "open",
+                "merged_at": None,
                 "trusted_context_sha256": "frozen",
             },
         }
@@ -511,7 +645,7 @@ class DelegatedActionControls(unittest.TestCase):
         )
 
         self.assertIn("Blocked, replacement required", html)
-        self.assertIn("Do not execute target code", html)
+        self.assertIn("Do not publish or execute this delivery", html)
         self.assertNotIn("Implementation pending", html)
         self.assertIn("Recorded failure: tests failed", failed)
         self.assertIn("Previously recorded obligation: repair the fixture", failed)
@@ -563,6 +697,31 @@ class DelegatedActionControls(unittest.TestCase):
         )
 
         self.assertIn("Review publication failed", html)
+
+    def test_malformed_report_delivery_uses_report_specific_labels(self):
+        pending = rr.render(
+            report_session(),
+            [beat(state="accepted", delivery={
+                "state": "pending",
+                "kind": "review",
+            })],
+            "",
+            {},
+        )
+        failed = rr.render(
+            report_session(),
+            [beat(state="accepted", delivery={
+                "state": "failed",
+                "kind": "review",
+            })],
+            "",
+            {},
+        )
+
+        self.assertIn("Report inclusion pending", pending)
+        self.assertIn("Report inclusion failed", failed)
+        self.assertNotIn("review pending", pending)
+        self.assertNotIn("Review publication", failed)
 
 
 class Escaping(unittest.TestCase):
@@ -822,6 +981,27 @@ class RenderCli(unittest.TestCase):
         (self.root / "beats" / ("%02d.json" % b["n"])).write_text(
             json.dumps(b), encoding="utf-8")
 
+    def frozen_store(self, state="closed", merged_at=None):
+        (self.root / "session.json").unlink()
+        source = self.root / "capture.diff"
+        metadata = self.root / "capture.json"
+        context = self.root / "trusted-context.json"
+        source.write_text("diff\n", encoding="utf-8")
+        metadata.write_text("{}\n", encoding="utf-8")
+        context.write_text(
+            json.dumps({
+                "version": 1,
+                "base_sha": "a" * 40,
+                "files": [],
+            }, separators=(",", ":"), sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        store = rr.SessionStore(self.root)
+        store.freeze_target(
+            pr_target(state, merged_at), source, metadata, context
+        )
+        return store
+
     def run_cli(self, *args):
         return subprocess.run(
             [sys.executable, str(SCRIPTS / "render-report.py"), str(self.root), *args],
@@ -845,6 +1025,15 @@ class RenderCli(unittest.TestCase):
         done = self.run_cli()
         self.assertEqual(done.returncode, 2)
         self.assertIn("clean with no proof", done.stderr)
+        self.assertIn("unproven", self.page())
+
+    def test_non_object_slots_render_as_unproven_instead_of_crashing(self):
+        self.put(beat(n=1, slots=["what", "proof"]))
+
+        done = self.run_cli()
+
+        self.assertEqual(done.returncode, 2)
+        self.assertIn("slots must be an object", done.stderr)
         self.assertIn("unproven", self.page())
 
     def test_a_review_accept_is_allowed_before_post_but_not_in_the_final_report(self):
@@ -872,6 +1061,96 @@ class RenderCli(unittest.TestCase):
 
         self.assertEqual(final.returncode, 2)
         self.assertIn("accepted, nothing landed", final.stderr)
+
+    def test_a_report_accept_is_terminal_in_the_final_report(self):
+        store = self.frozen_store()
+        finding = beat(
+            n=1,
+            state="flag",
+            slots={
+                "what": "x",
+                "proof": "a.ts:1",
+                "risk": "r",
+                "fix": "f",
+            },
+        )
+        store.put_beat(finding)
+        action = store.produce("accept-1", 1, "accept", "include it")
+        store.ack(action["seq"])
+        store.export_json()
+        (self.root / "session.sqlite3").unlink()
+
+        final = self.run_cli("--final")
+
+        self.assertEqual(final.returncode, 0)
+        self.assertTrue((self.root / "session.sqlite3").exists())
+        self.assertIn("Outcome: report only", self.page())
+        self.assertNotIn("<h2>What lands</h2>", self.page())
+
+    def test_a_report_with_zero_accepts_has_an_explicit_outcome(self):
+        store = self.frozen_store()
+        store.put_beat(beat(n=1, state="clean"))
+
+        final = self.run_cli("--final")
+
+        self.assertEqual(final.returncode, 0)
+        self.assertIn("Outcome: report only", self.page())
+        self.assertNotIn("<h2>What lands</h2>", self.page())
+
+    def test_a_pr_audience_mismatch_fails_final_validation(self):
+        store = self.frozen_store(state="open")
+        store.put_beat(beat(n=1, state="clean"))
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            row = db.execute(
+                "SELECT body_json FROM session WHERE singleton = 1"
+            ).fetchone()
+            session = json.loads(row[0])
+            session["audience"] = {"mode": "report", "why": "historical"}
+            db.execute(
+                "UPDATE session SET body_json = ? WHERE singleton = 1",
+                (json.dumps(session),),
+            )
+
+        final = self.run_cli("--final")
+
+        self.assertEqual(final.returncode, 2)
+        self.assertIn("does not match frozen PR lifecycle", final.stderr)
+
+    def test_a_targetless_raw_report_is_rejected(self):
+        self.session({
+            "repo": "acme/widget",
+            "audience": {"mode": "report", "why": "bypass delivery"},
+        })
+        self.put(beat(n=1, state="clean"))
+
+        final = self.run_cli("--final")
+
+        self.assertEqual(final.returncode, 1)
+        self.assertIn("report audience requires a frozen PR target", final.stderr)
+
+    def test_raw_json_cannot_forge_an_accepted_report(self):
+        store = self.frozen_store()
+        store.put_beat(beat(
+            n=1,
+            state="flag",
+            slots={
+                "what": "x",
+                "proof": "a.ts:1",
+                "risk": "r",
+                "fix": "f",
+            },
+        ))
+        store.export_json()
+        path = self.root / "beats" / "01.json"
+        finding = json.loads(path.read_text(encoding="utf-8"))
+        finding["state"] = "accepted"
+        path.write_text(json.dumps(finding), encoding="utf-8")
+        (self.root / "session.sqlite3").unlink()
+
+        final = self.run_cli("--final")
+
+        self.assertEqual(final.returncode, 1)
+        self.assertIn("accepted legacy beat 1 has no accept action", final.stderr)
 
     def test_a_final_review_with_its_url_exits_zero(self):
         review_url = "https://example.test/review/2"
@@ -928,7 +1207,10 @@ class RenderCli(unittest.TestCase):
         done = self.run_cli()
 
         self.assertEqual(done.returncode, 2)
-        self.assertIn("session audience mode must be branch or review", done.stderr)
+        self.assertIn(
+            "session audience mode must be branch, review, or report",
+            done.stderr,
+        )
 
     def test_a_legacy_pr_without_an_execution_policy_fails_closed(self):
         self.session({

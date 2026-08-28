@@ -118,6 +118,18 @@ class FrozenTargets(unittest.TestCase):
         diff, metadata = self.inputs(suffix)
         return self.store.freeze_target(self.target(suffix), diff, metadata)
 
+    def set_historical_audience(self, mode):
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            row = db.execute(
+                "SELECT body_json FROM session WHERE singleton = 1"
+            ).fetchone()
+            body = json.loads(row[0])
+            body["audience"] = {"mode": mode, "why": "historical session"}
+            db.execute(
+                "UPDATE session SET body_json = ? WHERE singleton = 1",
+                (json.dumps(body),),
+            )
+
     def test_freeze_records_one_hash_verified_target(self):
         target = self.freeze()
 
@@ -146,7 +158,7 @@ class FrozenTargets(unittest.TestCase):
         without_target = dict(self.store.snapshot()[0])
         without_target.pop("target")
         without_target.pop("execution_policy")
-        with self.assertRaisesRegex(session_store.Conflict, "cannot change"):
+        with self.assertRaisesRegex(session_store.StoreError, "frozen PR target"):
             self.store.apply(action["seq"], {"kind": "walk"}, session=without_target)
         self.assertEqual(self.store.head()["state"], "produced")
 
@@ -160,15 +172,250 @@ class FrozenTargets(unittest.TestCase):
         self.assertNotIn("target", self.store.snapshot()[0])
         self.assertFalse((self.root / "pr.diff").exists())
 
-    def test_target_and_no_exec_policy_are_frozen_atomically(self):
+    def test_target_audience_and_no_exec_policy_are_frozen_atomically(self):
         target = self.freeze()
 
-        policy = self.store.snapshot()[0]["execution_policy"]
+        session = self.store.snapshot()[0]
+        policy = session["execution_policy"]
+        self.assertEqual(session["audience"]["mode"], "review")
         self.assertEqual(policy["trust"], "untrusted")
         self.assertEqual(policy["mode"], "no_exec")
         self.assertEqual(policy["target"]["head_sha"], target["head_sha"])
         self.store.put_beat(FLAG)
         self.store.produce("nav-1", None, "next", "")
+
+    def test_non_open_prs_freeze_report_audience(self):
+        cases = (
+            ("closed", None),
+            ("closed", "2026-08-26T00:00:00Z"),
+        )
+        for index, (state, merged_at) in enumerate(cases, 1):
+            with self.subTest(state=state, merged_at=merged_at):
+                root = self.root / f"case-{index}"
+                store = session_store.SessionStore(root)
+                target = dict(
+                    self.target(), state=state, merged_at=merged_at
+                )
+                diff = self.root / f"case-{index}.diff"
+                metadata = self.root / f"case-{index}.json"
+                context = self.root / f"case-{index}-context.json"
+                diff.write_text("diff\n", encoding="utf-8")
+                metadata.write_text("{}\n", encoding="utf-8")
+                context.write_text(
+                    json.dumps({
+                        "version": 1,
+                        "base_sha": target["base_sha"],
+                        "files": [],
+                    }, separators=(",", ":"), sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+
+                store.freeze_target(target, diff, metadata, context)
+
+                self.assertEqual(store.snapshot()[0]["audience"]["mode"], "report")
+
+    def test_report_audience_requires_a_frozen_pr(self):
+        with self.assertRaisesRegex(
+            session_store.StoreError, "frozen PR target"
+        ):
+            self.store.put_session({
+                **SESSION,
+                "audience": {"mode": "report", "why": "bypass delivery"},
+            })
+
+    def test_review_audience_requires_a_frozen_or_legacy_pr(self):
+        with self.assertRaisesRegex(
+            session_store.StoreError, "frozen PR target or legacy PR marker"
+        ):
+            self.store.put_session({
+                **SESSION,
+                "audience": {"mode": "review", "why": "bypass delivery"},
+            })
+
+    def test_report_audience_cannot_carry_lands(self):
+        target = dict(self.target(), state="closed", merged_at=None)
+        diff, metadata = self.inputs()
+        self.store.freeze_target(
+            target, diff, metadata, self.context_input()
+        )
+        session = self.store.snapshot()[0]
+        session["lands"] = [{
+            "state": "ready",
+            "what": "external work",
+            "where": "somewhere else",
+        }]
+
+        with self.assertRaisesRegex(
+            session_store.StoreError, "report audience cannot have lands"
+        ):
+            self.store.put_session(session)
+
+    def test_freeze_overrides_a_prefreeze_pr_audience(self):
+        self.store.put_session(dict(SESSION, delivery_branch="stale"))
+        diff, metadata = self.inputs()
+
+        self.store.freeze_target(
+            self.target(), diff, metadata, self.context_input()
+        )
+
+        self.assertEqual(self.store.snapshot()[0]["audience"]["mode"], "review")
+        self.assertNotIn("delivery_branch", self.store.snapshot()[0])
+
+    def test_exact_replay_preserves_a_historical_audience(self):
+        diff, metadata = self.inputs()
+        target = self.store.freeze_target(
+            self.target(), diff, metadata, self.context_input()
+        )
+        self.set_historical_audience("branch")
+
+        diff, metadata = self.inputs()
+        replay = self.store.freeze_target(
+            self.target(), diff, metadata, self.context_input()
+        )
+
+        self.assertEqual(replay, target)
+        self.assertEqual(self.store.snapshot()[0]["audience"]["mode"], "branch")
+        self.store.put_beat(FLAG)
+        with self.assertRaisesRegex(session_store.Conflict, "frozen lifecycle"):
+            self.store.produce("accept-1", 1, "accept", "yes")
+
+    def test_report_accept_is_terminal_and_freezes_agent_content(self):
+        target = dict(self.target(), state="closed", merged_at=None)
+        diff, metadata = self.inputs()
+        self.store.freeze_target(
+            target, diff, metadata, self.context_input()
+        )
+        self.store.put_beat(FLAG)
+
+        action = self.store.produce("accept-1", 1, "accept", "include it")
+
+        self.assertEqual(action["result"]["delivery"], "none")
+        self.assertEqual(
+            self.store.presentation_snapshot()[1][0]["delivery"]["state"],
+            "none",
+        )
+        with self.assertRaisesRegex(session_store.Conflict, "cannot change slots"):
+            changed = self.store.snapshot()[1][0]
+            changed["slots"]["proof"] = "changed.py:1"
+            self.store.put_beat(changed)
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            db.execute(
+                "UPDATE beats SET delivery_state = 'pending', delivery_json = ? "
+                "WHERE n = 1",
+                (json.dumps({"kind": "review", "cause_seq": action["seq"]}),),
+            )
+        with self.assertRaisesRegex(session_store.Conflict, "has not landed"):
+            self.store.ack(action["seq"])
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            db.execute(
+                "UPDATE beats SET delivery_state = 'none', delivery_json = NULL "
+                "WHERE n = 1"
+            )
+        self.assertEqual(self.store.ack(action["seq"]), {"handled_seq": 1})
+        self.assertFalse(self.store.reconcile()["recovery"])
+        with self.assertRaisesRegex(session_store.Conflict, "does not match"):
+            self.store.land(action["seq"], 1, "review-url", "review")
+        with self.assertRaisesRegex(session_store.Conflict, "no external delivery"):
+            self.store.fail(action["seq"], "failed", "retry")
+
+    def test_report_accept_requires_shippable_frozen_content(self):
+        target = dict(self.target(), state="closed", merged_at=None)
+        diff, metadata = self.inputs()
+        self.store.freeze_target(
+            target, diff, metadata, self.context_input()
+        )
+        invalid = dict(FLAG)
+        invalid["slots"] = dict(FLAG["slots"], proof="trust me")
+        self.store.put_beat(invalid)
+
+        with self.assertRaisesRegex(
+            session_store.Conflict, "report acceptance requires a shippable beat"
+        ):
+            self.store.produce("accept-1", 1, "accept", "include it")
+
+        self.assertEqual(self.store.snapshot()[1][0]["state"], "flag")
+        self.assertIsNone(self.store.head())
+
+    def test_report_accept_ack_requires_the_accepted_beat(self):
+        target = dict(self.target(), state="closed", merged_at=None)
+        diff, metadata = self.inputs()
+        self.store.freeze_target(
+            target, diff, metadata, self.context_input()
+        )
+        self.store.put_beat(FLAG)
+        action = self.store.produce("accept-1", 1, "accept", "include it")
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            row = db.execute(
+                "SELECT body_json FROM beats WHERE n = 1"
+            ).fetchone()
+            body = json.loads(row[0])
+            body["state"] = "flag"
+            db.execute(
+                "UPDATE beats SET body_json = ? WHERE n = 1",
+                (json.dumps(body),),
+            )
+
+        with self.assertRaisesRegex(
+            session_store.Conflict, "no longer resolves to an accepted beat"
+        ):
+            self.store.ack(action["seq"])
+
+    def test_report_accept_keeps_reviewer_notes_mutable(self):
+        target = dict(self.target(), state="closed", merged_at=None)
+        diff, metadata = self.inputs()
+        self.store.freeze_target(
+            target, diff, metadata, self.context_input()
+        )
+        self.store.put_beat(FLAG)
+        accepted = self.store.produce("accept-1", 1, "accept", "include it")
+        self.store.ack(accepted["seq"])
+
+        noted = self.store.produce("note-1", 1, "note", "reviewer follow-up")
+        self.store.ack(noted["seq"])
+
+        self.assertEqual(self.store.snapshot()[1][0]["call"], "reviewer follow-up")
+
+    def test_report_accept_survives_export_and_reimport_without_delivery(self):
+        target = dict(
+            self.target(), state="closed", merged_at="2026-08-26T00:00:00Z"
+        )
+        diff, metadata = self.inputs()
+        self.store.freeze_target(
+            target, diff, metadata, self.context_input()
+        )
+        self.store.put_beat(FLAG)
+        action = self.store.produce("accept-1", 1, "accept", "include it")
+        self.store.ack(action["seq"])
+        self.store.export_json()
+        (self.root / "session.sqlite3").unlink()
+
+        restored = session_store.SessionStore(self.root)
+
+        beat = restored.presentation_snapshot()[1][0]
+        self.assertEqual(beat["state"], "accepted")
+        self.assertEqual(beat["delivery"]["state"], "none")
+        self.assertFalse(restored.reconcile()["recovery"])
+
+    def test_invalid_accepted_report_cannot_be_reimported(self):
+        target = dict(self.target(), state="closed", merged_at=None)
+        diff, metadata = self.inputs()
+        self.store.freeze_target(
+            target, diff, metadata, self.context_input()
+        )
+        self.store.put_beat(FLAG)
+        action = self.store.produce("accept-1", 1, "accept", "include it")
+        self.store.ack(action["seq"])
+        self.store.export_json()
+        path = self.root / "beats" / "01.json"
+        exported = json.loads(path.read_text(encoding="utf-8"))
+        exported["slots"]["proof"] = "trust me"
+        path.write_text(json.dumps(exported), encoding="utf-8")
+        (self.root / "session.sqlite3").unlink()
+
+        with self.assertRaisesRegex(
+            session_store.MigrationError, "accepted report beat 1 is not shippable"
+        ):
+            session_store.SessionStore(self.root)
 
     def test_execution_policy_is_target_bound_write_once_and_idempotent(self):
         diff, metadata = self.inputs()
@@ -292,36 +539,31 @@ class FrozenTargets(unittest.TestCase):
         self.assertNotIn("target", self.store.snapshot()[0])
         self.assertFalse((self.root / "trusted-context.json").exists())
 
-    def test_no_exec_is_independent_of_audience(self):
+    def test_open_pr_uses_review_without_relaxing_no_exec(self):
         diff, metadata = self.inputs()
         self.store.freeze_target(
             self.target(), diff, metadata, self.context_input()
         )
         policy = self.store.freeze_execution("no_exec")
-        self.store.patch_session({
-            "audience": {"mode": "branch", "why": "the author owns the branch"}
-        })
         self.store.put_beat(FLAG)
 
-        with self.assertRaisesRegex(session_store.Conflict, "disabled"):
-            self.store.produce("accept-1", 1, "accept", "yes")
-
-        self.store.patch_session({
-            "audience": {"mode": "review", "why": "another reviewer owns the PR"}
-        })
-        accepted = self.store.produce("accept-2", 1, "accept", "include it")
+        with self.assertRaisesRegex(session_store.Conflict, "target is frozen"):
+            self.store.patch_session({"audience": {"mode": "branch"}})
+        accepted = self.store.produce("accept-1", 1, "accept", "include it")
+        self.assertEqual(self.store.ack(accepted["seq"]), {"handled_seq": 1})
+        self.assertTrue(self.store.delivery_state()["recovery"])
         landed = self.store.land(
             accepted["seq"], 1, "https://example.test/review/1", "review"
         )
         self.assertEqual(landed["kind"], "review")
-        self.assertEqual(self.store.snapshot()[0]["execution_policy"], policy)
+        self.assertFalse(self.store.delivery_state()["recovery"])
+        session = self.store.snapshot()[0]
+        self.assertEqual(session["audience"]["mode"], "review")
+        self.assertEqual(session["execution_policy"], policy)
 
     def test_a_v3_pr_without_trusted_context_requires_replacement(self):
         self.freeze()
         self.store.freeze_execution("no_exec")
-        self.store.patch_session({
-            "audience": {"mode": "review", "why": "another reviewer owns the PR"}
-        })
         self.store.put_beat(FLAG)
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
             row = db.execute(
@@ -363,9 +605,6 @@ class FrozenTargets(unittest.TestCase):
             session_store.SessionStore, "_replacement_reason", return_value=None
         ):
             self.store.freeze_execution("sandboxed")
-            self.store.patch_session({
-                "audience": {"mode": "review", "why": "another reviewer owns the PR"}
-            })
             self.store.put_beat(FLAG)
             action = self.store.produce("accept-1", 1, "accept", "include it")
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
@@ -399,11 +638,11 @@ class FrozenTargets(unittest.TestCase):
             )
         with mock.patch.object(
             session_store, "EXECUTION_MODES", ("sandboxed", "no_exec")
+        ), mock.patch.object(
+            session_store.SessionStore, "_replacement_reason", return_value=None
         ):
             self.store.freeze_execution("sandboxed")
-            self.store.patch_session({
-                "audience": {"mode": "branch", "why": "the author owns the branch"}
-            })
+            self.set_historical_audience("branch")
             self.store.put_beat(FLAG)
             action = self.store.produce("accept-1", 1, "accept", "yes")
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
@@ -417,8 +656,8 @@ class FrozenTargets(unittest.TestCase):
         pending = self.store.reconcile()["pending_deliveries"]
         self.assertEqual(len(pending), 1)
         self.assertTrue(pending[0]["blocked"])
-        self.assertIn("do not execute target code", pending[0]["blocked_reason"])
-        with self.assertRaisesRegex(session_store.Conflict, "disabled"):
+        self.assertIn("frozen lifecycle", pending[0]["blocked_reason"])
+        with self.assertRaisesRegex(session_store.Conflict, "supervised replacement"):
             self.store.land(action["seq"], 1, "c" * 40, "commit", branch="feature")
 
     def test_v3_applied_navigation_replay_uses_the_migrated_execution_policy(self):
@@ -541,11 +780,11 @@ class FrozenTargets(unittest.TestCase):
             )
         with mock.patch.object(
             session_store, "EXECUTION_MODES", ("sandboxed", "no_exec")
+        ), mock.patch.object(
+            session_store.SessionStore, "_replacement_reason", return_value=None
         ):
             self.store.freeze_execution("sandboxed")
-            self.store.patch_session({
-                "audience": {"mode": "branch", "why": "the author owns the branch"}
-            })
+            self.set_historical_audience("branch")
             self.store.put_beat(FLAG)
             action = self.store.produce("accept-1", 1, "accept", "yes")
             landed = self.store.land(
@@ -574,9 +813,7 @@ class FrozenTargets(unittest.TestCase):
 
     def test_a_delivery_branch_is_write_once_through_its_gateway(self):
         self.freeze()
-        self.store.patch_session({
-            "audience": {"mode": "branch", "why": "the author owns the branch"}
-        })
+        self.set_historical_audience("branch")
 
         pinned = self.store.pin_branch("feature")
 
@@ -1305,6 +1542,25 @@ class CreatingAndMigrating(StoreCase):
             [{"beat_n": 1, "cause_seq": 1, "kind": "commit"}],
         )
 
+    def test_a_landed_legacy_accept_needs_no_historical_action_log(self):
+        (self.root / "session.sqlite3").unlink()
+        accepted = dict(
+            FLAG,
+            state="accepted",
+            landed="a" * 40,
+            delivery_kind="commit",
+            branch="feature",
+        )
+        (self.root / "beats" / "01.json").write_text(
+            json.dumps(accepted), encoding="utf-8"
+        )
+
+        store = session_store.SessionStore(self.root)
+
+        delivered = store.presentation_snapshot()[1][0]["delivery"]
+        self.assertEqual(delivered["state"], "landed")
+        self.assertEqual(delivered["artifact"], "a" * 40)
+
     def test_a_pending_legacy_pr_review_is_blocked_for_replacement(self):
         (self.root / "session.sqlite3").unlink()
         (self.root / "session.json").write_text(
@@ -1568,13 +1824,6 @@ class ProducingAndApplying(StoreCase):
         self.assertEqual(self.store.ack(first["seq"]), {"handled_seq": 1})
         self.assertEqual(self.store.head()["seq"], 2)
 
-    def test_review_accept_can_ack_before_the_single_review_lands(self):
-        self.store.put_session(dict(self.store.snapshot()[0], audience={"mode": "review"}))
-        action = self.store.produce("click-1", 1, "accept", "yes")
-
-        self.assertEqual(self.store.ack(action["seq"]), {"handled_seq": 1})
-        self.assertTrue(self.store.delivery_state()["recovery"])
-
     def test_a_legacy_accept_can_be_refined_into_a_decision(self):
         self.assertNotIn("resolution_kind", self.beat(1))
         accepted = self.store.produce("click-1", 1, "accept", "yes")
@@ -1745,7 +1994,7 @@ class ProducingAndApplying(StoreCase):
     def test_audience_cannot_change_after_an_accept(self):
         action = self.store.produce("click-1", 1, "accept", "yes")
 
-        with self.assertRaisesRegex(session_store.Conflict, "audience cannot change"):
+        with self.assertRaisesRegex(session_store.StoreError, "frozen PR target"):
             self.store.patch_session({"audience": {"mode": "review", "why": "changed"}})
 
         self.assertEqual(self.store.snapshot()[0]["audience"]["mode"], "branch")

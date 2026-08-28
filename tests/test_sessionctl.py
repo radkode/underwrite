@@ -381,9 +381,8 @@ class TargetCommands(SessionCtlCase):
         self.assertEqual(changed.returncode, 2)
         self.assertIn("head_sha changed", changed.stderr)
 
-    def test_no_exec_blocks_worktree_checks_land_and_branch_acceptance(self):
-        pinned = self.success("pin-branch", self.root, "feature")
-        self.assertEqual(pinned["delivery_branch"], "feature")
+    def test_open_pr_uses_review_and_never_enters_commit_delivery(self):
+        pinned = self.invoke("pin-branch", self.root, "feature")
         hostile = self.root / "missing-hostile-repo"
         checked = self.invoke("check-worktree", self.root, hostile)
         landed = self.invoke(
@@ -399,14 +398,19 @@ class TargetCommands(SessionCtlCase):
             "--repo-root",
             hostile,
         )
+        self.assertEqual(pinned.returncode, 1)
+        self.assertIn("not in branch delivery mode", pinned.stderr)
         self.assertEqual(checked.returncode, 1)
-        self.assertEqual(landed.returncode, 1)
         self.assertIn("forbids target code execution", checked.stderr)
-        self.assertIn("forbids target code execution", landed.stderr)
+        self.assertEqual(landed.returncode, 1)
+        self.assertIn("not in branch delivery mode", landed.stderr)
         store = self.store()
         store.put_beat(FLAG)
-        with self.assertRaisesRegex(session_store.Conflict, "disabled"):
-            store.produce("accept-1", 1, "accept", "yes")
+        action = store.produce("accept-1", 1, "accept", "include it")
+        self.assertEqual(action["result"]["delivery"], "pending")
+        self.assertEqual(
+            store.reconcile()["pending_deliveries"][0]["kind"], "review"
+        )
 
     def test_execution_policy_commands_are_target_bound_and_fail_closed(self):
         context = self.success("trusted-context", self.root)

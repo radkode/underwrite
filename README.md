@@ -7,7 +7,8 @@ Most review tooling hands you a wall of findings and leaves the work of deciding
 This walks a change in causal order, one coherent unit per turn, and stops after each one
 so you steer. When something is worth flagging, the action names what happens next:
 Implement applies and verifies a branch fix, Include in review queues a finding for the
-GitHub review, and Record decision stores an answer whose words complete the work.
+GitHub review, and Include in report records a finding in the durable report.
+Record decision stores an answer whose words complete the work.
 
 ## Install
 
@@ -26,13 +27,15 @@ GitHub review, and Record decision stores an answer whose words complete the wor
 
 ## How a session goes
 
-**Ingest.** Freezes the PR's exact base and head, fetches both into a bare repository, and
-builds their three-dot diff locally. That avoids remote display limits and binds every
-later check to full commit IDs. The same capture freezes governing instructions from the
-base, separately from the untrusted head. It then reads the last twenty base commits
-touching those paths and the two or three earlier PRs the squash-merge subjects point at.
-That last one is not padding: prior work in the same area is reliably where the best
-finding comes from, because it is the context a diff cannot show you.
+**Ingest.** Freezes the PR's exact base and head, no-exec policy, and lifecycle-derived
+audience in one transaction, fetches both revisions into a bare repository, and builds
+their three-dot diff locally. Open PRs use review mode; every non-open PR, whether merged
+or closed without merge, uses report mode. That avoids remote display limits and binds
+every later check to full commit IDs. The same capture freezes governing instructions
+from the base, separately from the untrusted head. It then reads the last twenty base
+commits touching those paths and the two or three earlier PRs the squash-merge subjects
+point at. That last one is not padding: prior work in the same area is reliably where the
+best finding comes from, because it is the context a diff cannot show you.
 
 **Orient.** A short reconstruction of what the change is for, plus a claim check comparing
 the PR description against what the diff actually does. You confirm or correct it, and
@@ -62,12 +65,12 @@ owed. For local branch and working-tree targets, choosing Implement authorizes U
 to apply that intent and run verification. It does not claim that an exact patch already
 exists. PR snapshots are no-exec and keep implementation unavailable.
 
-**Land.** The medium is decided at ingest, from whether anyone will read it. Local branch
-and working-tree targets may land requested implementations as commits. An open PR with a
-review audience lands as a single GitHub review, anchor-validated first because one bad
-anchor rejects the whole thing. The review carries the frozen full head as `commit_id`, so
-a PR update cannot silently move the delivery onto code that was never walked. A stable
-hidden marker distinguishes that delivery from every older review on the same commit.
+**Finish.** Local branch and working-tree targets may land requested implementations as
+commits. An open PR lands accepted findings as one anchor-validated GitHub review. The
+review carries the frozen full head as `commit_id`, so a PR update cannot silently move
+delivery onto code that was never walked. A non-open PR has no open review delivery
+target, so Include in report makes the accepted SQLite beat its terminal report outcome.
+It does not call `land` or create a GitHub effect.
 
 ## Trust and execution
 
@@ -82,10 +85,11 @@ output as data. Governing repository instructions come only from the frozen base
 Changed `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, `CLAUDE.local.md`, contribution
 guidance, and ADRs are reviewed like any other change; they do not govern their own review.
 
-Every PR session freezes `no-exec` atomically with its target. Underwrite may inspect the
-hash-bound diff and frozen Git objects through its static readers, but it does not check
-out the head, install, build, test, lint, run repo scripts or interpreters, or invoke Git
-hooks and filters. Review comments, notes, navigation, and recorded decisions still work.
+Every PR session freezes `no-exec` and its lifecycle-derived audience atomically with its
+target. Underwrite may inspect the hash-bound diff and frozen Git objects through its
+static readers, but it does not check out the head, install, build, test, lint, run repo
+scripts or interpreters, or invoke Git hooks and filters. Review comments, report
+inclusions, notes, navigation, and recorded decisions still work.
 
 Underwrite does not currently create or attest a host sandbox, so it never accepts a
 caller-supplied sandbox label as authorization. A future execution path needs a host-issued
@@ -99,18 +103,17 @@ in as they are walked, ordered by what is owed rather than by what was walked: o
 expanded at the top, chosen resolutions next, clean beats collapsed to one line each that
 still carry their proof.
 
-Decisions happen there too. A PR in branch mode shows that implementation is blocked and
-keeps Drop and Save note available. Review mode uses Include in review and Drop. Local
-branch and working-tree sessions retain Implement. A policy question whose answer
-completes the work carries Record decision.
+Decisions happen there too. Review mode uses Include in review and Drop. Report mode uses
+Include in report and Drop. Local branch and working-tree sessions retain Implement. A
+policy question whose answer completes the work carries Record decision.
 Each has a field for putting the call in your own words, and Next beat advances the walk
 from anywhere. Clicking is what unblocks the terminal side, which parks on the server
 between beats rather than spinning. The terminal still takes the same answers in words,
 so closing the tab never strands a session.
 
-The labels describe the delegated effect without changing the durable protocol. Implement
-and Include in review both record the existing `accept` action. Record decision uses the
-existing `decide` action.
+The labels describe the delegated effect without changing the durable protocol. Implement,
+Include in review, and Include in report all record the existing `accept` action. Record
+decision uses the existing `decide` action.
 
 A no-exec PR review flow looks like this:
 
@@ -126,6 +129,10 @@ presents beat 6    ------>   beat 6 arrives
 final approval     ------>   one anchor-validated GitHub review is posted
 records the landing ------>  accepted beats show the review URL
 ```
+
+For a non-open PR, Include in report records `accept` and the accepted beat is complete in
+the SQLite-backed report immediately. There is no pending delivery, `land` call, or GitHub
+effect. `report.html` is a regenerable view of that durable state, not its delivery receipt.
 
 The server is loopback-only and takes no path from any request: every read and write is a
 fixed name inside the session directory. Loopback is not authentication on its own, so it
@@ -159,9 +166,11 @@ absolute application receipt. A crash before commit changes nothing; a crash aft
 resumes from the stored result without moving twice. Compatibility JSON is regenerated
 from SQLite and is never authoritative once the database exists. The `snapshot-pr`
 command in `sessionctl.py` records the write-once target, including the head repository
-and ref, plus the trusted base context and Git object bundle. It records the no-exec
-policy in the same transaction. `read-blob` and `context-log` are the argv-safe gateways
-for inspecting those frozen objects without checking out the PR.
+and ref, plus the trusted base context and Git object bundle. It records the no-exec policy
+and derives the PR audience from the captured lifecycle in the same transaction. Existing
+sessions keep their frozen audience; lifecycle drift requires a supervised replacement.
+`read-blob` and `context-log` are the argv-safe gateways for inspecting those frozen
+objects without checking out the PR.
 `check-pr` refuses a moved base, head, route, or lifecycle before an external effect, while
 `check-controller` requires the clean controller to remain at the frozen base. The frozen
 diff, trusted context, and object bundle are checked by byte count and SHA-256.
@@ -174,8 +183,9 @@ flag with no fix, a clean beat with no proof, or a proof naming no command gets 
 states and do not pretend to be completion: `Implementation pending` or `Implementation
 failed` in branch mode, `Included, review pending` or `Review publication failed` in
 review mode. A final render uses `--final` and rejects any chosen branch or review delivery
-that has not landed. Review mode omits that flag only for the preview before its GitHub
-POST. The page still renders when validation fails.
+that has not landed. Report accepts are already terminal and require no landing. Review
+mode omits that flag only for the preview before its GitHub POST. The page still renders
+when validation fails.
 `validate-anchors.py` snaps review comments to lines that exist in the diff and folds
 unsnappable ones into the body rather than dropping them.
 
