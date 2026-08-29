@@ -204,6 +204,7 @@ class FrozenSnapshotContract(unittest.TestCase):
         self.assertIn("the page and store always refuse branch acceptance", text)
         self.assertIn("PR targets never enter this path", text)
         self.assertIn("supervised replacement session", text)
+        self.assertIn("Never invoke it as review authorization", text)
         self.assertNotIn('check-worktree "$R" "$PWD"', text)
 
     def test_review_validation_and_delivery_share_the_frozen_head(self):
