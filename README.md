@@ -91,10 +91,16 @@ static readers, but it does not check out the head, install, build, test, lint, 
 scripts or interpreters, or invoke Git hooks and filters. Review comments, report
 inclusions, notes, navigation, and recorded decisions still work.
 
-Underwrite does not currently create or attest a host sandbox, so it never accepts a
-caller-supplied sandbox label as authorization. A future execution path needs a host-issued
-receipt bound to the frozen target and verified tree. Until that boundary exists, all PR
-code remains no-exec. Audience and execution policy are separate decisions.
+The host execution protocol is documented in
+[`docs/host-execution-protocol.md`](docs/host-execution-protocol.md). Its
+[`execution_receipt.py`](skills/underwrite/scripts/execution_receipt.py) module checks a
+signed receipt contract plus caller-supplied bindings through an out-of-band verifier. It
+does not provide signing keys, authenticate a host on its own, consume replay state, mutate
+sessions, or authorize execution.
+
+Underwrite still has no host attestation gateway and never accepts a caller-supplied
+sandbox label or a conforming receipt as authorization. Every PR session remains `no-exec`;
+audience and execution policy remain separate decisions.
 
 ## The page drives
 
