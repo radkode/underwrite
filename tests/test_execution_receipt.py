@@ -10,7 +10,7 @@ import json
 import subprocess
 import sys
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 
@@ -173,6 +173,19 @@ class SignatureRecorder:
         if self.error_at == call:
             raise RuntimeError("fixture signature rejection")
         return self.signer_ids[min(call, len(self.signer_ids) - 1)]
+
+
+class SigningRecorder:
+    def __init__(self, signature=SIGNATURE, error=None):
+        self.signature = signature
+        self.error = error
+        self.calls = []
+
+    def __call__(self, pae_bytes, keyid):
+        self.calls.append((pae_bytes, keyid))
+        if self.error is not None:
+            raise self.error
+        return self.signature
 
 
 class ReceiptCase(unittest.TestCase):
@@ -444,6 +457,222 @@ class PrimitiveContracts(ReceiptCase):
         callback = self.assert_capability_rejected(envelope=envelope)
 
         self.assertEqual(callback.calls, [])
+
+
+class ProducerContracts(ReceiptCase):
+    def test_producers_match_independent_fixtures_and_round_trip(self):
+        capability_expected = self.capability_expected()
+        receipt_expected = copy.deepcopy(self.expected)
+        capability_snapshot = copy.deepcopy(capability_expected)
+        receipt_snapshot = copy.deepcopy(receipt_expected)
+
+        capability_payload = execution_receipt.build_host_capability_payload(
+            capability_expected,
+            datetime(2026, 8, 29, 11, 55, tzinfo=timezone.utc),
+            datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc),
+        )
+        capability_signer = SigningRecorder()
+        capability_envelope = execution_receipt.build_dsse_envelope(
+            capability_payload, KEY_ID, capability_signer
+        )
+        receipt_payload = execution_receipt.build_execution_receipt_payload(
+            capability_payload,
+            receipt_expected,
+            datetime(2026, 8, 29, 11, 59, tzinfo=timezone.utc),
+            datetime(2026, 8, 29, 11, 59, 30, tzinfo=timezone.utc),
+        )
+        receipt_signer = SigningRecorder()
+        receipt_envelope = execution_receipt.build_dsse_envelope(
+            receipt_payload, KEY_ID, receipt_signer
+        )
+
+        self.assertIs(type(capability_payload), bytes)
+        self.assertIs(type(receipt_payload), bytes)
+        self.assertEqual(capability_payload, self.capability_payload)
+        self.assertEqual(receipt_payload, self.receipt_payload)
+        self.assertEqual(capability_envelope, self.capability_envelope)
+        self.assertEqual(receipt_envelope, self.receipt_envelope)
+        self.assertEqual(capability_expected, capability_snapshot)
+        self.assertEqual(receipt_expected, receipt_snapshot)
+        self.assertEqual(
+            capability_signer.calls,
+            [(fixture_pae(PAYLOAD_TYPE, capability_payload), KEY_ID)],
+        )
+        self.assertEqual(
+            receipt_signer.calls,
+            [(fixture_pae(PAYLOAD_TYPE, receipt_payload), KEY_ID)],
+        )
+
+        verified = execution_receipt.verify_execution_receipt(
+            capability_envelope,
+            receipt_envelope,
+            copy.deepcopy(self.expected),
+            SignatureRecorder(),
+            NOW,
+        )
+        self.assertEqual(verified.payload, receipt_payload)
+
+    def test_producers_normalize_aware_datetimes_to_canonical_utc(self):
+        central = timezone(timedelta(hours=-5))
+        issued_at = datetime(
+            2026, 8, 29, 6, 55, 0, 123400, tzinfo=central
+        )
+        expires_at = datetime(
+            2026, 8, 29, 6, 59, 59, 123400, tzinfo=central
+        )
+        capability_payload = execution_receipt.build_host_capability_payload(
+            self.capability_expected(), issued_at, expires_at
+        )
+        capability = json.loads(capability_payload)
+
+        self.assertEqual(
+            capability["predicate"]["issuedAt"],
+            "2026-08-29T11:55:00.123400Z",
+        )
+        self.assertEqual(
+            capability["predicate"]["expiresAt"],
+            "2026-08-29T11:59:59.123400Z",
+        )
+
+        receipt_payload = execution_receipt.build_execution_receipt_payload(
+            capability_payload,
+            copy.deepcopy(self.expected),
+            datetime(2026, 8, 29, 6, 59, 0, 500, tzinfo=central),
+            datetime(2026, 8, 29, 6, 59, 30, 500, tzinfo=central),
+        )
+        receipt = json.loads(receipt_payload)
+        self.assertEqual(
+            receipt["predicate"]["startedAt"],
+            "2026-08-29T11:59:00.000500Z",
+        )
+        self.assertEqual(
+            receipt["predicate"]["finishedAt"],
+            "2026-08-29T11:59:30.000500Z",
+        )
+
+    def test_receipt_producer_links_exact_capability_payload_bytes(self):
+        capability_payload = fixture_json_bytes(
+            self.capability_statement, pretty=True
+        )
+        receipt_payload = execution_receipt.build_execution_receipt_payload(
+            capability_payload,
+            copy.deepcopy(self.expected),
+            datetime(2026, 8, 29, 11, 59, tzinfo=timezone.utc),
+            datetime(2026, 8, 29, 11, 59, 30, tzinfo=timezone.utc),
+        )
+        receipt = json.loads(receipt_payload)
+
+        self.assertEqual(
+            receipt["predicate"]["capability"]["payloadSha256"],
+            hashlib.sha256(capability_payload).hexdigest(),
+        )
+        self.assertNotEqual(
+            receipt["predicate"]["capability"]["payloadSha256"],
+            hashlib.sha256(self.capability_payload).hexdigest(),
+        )
+
+        capability_envelope = execution_receipt.build_dsse_envelope(
+            capability_payload, KEY_ID, SigningRecorder()
+        )
+        receipt_envelope = execution_receipt.build_dsse_envelope(
+            receipt_payload, KEY_ID, SigningRecorder()
+        )
+        verified = execution_receipt.verify_execution_receipt(
+            capability_envelope,
+            receipt_envelope,
+            copy.deepcopy(self.expected),
+            SignatureRecorder(),
+            NOW,
+        )
+        self.assertEqual(verified.payload, receipt_payload)
+
+    def test_payload_builders_reject_untrusted_or_inconsistent_inputs(self):
+        naive = datetime(2026, 8, 29, 11, 55)
+        valid_issue = datetime(2026, 8, 29, 11, 55, tzinfo=timezone.utc)
+        valid_expiry = datetime(2026, 8, 29, 12, 0, tzinfo=timezone.utc)
+
+        with self.assertRaises(execution_receipt.ReceiptError):
+            execution_receipt.build_host_capability_payload(
+                self.capability_expected(), naive, valid_expiry
+            )
+        with self.assertRaises(execution_receipt.ReceiptError):
+            execution_receipt.build_host_capability_payload(
+                self.capability_expected(),
+                valid_issue,
+                valid_expiry + timedelta(microseconds=1),
+            )
+
+        malformed_expected = self.capability_expected()
+        malformed_expected["target"]["number"] = 0
+        with self.assertRaises(execution_receipt.ReceiptError):
+            execution_receipt.build_host_capability_payload(
+                malformed_expected, valid_issue, valid_expiry
+            )
+
+        wrong_context = copy.deepcopy(self.expected)
+        wrong_context["executorId"] = OTHER_EXECUTOR_ID
+        with self.assertRaises(execution_receipt.ReceiptError):
+            execution_receipt.build_execution_receipt_payload(
+                self.capability_payload,
+                wrong_context,
+                datetime(2026, 8, 29, 11, 59, tzinfo=timezone.utc),
+                datetime(2026, 8, 29, 11, 59, 30, tzinfo=timezone.utc),
+            )
+
+        invalid_result = copy.deepcopy(self.expected)
+        invalid_result["stderr"]["truncated"] = True
+        with self.assertRaises(execution_receipt.ReceiptError):
+            execution_receipt.build_execution_receipt_payload(
+                self.capability_payload,
+                invalid_result,
+                datetime(2026, 8, 29, 11, 59, tzinfo=timezone.utc),
+                datetime(2026, 8, 29, 11, 59, 30, tzinfo=timezone.utc),
+            )
+
+        with self.assertRaises(execution_receipt.ReceiptError):
+            execution_receipt.build_execution_receipt_payload(
+                self.capability_payload,
+                copy.deepcopy(self.expected),
+                valid_expiry,
+                valid_expiry,
+            )
+
+    def test_envelope_builder_is_fail_closed_around_the_signer(self):
+        signer = SigningRecorder()
+        for name, payload, keyid, callback in (
+            ("non-json payload", b"not JSON", KEY_ID, signer),
+            ("empty keyid", self.capability_payload, "", signer),
+            ("non-callable signer", self.capability_payload, KEY_ID, None),
+        ):
+            with self.subTest(name=name):
+                with self.assertRaises(execution_receipt.ReceiptError):
+                    execution_receipt.build_dsse_envelope(
+                        payload, keyid, callback
+                    )
+        self.assertEqual(signer.calls, [])
+
+        for name, signature in (
+            ("non-bytes", "signature"),
+            ("empty", b""),
+            ("oversized", b"x" * (execution_receipt.MAX_SIGNATURE_BYTES + 1)),
+        ):
+            with self.subTest(name=name):
+                callback = SigningRecorder(signature=signature)
+                with self.assertRaises(execution_receipt.ReceiptError):
+                    execution_receipt.build_dsse_envelope(
+                        self.capability_payload, KEY_ID, callback
+                    )
+                self.assertEqual(
+                    callback.calls,
+                    [(fixture_pae(PAYLOAD_TYPE, self.capability_payload), KEY_ID)],
+                )
+
+        callback = SigningRecorder(error=RuntimeError("signer unavailable"))
+        with self.assertRaises(execution_receipt.ReceiptError) as raised:
+            execution_receipt.build_dsse_envelope(
+                self.capability_payload, KEY_ID, callback
+            )
+        self.assertIsInstance(raised.exception.__cause__, RuntimeError)
 
 
 class StrictEnvelopeParsing(ReceiptCase):

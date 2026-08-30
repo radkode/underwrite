@@ -166,6 +166,10 @@ def _canonical_value(value, label="canonical JSON"):
 
 def canonical_sha256(value):
     """Hash the deterministic JSON encoding used by the v1 binding fields."""
+    return hashlib.sha256(_canonical_json_bytes(value)).hexdigest()
+
+
+def _canonical_json_bytes(value, label="canonical JSON", maximum=None):
     _canonical_value(value)
     try:
         encoded = json.dumps(
@@ -175,8 +179,10 @@ def canonical_sha256(value):
             sort_keys=True,
         ).encode("utf-8")
     except (TypeError, ValueError, UnicodeEncodeError) as error:
-        raise ReceiptError("value cannot be encoded as canonical JSON") from error
-    return hashlib.sha256(encoded).hexdigest()
+        raise ReceiptError(f"{label} cannot be encoded as canonical JSON") from error
+    if maximum is not None and len(encoded) > maximum:
+        raise ReceiptError(f"{label} exceeds {maximum} bytes")
+    return encoded
 
 
 def dsse_pae(payload_type, payload):
@@ -298,12 +304,22 @@ def _timestamp(value, label):
 
 
 def _now(value):
+    return _trusted_datetime(value, "now")
+
+
+def _trusted_datetime(value, label):
     if not isinstance(value, datetime) or value.tzinfo is None:
-        raise ReceiptError("now must be a timezone-aware datetime")
+        raise ReceiptError(f"{label} must be a timezone-aware datetime")
     offset = value.utcoffset()
     if offset is None:
-        raise ReceiptError("now must be a timezone-aware datetime")
+        raise ReceiptError(f"{label} must be a timezone-aware datetime")
     return value.astimezone(timezone.utc)
+
+
+def _timestamp_text(value, label):
+    value = _trusted_datetime(value, label)
+    timespec = "microseconds" if value.microsecond else "seconds"
+    return value.isoformat(timespec=timespec).replace("+00:00", "Z")
 
 
 def _decode_base64(value, label, maximum):
@@ -624,10 +640,7 @@ def _subject(value, name, tree):
         raise ReceiptError("in-toto Statement subject does not match expected tree")
 
 
-def _capability(envelope, expected, verify_signature):
-    attestation, raw_statement = _verified_envelope(
-        envelope, expected["signerId"], verify_signature
-    )
+def _validate_capability_statement(raw_statement, expected):
     statement = _statement(raw_statement, CAPABILITY_PREDICATE_TYPE)
     _subject(statement["subject"], "underwrite-execution-input", expected["inputTree"])
     predicate = _object(
@@ -652,7 +665,227 @@ def _capability(envelope, expected, verify_signature):
         raise ReceiptError(
             "host capability lifetime must be positive and at most 300 seconds"
         )
+    return issued_at, expires_at
+
+
+def _validate_capability_payload(payload, expected):
+    raw_statement = _load_json(
+        payload, "host capability payload", MAX_PAYLOAD_BYTES
+    )
+    issued_at, expires_at = _validate_capability_statement(
+        raw_statement, expected
+    )
+    return hashlib.sha256(payload).hexdigest(), issued_at, expires_at
+
+
+def _capability(envelope, expected, verify_signature):
+    attestation, raw_statement = _verified_envelope(
+        envelope, expected["signerId"], verify_signature
+    )
+    issued_at, expires_at = _validate_capability_statement(
+        raw_statement, expected
+    )
     return attestation, issued_at, expires_at
+
+
+def _complete_result(expected):
+    return {
+        "status": "exited",
+        "exitCode": expected["exitCode"],
+        "signal": None,
+        "timedOut": False,
+        "resourceViolation": None,
+        "isolationViolation": None,
+        "survivingProcesses": 0,
+        "teardown": "complete",
+    }
+
+
+def _validate_execution_statement(
+    raw_statement,
+    expected,
+    capability_payload_sha256,
+    issued_at,
+    expires_at,
+    now,
+):
+    statement = _statement(raw_statement, EXECUTION_PREDICATE_TYPE)
+    _subject(
+        statement["subject"],
+        "underwrite-execution-output",
+        expected["outputTree"],
+    )
+    predicate = _object(
+        statement["predicate"],
+        "execution receipt predicate",
+        {
+            "executor",
+            "capability",
+            "startedAt",
+            "finishedAt",
+            "invocation",
+            "outputTree",
+            "outputBundle",
+            "result",
+            "streams",
+        },
+    )
+    _match(
+        predicate["executor"],
+        {"id": expected["executorId"]},
+        "execution receipt executor",
+    )
+    _match(
+        predicate["capability"],
+        {"payloadSha256": capability_payload_sha256},
+        "execution receipt capability",
+    )
+    _match(
+        predicate["invocation"],
+        _invocation(expected),
+        "execution receipt invocation",
+    )
+    output_tree = {"gitTree": expected["outputTree"]}
+    _match(predicate["outputTree"], output_tree, "execution receipt outputTree")
+    expected_bundle = {
+        "gitTree": expected["outputTree"],
+        "sha256": expected["outputBundle"]["sha256"],
+        "bytes": expected["outputBundle"]["bytes"],
+    }
+    _match(
+        predicate["outputBundle"],
+        expected_bundle,
+        "execution receipt outputBundle",
+    )
+    _match(
+        predicate["result"],
+        _complete_result(expected),
+        "execution receipt complete result",
+    )
+    expected_streams = {
+        "stdout": expected["stdout"],
+        "stderr": expected["stderr"],
+    }
+    _match(predicate["streams"], expected_streams, "execution receipt streams")
+    started_at = _timestamp(predicate["startedAt"], "execution receipt startedAt")
+    finished_at = _timestamp(predicate["finishedAt"], "execution receipt finishedAt")
+    if started_at < issued_at or started_at >= expires_at:
+        raise ReceiptError("execution did not start within the capability lifetime")
+    if finished_at < started_at:
+        raise ReceiptError("execution receipt finished before it started")
+    if finished_at > now:
+        raise ReceiptError("execution receipt finished in the future")
+    wall_seconds = expected["sandbox"]["limits"]["wallSeconds"]
+    if (finished_at - started_at).total_seconds() > wall_seconds:
+        raise ReceiptError("execution exceeded the attested wall-clock limit")
+
+
+def build_host_capability_payload(expected, issued_at, expires_at):
+    """Build canonical host capability Statement bytes from trusted context."""
+    expected = _expected(expected, execution=False)
+    statement = {
+        "_type": STATEMENT_TYPE,
+        "subject": [
+            {
+                "name": "underwrite-execution-input",
+                "digest": {"gitTree": expected["inputTree"]},
+            }
+        ],
+        "predicateType": CAPABILITY_PREDICATE_TYPE,
+        "predicate": {
+            "executor": {"id": expected["executorId"]},
+            "issuedAt": _timestamp_text(issued_at, "issued_at"),
+            "expiresAt": _timestamp_text(expires_at, "expires_at"),
+            "invocation": _invocation(expected),
+        },
+    }
+    _validate_capability_statement(statement, expected)
+    return _canonical_json_bytes(
+        statement, "host capability payload", MAX_PAYLOAD_BYTES
+    )
+
+
+def build_execution_receipt_payload(
+    capability_payload,
+    expected,
+    started_at,
+    finished_at,
+):
+    """Build canonical execution receipt Statement bytes linked to a capability."""
+    expected = _expected(expected, execution=True)
+    common = {field: expected[field] for field in _COMMON_EXPECTED_FIELDS}
+    capability_sha256, issued_at, expires_at = _validate_capability_payload(
+        capability_payload, common
+    )
+    finished_datetime = _trusted_datetime(finished_at, "finished_at")
+    statement = {
+        "_type": STATEMENT_TYPE,
+        "subject": [
+            {
+                "name": "underwrite-execution-output",
+                "digest": {"gitTree": expected["outputTree"]},
+            }
+        ],
+        "predicateType": EXECUTION_PREDICATE_TYPE,
+        "predicate": {
+            "executor": {"id": expected["executorId"]},
+            "capability": {"payloadSha256": capability_sha256},
+            "startedAt": _timestamp_text(started_at, "started_at"),
+            "finishedAt": _timestamp_text(finished_datetime, "finished_at"),
+            "invocation": _invocation(expected),
+            "outputTree": {"gitTree": expected["outputTree"]},
+            "outputBundle": {
+                "gitTree": expected["outputTree"],
+                "sha256": expected["outputBundle"]["sha256"],
+                "bytes": expected["outputBundle"]["bytes"],
+            },
+            "result": _complete_result(expected),
+            "streams": {
+                "stdout": expected["stdout"],
+                "stderr": expected["stderr"],
+            },
+        },
+    }
+    _validate_execution_statement(
+        statement,
+        expected,
+        capability_sha256,
+        issued_at,
+        expires_at,
+        finished_datetime,
+    )
+    return _canonical_json_bytes(
+        statement, "execution receipt payload", MAX_PAYLOAD_BYTES
+    )
+
+
+def build_dsse_envelope(payload, keyid, sign):
+    """Sign exact payload bytes and build one canonical DSSE envelope."""
+    _load_json(payload, "signed in-toto payload", MAX_PAYLOAD_BYTES)
+    keyid = _text(keyid, "DSSE keyid")
+    if not callable(sign):
+        raise ReceiptError("sign must be callable")
+    try:
+        signature = sign(dsse_pae(DSSE_PAYLOAD_TYPE, payload), keyid)
+    except Exception as error:
+        raise ReceiptError("DSSE signing failed") from error
+    if type(signature) is not bytes or not signature:
+        raise ReceiptError("sign must return non-empty signature bytes")
+    if len(signature) > MAX_SIGNATURE_BYTES:
+        raise ReceiptError(
+            f"DSSE signature exceeds {MAX_SIGNATURE_BYTES} bytes"
+        )
+    envelope = {
+        "payloadType": DSSE_PAYLOAD_TYPE,
+        "payload": base64.b64encode(payload).decode("ascii"),
+        "signatures": [
+            {
+                "keyid": keyid,
+                "sig": base64.b64encode(signature).decode("ascii"),
+            }
+        ],
+    }
+    return _canonical_json_bytes(envelope, "DSSE envelope", MAX_ENVELOPE_BYTES)
 
 
 def verify_host_capability(envelope, expected, verify_signature, now):
@@ -684,83 +917,12 @@ def verify_execution_receipt(
     receipt, raw_statement = _verified_envelope(
         receipt_envelope, expected["signerId"], verify_signature
     )
-    statement = _statement(raw_statement, EXECUTION_PREDICATE_TYPE)
-    _subject(
-        statement["subject"],
-        "underwrite-execution-output",
-        expected["outputTree"],
+    _validate_execution_statement(
+        raw_statement,
+        expected,
+        capability.payload_sha256,
+        issued_at,
+        expires_at,
+        now,
     )
-    predicate = _object(
-        statement["predicate"],
-        "execution receipt predicate",
-        {
-            "executor",
-            "capability",
-            "startedAt",
-            "finishedAt",
-            "invocation",
-            "outputTree",
-            "outputBundle",
-            "result",
-            "streams",
-        },
-    )
-    _match(
-        predicate["executor"],
-        {"id": expected["executorId"]},
-        "execution receipt executor",
-    )
-    _match(
-        predicate["capability"],
-        {"payloadSha256": capability.payload_sha256},
-        "execution receipt capability",
-    )
-    _match(
-        predicate["invocation"],
-        _invocation(expected),
-        "execution receipt invocation",
-    )
-    output_tree = {"gitTree": expected["outputTree"]}
-    _match(predicate["outputTree"], output_tree, "execution receipt outputTree")
-    expected_bundle = {
-        "gitTree": expected["outputTree"],
-        "sha256": expected["outputBundle"]["sha256"],
-        "bytes": expected["outputBundle"]["bytes"],
-    }
-    _match(
-        predicate["outputBundle"],
-        expected_bundle,
-        "execution receipt outputBundle",
-    )
-    expected_result = {
-        "status": "exited",
-        "exitCode": expected["exitCode"],
-        "signal": None,
-        "timedOut": False,
-        "resourceViolation": None,
-        "isolationViolation": None,
-        "survivingProcesses": 0,
-        "teardown": "complete",
-    }
-    _match(
-        predicate["result"],
-        expected_result,
-        "execution receipt complete result",
-    )
-    expected_streams = {
-        "stdout": expected["stdout"],
-        "stderr": expected["stderr"],
-    }
-    _match(predicate["streams"], expected_streams, "execution receipt streams")
-    started_at = _timestamp(predicate["startedAt"], "execution receipt startedAt")
-    finished_at = _timestamp(predicate["finishedAt"], "execution receipt finishedAt")
-    if started_at < issued_at or started_at >= expires_at:
-        raise ReceiptError("execution did not start within the capability lifetime")
-    if finished_at < started_at:
-        raise ReceiptError("execution receipt finished before it started")
-    if finished_at > now:
-        raise ReceiptError("execution receipt finished in the future")
-    wall_seconds = expected["sandbox"]["limits"]["wallSeconds"]
-    if (finished_at - started_at).total_seconds() > wall_seconds:
-        raise ReceiptError("execution exceeded the attested wall-clock limit")
     return receipt
