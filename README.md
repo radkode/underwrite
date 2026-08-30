@@ -98,9 +98,12 @@ signed receipt contract plus caller-supplied bindings through an out-of-band ver
 does not provide signing keys, authenticate a host on its own, consume replay state, mutate
 sessions, or authorize execution.
 
-Underwrite still has no host attestation gateway and never accepts a caller-supplied
-sandbox label or a conforming receipt as authorization. Every PR session remains `no-exec`;
-audience and execution policy remain separate decisions.
+The repository includes a standalone privileged host gateway in
+[`gateway/`](gateway/README.md), but the current Underwrite workflow does not invoke it and
+never accepts a caller-supplied sandbox label or conforming receipt as authorization. Every
+PR session remains `no-exec`; audience and execution policy remain separate decisions.
+The gateway must run in its own supervised process because it installs process-wide host
+resource limits before handling untrusted artifacts.
 
 ## The page drives
 

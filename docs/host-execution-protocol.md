@@ -215,12 +215,12 @@ The capability and receipt contain the same invocation object:
     "gitFilters": "disabled",
     "timeout": "enforced",
     "limits": {
-      "wallSeconds": 900,
-      "cpuSeconds": 600,
-      "memoryBytes": 4294967296,
-      "processes": 256,
-      "workspaceBytes": 1073741824,
-      "outputBytes": 16777216
+      "wallSeconds": 60,
+      "cpuSeconds": 30,
+      "memoryBytes": 134217728,
+      "processes": 1,
+      "workspaceBytes": 67108864,
+      "outputBytes": 1048576
     }
   }
 }
@@ -239,8 +239,8 @@ tuple before issuing a capability and permit at most one job and one terminal re
 it.
 
 The version 1 envelope validator has no replay-store input and does not consume this tuple.
-DD-2174 must add the integration that consumes the tuple and capability payload digest
-transactionally before accepting a receipt. A byte-identical replay MAY return the already
+The gateway integration consumes the tuple and capability payload digest transactionally
+before accepting a receipt. A byte-identical replay MAY return the already
 recorded result. Any reuse with a different capability, invocation, receipt, or artifact
 is a conflict and MUST be rejected.
 
@@ -537,7 +537,7 @@ stderr bytes. It compares signed fields with caller-owned expected descriptors. 
 descriptors are trustworthy only when an independent integration derives them from the
 actual bytes rather than copying them from an envelope or an untrusted job.
 
-DD-2174 must add this integration. For the source bundle it MUST:
+For the source bundle, the gateway integration MUST:
 
 1. Check its exact byte count and SHA-256 against `sourceBundle`.
 2. Check those values against the frozen target's `object_bundle_bytes` and
@@ -628,7 +628,7 @@ Validation proceeds in this order:
 Every comparison is fail closed. A validator failure returns no execution authority, even
 when some independent evidence inside the artifacts is valid.
 
-DD-2174 is responsible for deriving the expected descriptors, verifying artifacts as
+The gateway is responsible for deriving the expected descriptors, verifying artifacts as
 described above, reserving and consuming replay identity, calling this validator, and
 persisting the capability, receipt, artifacts, signer identity, and validation result in
 one authoritative transaction.

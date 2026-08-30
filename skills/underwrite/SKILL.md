@@ -131,16 +131,15 @@ this session, even when the PR adds a governing file where the base had none.
 
 **The capture freezes the target, `no-exec` policy, and derived audience in one transaction
 before returning.** Every PR head is untrusted executable input, independently of audience,
-author, fork status, reviews, or merge state. Underwrite has no host attestation gateway,
-so a caller-supplied sandbox label is never authorization.
+author, fork status, reviews, or merge state. Underwrite does not invoke the standalone host
+gateway, so a caller-supplied sandbox label is never authorization.
 Do not check out or execute the head. Legacy PR sessions that lack the current frozen
 context require a supervised replacement.
 
-The standalone protocol in `docs/host-execution-protocol.md` and
-`scripts/execution_receipt.py` is for host integrators only. It checks a signed receipt
-contract plus caller-supplied bindings through an out-of-band verifier. It does not provide
-keys, authenticate a host on its own, consume replay state, mutate sessions, or authorize
-execution. Never invoke it as review authorization. Every PR review remains `no-exec`.
+The standalone gateway, `docs/host-execution-protocol.md`, and
+`scripts/execution_receipt.py` are for host integrators only. The gateway can enforce and
+persist a signed execution, but it does not mutate sessions or authorize a review effect.
+Never invoke it as review authorization. Every PR review remains `no-exec`.
 
 After the snapshot is frozen, run these contextual reads in parallel:
 
