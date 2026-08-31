@@ -131,15 +131,18 @@ this session, even when the PR adds a governing file where the base had none.
 
 **The capture freezes the target, `no-exec` policy, and derived audience in one transaction
 before returning.** Every PR head is untrusted executable input, independently of audience,
-author, fork status, reviews, or merge state. Underwrite does not invoke the standalone host
-gateway, so a caller-supplied sandbox label is never authorization.
+author, fork status, reviews, or merge state. The source review or report session does not
+invoke the standalone host gateway, so a caller-supplied sandbox label is never
+authorization.
 Do not check out or execute the head. Legacy PR sessions that lack the current frozen
 context require a supervised replacement.
 
 The standalone gateway, `docs/host-execution-protocol.md`, and
-`scripts/execution_receipt.py` are for host integrators only. The gateway can enforce and
-persist a signed execution, but it does not mutate sessions or authorize a review effect.
-Never invoke it as review authorization. Every PR review remains `no-exec`.
+`scripts/execution_receipt.py` define the host trust boundary. The gateway can enforce and
+persist a signed execution, but its receipt does not authorize a review effect or mutate a
+source session. Never invoke it as review authorization. Every PR source remains `no_exec`.
+Only the separate linked implementation flow below may create a `gateway_attested` child
+after a distinct implementation approval.
 
 After the snapshot is frozen, run these contextual reads in parallel:
 
@@ -169,6 +172,11 @@ usable only while the frozen target and trusted-base controller still match.
 | local branch or working tree | `branch` |
 | open PR | `review` |
 | non-open PR, merged or closed without merge | `report` |
+
+`gateway_attested` is an execution policy, not another audience. A linked implementation
+child has branch audience because its reader is a local commit, but it is constructed from
+one frozen source finding instead of reclassifying the PR session. Normal ingest never
+chooses that mode.
 
 For a PR, `snapshot-pr` derives this audience from the captured lifecycle and freezes it
 with the target and policy. Do not patch it afterward. An open review session that later
@@ -206,8 +214,9 @@ not see that anywhere." Say so explicitly when the claims hold up.
 State the frozen audience and lifecycle in one line here. Correct a bad capture with a
 supervised replacement, never an in-session audience change.
 
-State the execution policy separately: PR snapshots are `no-exec` and use static evidence
-only. Never describe review audience as execution trust.
+State the execution policy separately: source PR snapshots are `no_exec` and use static
+evidence only. Never describe review audience as execution trust. A linked child, if later
+authorized, is a separate session and does not change this statement.
 
 Then wait. The reviewer confirms or corrects your reconstruction, and their correction
 frames the rest of the walk.
@@ -252,6 +261,11 @@ Include in review, and Include in report all post the canonical `accept` action.
 Record decision posts the existing `decide` action. New ordinary flags persist
 `resolution_kind: "delivery"`.
 Imported legacy beats may omit the field and retain their earlier transition rules.
+
+A linked implementation child is not a second browser walk. Its one accepted beat and
+action are copied from the separately authorized source finding, and ordinary `/act`
+requests are refused. Drive its reserved execution and landing only through
+`implementationctl.py`.
 
 **Say what you are doing.** The page cannot see you work, and "busy" and "waiting on you"
 look identical on disk, so the controls stay disabled until you say you are parked. POST
@@ -359,11 +373,12 @@ the final GitHub review. In report mode, Include in report records the finding i
 durable report. All three clicks have already posted the canonical `accept` action, which
 flips the beat's `state` and records the reviewer's words as `call`.
 
-For a PR, the page and store always refuse branch acceptance. Keep the flag open, explain
-that PR execution is not supported in this release, and do not post `accept` from the
-terminal. Include in review, Include in report, Drop, notes, navigation, and decision-only
-answers remain available because they do not execute the head. Local branch and
-working-tree targets retain their existing execution behavior.
+For a PR source, the page and store always refuse branch acceptance. Include in review,
+Include in report, Drop, notes, navigation, and decision-only answers remain available
+because they do not execute the head. Direct PR execution is not supported. The only PR
+implementation path is the separately approved linked child described below; it never
+changes the source audience or `no_exec` policy. Local branch and working-tree targets
+retain their existing execution behavior.
 
 An answer in words has reached nothing. Before posting it, read `/state` and retain its
 `session_id`. If `seq` and `handled_seq` differ, handle and acknowledge the older
@@ -424,6 +439,124 @@ to reconcile. Do not call `land`, create a `lands[]` entry, or use `report.html`
 receipt. Acceptance freezes the agent-authored finding text and evidence. Refine them
 before presenting the beat, not after the reviewer includes it.
 
+### Linked PR implementation
+
+Including a finding in review or report is not implementation permission. After its source
+`accept` has been acknowledged, obtain a separate explicit approval to implement that one
+finding. Record the approving actor and their exact words by creating the link:
+
+The trusted controller must hold exclusive operational access to the implementation
+repository and both session directories while `link` or `land` runs. Do not create a
+worktree, check out the generated branch, or update its ref concurrently. The implementation
+repository requires Git 2.36 or newer so object and reference writes can be explicitly
+hardened against power loss. Keep the source session, `implementations/` tree, and local Git
+metadata on private local POSIX storage that gateway jobs and other untrusted or concurrent
+principals cannot modify.
+
+```bash
+$S/scripts/implementationctl.py link "$R" "$PWD" \
+  --seq <source-accept-seq> --beat <beat> \
+  --actor '<approving identity>' --approval '<explicit implementation approval>'
+```
+
+`link` rechecks the live PR, binds the source session, accept action, exact beat revision,
+frozen target, actor, and approval, then creates
+`$R/implementations/<link-id>/`. Call that child directory `$C`. It contains exactly the
+one approved finding, branch audience, `gateway_attested` execution, and a generated
+`underwrite/implementation-<id>` local branch seeded from the frozen head. The source
+review or report delivery remains independent. Repeating the same authorization resumes
+the same child; changing it for the same source action is a conflict. `link` records the
+actor label but does not authenticate it. Establish the approver's identity and authority
+through the trusted controller before calling the command.
+
+The host operator supplies a trusted profile `$P` outside the repository, session, and
+gateway result. It contains exactly `version`, `keyId`, `signerId`, `executorId`, `job`,
+`sandbox`, and `exitCode`. The operator also supplies an absolute pinned P-256 public key
+path `$K`; never take either value from target code, returned evidence, or an envelope. The
+profile is limited to 256 KiB, its canonical request to 384 KiB, `job.cwd` to 4,096 UTF-8
+bytes with 255 bytes per component, the executable path to 4,095 bytes with the same
+component limit, the complete Linux exec vector to 128 KiB, and `exitCode` to 0 through 255.
+Reserve the request:
+
+```bash
+$S/scripts/implementationctl.py request "$C" "$R" "$P"
+```
+
+`request` rechecks the PR and binds a fresh challenge and attempt to the child action. A
+retry returns the existing nonfailed attempt unchanged. Only a definitely failed attempt
+gets a new number and challenge. It prints the request object as JSON. The trusted adapter
+submits that object to the gateway; the later evidence file must be the gateway's exact
+canonical `StoredExecution.request` bytes, not a copy of terminal formatting.
+
+If the supervised gateway definitely reports that it did not produce a receipt, record
+that outcome before requesting a fresh attempt:
+
+```bash
+$S/scripts/implementationctl.py fail "$C" "$R" \
+  --attempt <attempt> --reason '<definite gateway failure>'
+```
+
+Do not use `fail` for a bad evidence path, wrong local key, malformed transport, or failed
+consumer verification. Those errors leave the same reserved attempt available for a
+corrected, byte-identical handoff.
+
+The supervised host adapter must return a real directory `$E` containing exactly these six
+entries and no others:
+
+```
+request.json
+capability.dsse.json
+receipt.dsse.json
+output.bundle
+stdout
+stderr
+```
+
+Each entry is an independently readable, single-link regular file. Consume it with the
+same trusted profile and the pinned public key:
+
+```bash
+$S/scripts/implementationctl.py consume "$C" "$R" "$P" "$K" "$E"
+```
+
+`consume` requires the request bytes to equal the reserved request, verifies the frozen
+source bundle and returned output bundle in fresh quarantines, hashes both complete
+streams, verifies both DSSE signatures under `$K`, requires its fingerprint to match
+`keyId`, and checks the exact signer, executor, target, action, job, sandbox, trees, bundle,
+streams, and exit code. It then copies the exact evidence into
+`$C/implementation-evidence/<attempt>/` and records its digests in the child database.
+Neither the gateway's own validation record nor a conforming envelope substitutes for
+these checks.
+
+Land only an attempt reported as verified:
+
+```bash
+$S/scripts/implementationctl.py land "$C" "$R" "$PWD" \
+  --attempt <attempt> --message '<commit message>'
+```
+
+`land` materializes the verified output, creates a local SHA-1 commit whose only parent is
+the frozen PR head, and remeasures that commit against the signed synthetic SHA-256 output
+tree. It persists the exact commit plan before changing a ref, refuses a branch checked out
+in any worktree, rechecks the live PR, and compare-and-swap updates the generated branch
+only when it still names the frozen head. Git object, pack-metadata, and reference writes
+use explicit `fsync` durability. Landing permits at most 20,000 output entries and has one
+180-second deadline across verification, materialization, Git object creation, measurement,
+live PR checks, and the ref update. It does not check out the branch, alter the working tree,
+run hooks or filters, or push.
+
+All five commands are recoverable. An identical `consume` pins the same profile and public
+key, then compares all six incoming files with the persisted verified evidence. That exact
+replay remains valid after the original capability window closes. An identical `land`
+resumes its persisted commit plan and can finish the SQLite receipt if the ref already
+names that commit. A reserved attempt rejects a changed profile, verified evidence is
+immutable, and a prepared landing rejects a changed message, commit, branch, or ref
+position. Exit 2 from `link`, `request`, or the pre-update `land` check means the PR moved
+and requires a replacement source snapshot. If the PR moves only after the local
+compare-and-swap, `land` preserves the commit and receipt and returns
+`replacement_required: true`. Report that stale landing and stop. Never refresh either
+session in place or cause another effect.
+
 When the flag itself is a decision whose words complete the work and do not need to reach
 the PR audience as a finding, set top-level `resolution_kind: "decision"` before presenting
 the beat. Record decision then posts `decide` and moves the beat directly to `decided`. A
@@ -483,7 +616,10 @@ local `$R/report.html` path instead.
 `git log --oneline`, and offer to push and open a PR. Do not do either unasked. A session
 with no requested implementations leaves no branch at all, which is correct. This
 implementation path is only for local branch and working-tree targets. A PR in branch
-mode is a static audit and cannot have accepted commit deliveries.
+mode is a static audit and cannot have accepted commit deliveries. A linked
+`gateway_attested` child is the separate exception described above. Report its generated
+local branch and exact commit, but do not push or open a PR as part of that flow. Any later
+publication is a new operation with its own explicit authorization.
 
 **Report mode.** Run the final render after the walk. Include in report has already made
 each accepted beat terminal in SQLite, so there is no pending external delivery to land
@@ -611,6 +747,15 @@ pr.bundle        frozen base and head Git objects, hash-bound to the target
 trusted-context.json  frozen base instructions, hash-bound to the target
 serve.json       running server URL and pid, removed when it exits
 report.html      rendered, regenerable, throwaway
+implementations/<link-id>/  one source-bound implementation child
+  session.sqlite3           authoritative attempt, evidence, plan, and landing state
+  implementation-evidence/<attempt>/
+    request.json            exact reserved request
+    capability.dsse.json    signed host capability
+    receipt.dsse.json       signed execution receipt
+    output.bundle           verified output transport
+    stdout                  complete captured standard output
+    stderr                  complete captured standard error
 ```
 
 All mutations go through `sessionctl.py` or the server's `/act` endpoint. All reads used

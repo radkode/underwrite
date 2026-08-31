@@ -6,18 +6,21 @@ import hashlib
 import json
 import os
 import re
+import secrets
+import shutil
 import sqlite3
+import stat
 import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
 
-DB_SCHEMA_VERSION = 4
+DB_SCHEMA_VERSION = 5
 SCHEMA_VERSION = 1
 DELIVERY_VERSION = 1
 EXECUTION_POLICY_VERSION = 1
-EXECUTION_MODES = ("no_exec",)
+EXECUTION_MODES = ("no_exec", "gateway_attested")
 AUDIENCE_MODES = ("branch", "review", "report")
 BEAT_SLOTS = ("what", "why", "proof", "risk", "prior", "fix")
 BEAT_STATES = ("clean", "flag", "unverified", "accepted", "dropped", "decided")
@@ -29,6 +32,8 @@ BLOCKED_REPLACEMENT_DELIVERY_SUFFIX = (
     "; start a supervised replacement; do not perform external delivery"
 )
 MAX_OBJECT_BUNDLE_MEMORY_BYTES = 64 * 1024 * 1024
+MAX_IMPLEMENTATION_PROFILE_BYTES = 256 * 1024
+MAX_IMPLEMENTATION_REQUEST_BYTES = 384 * 1024
 ACTIONS = ("accept", "drop", "decide", "note", "next", "back", "skip")
 NAVIGATION = ("next", "back", "skip")
 RESOLVE = {"accept": "accepted", "drop": "dropped", "decide": "decided"}
@@ -73,6 +78,15 @@ _EXECUTION_TARGET_FIELDS = (
     "head_sha",
     "diff_sha256",
 )
+_TRUSTED_PROFILE_FIELDS = {
+    "version", "keyId", "signerId", "executorId", "job", "sandbox", "exitCode"
+}
+_IMPLEMENTATION_EVIDENCE_FIELDS = {
+    "version", "requestSha256", "keyId", "signerId", "executorId",
+    "capabilitySha256", "receiptSha256", "inputTree", "outputTree",
+    "outputBundle", "stdout", "stderr", "exitCode",
+}
+_COMMIT_PLAN_FIELDS = {"version", "commit", "parent", "tree", "outputTree", "branch"}
 
 
 class StoreError(ValueError):
@@ -277,6 +291,109 @@ def _file_identity(path):
     return digest.hexdigest(), size
 
 
+def _bounded_file_identity(path, expected_size, label):
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise Conflict("target verification requires no-follow file opens")
+    try:
+        descriptor = os.open(
+            os.fsencode(path),
+            os.O_RDONLY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_NOCTTY", 0),
+        )
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise Conflict(f"{label} cannot be opened safely") from error
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size != expected_size
+        ):
+            raise Conflict(f"{label} is not one exact regular file")
+        digest = hashlib.sha256()
+        remaining = expected_size
+        while remaining:
+            block = os.read(descriptor, min(remaining, 1024 * 1024))
+            if not block:
+                raise Conflict(f"{label} became shorter while verified")
+            digest.update(block)
+            remaining -= len(block)
+        if os.read(descriptor, 1):
+            raise Conflict(f"{label} became longer while verified")
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    identity = lambda value: (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+    if identity(before) != identity(after):
+        raise Conflict(f"{label} changed while verified")
+    return digest.hexdigest(), expected_size
+
+
+def _bounded_file_bytes(path, expected_size, label):
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise Conflict("target reads require no-follow file opens")
+    try:
+        descriptor = os.open(
+            os.fsencode(path),
+            os.O_RDONLY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_NOCTTY", 0),
+        )
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise Conflict(f"{label} cannot be opened safely") from error
+    try:
+        before = os.fstat(descriptor)
+        if (
+            not stat.S_ISREG(before.st_mode)
+            or before.st_nlink != 1
+            or before.st_size != expected_size
+        ):
+            raise Conflict(f"{label} is not one exact regular file")
+        data = bytearray()
+        while len(data) < expected_size:
+            block = os.read(
+                descriptor,
+                min(expected_size - len(data), 1024 * 1024),
+            )
+            if not block:
+                raise Conflict(f"{label} became shorter while read")
+            data.extend(block)
+        if os.read(descriptor, 1):
+            raise Conflict(f"{label} became longer while read")
+        after = os.fstat(descriptor)
+    finally:
+        os.close(descriptor)
+    identity = lambda value: (
+        value.st_dev,
+        value.st_ino,
+        value.st_mode,
+        value.st_nlink,
+        value.st_size,
+        value.st_mtime_ns,
+        value.st_ctime_ns,
+    )
+    if identity(before) != identity(after):
+        raise Conflict(f"{label} changed while read")
+    return bytes(data)
+
+
 class SessionStore:
     """The sole mutable authority for one session directory."""
 
@@ -401,6 +518,45 @@ class SessionStore:
                     state = 'abandoned'
                 )
             )""",
+            """CREATE TABLE implementation_links (
+                link_id TEXT PRIMARY KEY,
+                source_action_seq INTEGER NOT NULL UNIQUE REFERENCES actions(seq),
+                source_action_id TEXT NOT NULL,
+                source_beat INTEGER NOT NULL REFERENCES beats(n),
+                source_beat_revision INTEGER NOT NULL CHECK (source_beat_revision >= 0),
+                source_beat_json TEXT NOT NULL,
+                source_beat_sha256 TEXT NOT NULL,
+                target_sha256 TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                approval TEXT NOT NULL,
+                child_path TEXT NOT NULL UNIQUE,
+                branch TEXT NOT NULL,
+                child_session_id TEXT UNIQUE,
+                state TEXT NOT NULL CHECK (state IN ('reserved', 'ready')),
+                created_at TEXT NOT NULL,
+                ready_at TEXT
+            )""",
+            """CREATE TABLE implementation_attempts (
+                action_seq INTEGER NOT NULL REFERENCES actions(seq),
+                attempt INTEGER NOT NULL CHECK (attempt > 0),
+                challenge TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL
+                    CHECK (state IN ('reserved', 'verified', 'prepared', 'landed', 'failed')),
+                trusted_profile_json TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                request_sha256 TEXT NOT NULL,
+                capability BLOB,
+                receipt BLOB,
+                evidence_json TEXT,
+                commit_plan_json TEXT,
+                failure TEXT,
+                created_at TEXT NOT NULL,
+                verified_at TEXT,
+                prepared_at TEXT,
+                landed_at TEXT,
+                failed_at TEXT,
+                PRIMARY KEY (action_seq, attempt)
+            )""",
         )
         for statement in statements:
             db.execute(statement)
@@ -412,7 +568,7 @@ class SessionStore:
             version = db.execute("PRAGMA user_version").fetchone()[0]
             if version == DB_SCHEMA_VERSION:
                 return
-            if version not in (1, 2, 3):
+            if version not in (1, 2, 3, 4):
                 raise StoreError(f"unsupported session database version {version}")
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
@@ -444,7 +600,9 @@ class SessionStore:
                 )
             if version in (1, 2):
                 self._restore_failed_fix_intents(db)
-            self._default_legacy_execution_policy(db)
+            if version in (1, 2, 3):
+                self._default_legacy_execution_policy(db)
+            self._create_implementation_tables(db)
             db.execute(f"PRAGMA user_version = {DB_SCHEMA_VERSION}")
             db.execute("COMMIT")
         except Exception:
@@ -453,6 +611,47 @@ class SessionStore:
             raise
         finally:
             db.close()
+
+    def _create_implementation_tables(self, db):
+        db.execute("""CREATE TABLE IF NOT EXISTS implementation_links (
+            link_id TEXT PRIMARY KEY,
+            source_action_seq INTEGER NOT NULL UNIQUE REFERENCES actions(seq),
+            source_action_id TEXT NOT NULL,
+            source_beat INTEGER NOT NULL REFERENCES beats(n),
+            source_beat_revision INTEGER NOT NULL CHECK (source_beat_revision >= 0),
+            source_beat_json TEXT NOT NULL,
+            source_beat_sha256 TEXT NOT NULL,
+            target_sha256 TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            approval TEXT NOT NULL,
+            child_path TEXT NOT NULL UNIQUE,
+            branch TEXT NOT NULL,
+            child_session_id TEXT UNIQUE,
+            state TEXT NOT NULL CHECK (state IN ('reserved', 'ready')),
+            created_at TEXT NOT NULL,
+            ready_at TEXT
+        )""")
+        db.execute("""CREATE TABLE IF NOT EXISTS implementation_attempts (
+            action_seq INTEGER NOT NULL REFERENCES actions(seq),
+            attempt INTEGER NOT NULL CHECK (attempt > 0),
+            challenge TEXT NOT NULL UNIQUE,
+            state TEXT NOT NULL
+                CHECK (state IN ('reserved', 'verified', 'prepared', 'landed', 'failed')),
+            trusted_profile_json TEXT NOT NULL,
+            request_json TEXT NOT NULL,
+            request_sha256 TEXT NOT NULL,
+            capability BLOB,
+            receipt BLOB,
+            evidence_json TEXT,
+            commit_plan_json TEXT,
+            failure TEXT,
+            created_at TEXT NOT NULL,
+            verified_at TEXT,
+            prepared_at TEXT,
+            landed_at TEXT,
+            failed_at TEXT,
+            PRIMARY KEY (action_seq, attempt)
+        )""")
 
     def _default_legacy_execution_policy(self, db):
         row = self._session_row(db)
@@ -734,6 +933,10 @@ class SessionStore:
             raise MigrationError("session.json is not valid UTF-8") from error
         if not isinstance(session, dict):
             raise MigrationError("session.json must contain an object")
+        if "linked_implementation" in session:
+            raise MigrationError(
+                "linked implementation sessions require their authoritative database"
+            )
 
         beats = []
         seen_beats = set()
@@ -940,12 +1143,22 @@ class SessionStore:
             )
         if audience_mode == "report" and body.get("lands") not in (None, []):
             raise StoreError("report audience cannot have lands")
+        linked = body.get("linked_implementation")
+        if linked is not None:
+            linked = self._linked_implementation_document(linked)
+            body["linked_implementation"] = linked
+            if audience_mode != "branch":
+                raise StoreError("linked implementation requires branch audience")
+            if not delivery_branch:
+                raise StoreError("linked implementation requires a delivery branch")
         if "execution_policy" in body:
             if "target" not in body:
                 raise StoreError("session execution_policy requires a frozen target")
             body["execution_policy"] = self._execution_policy_document(
-                body["execution_policy"], body["target"]
+                body["execution_policy"], body["target"], linked
             )
+        if linked is not None and body.get("execution_policy", {}).get("mode") != "gateway_attested":
+            raise StoreError("linked implementation requires gateway_attested execution")
         return version, body
 
     def _target_document(self, document):
@@ -1040,28 +1253,64 @@ class SessionStore:
             bound["object_bundle_sha256"] = target["object_bundle_sha256"]
         return bound
 
-    def _execution_policy(self, target, mode):
+    def _execution_policy(self, target, mode, link_id=None):
         if mode not in EXECUTION_MODES:
             raise StoreError(
                 "execution mode must be one of " + ", ".join(EXECUTION_MODES)
             )
-        return {
+        policy = {
             "version": EXECUTION_POLICY_VERSION,
             "trust": "untrusted",
             "mode": mode,
             "target": self._execution_target(target),
         }
+        if mode == "gateway_attested":
+            if not isinstance(link_id, str) or not _SHA256.fullmatch(link_id):
+                raise StoreError(
+                    "gateway_attested execution requires linked implementation provenance"
+                )
+            policy["link_id"] = link_id
+        elif link_id is not None:
+            raise StoreError("no_exec execution cannot name an implementation link")
+        return policy
 
-    def _execution_policy_document(self, document, target):
+    def _execution_policy_document(self, document, target, linked=None):
         if not isinstance(document, dict):
             raise StoreError("session execution_policy must be an object")
         mode = document.get("mode")
-        expected = self._execution_policy(target, mode)
+        link_id = linked.get("link_id") if isinstance(linked, dict) else None
+        expected = self._execution_policy(target, mode, link_id)
         if document != expected:
             raise StoreError(
                 "session execution_policy does not match its frozen target"
             )
         return expected
+
+    def _linked_implementation_document(self, document):
+        fields = {
+            "version", "link_id", "source_session_id", "source_action_seq",
+            "source_action_id", "source_beat", "source_beat_revision",
+            "source_beat_sha256", "target_sha256", "actor", "approval",
+        }
+        if not isinstance(document, dict) or set(document) != fields:
+            raise StoreError("session linked_implementation has an unsupported shape")
+        linked = _copy(document)
+        if type(linked["version"]) is not int or linked["version"] != 1:
+            raise StoreError("session linked_implementation version must be 1")
+        for name in ("link_id", "source_beat_sha256", "target_sha256"):
+            if not isinstance(linked[name], str) or not _SHA256.fullmatch(linked[name]):
+                raise StoreError(f"session linked_implementation {name} is invalid")
+        for name in ("source_action_seq", "source_beat"):
+            _positive(linked[name], f"session linked_implementation {name}")
+        _non_negative(
+            linked["source_beat_revision"],
+            "session linked_implementation source_beat_revision",
+        )
+        for name in ("source_session_id", "source_action_id", "actor", "approval"):
+            value = linked[name]
+            if not isinstance(value, str) or not value.strip() or value != value.strip():
+                raise StoreError(f"session linked_implementation {name} must be text")
+        return linked
 
     def _trusted_context_document(self, data, target):
         try:
@@ -1256,6 +1505,10 @@ class SessionStore:
             and _legacy_pr_identity(body) is not None
         ):
             raise Conflict("targetless PR sessions must be created through snapshot-pr")
+        if current.get("linked_implementation", _MISSING) != body.get(
+            "linked_implementation", _MISSING
+        ):
+            raise Conflict("session linked implementation provenance cannot change")
         current_branch = current.get("delivery_branch", _MISSING)
         incoming_branch = body.get("delivery_branch", _MISSING)
         if current_target is not _MISSING and current_branch != incoming_branch:
@@ -1415,6 +1668,8 @@ class SessionStore:
                 raise StoreError(f"session schema_version must be {SCHEMA_VERSION}")
         with self._write() as db:
             current = json.loads(self._session_row(db)["body_json"])
+            if current.get("linked_implementation") is not None:
+                raise Conflict("linked implementation session metadata is immutable")
             current.update(patch)
             changed = self._save_session(db, current)
             if changed:
@@ -1479,6 +1734,10 @@ class SessionStore:
         staged = []
         with self._session_lock():
             try:
+                with self._read() as db:
+                    current = json.loads(self._session_row(db)["body_json"])
+                    if current.get("linked_implementation") is not None:
+                        raise Conflict("linked implementation target projections are immutable")
                 diff, diff_sha256, diff_bytes = _stage_copy(
                     diff_source, self.root, "pr.diff"
                 )
@@ -1649,7 +1908,9 @@ class SessionStore:
         policy = session.get("execution_policy")
         if policy is None:
             raise Conflict("session has no frozen execution policy")
-        return self._execution_policy_document(policy, target)
+        return self._execution_policy_document(
+            policy, target, session.get("linked_implementation")
+        )
 
     def _legacy_pr_execution_policy(self, session):
         identity = session.get("legacy_pr")
@@ -1674,6 +1935,17 @@ class SessionStore:
         target = session.get("target")
         if target is not None and "trusted_context_sha256" not in target:
             return "PR session has no frozen trusted context"
+        linked = session.get("linked_implementation")
+        if linked is not None:
+            try:
+                self._linked_implementation_document(linked)
+                if self._audience_mode(session) != "branch":
+                    return "linked implementation audience is invalid"
+                if policy is None or policy.get("mode") != "gateway_attested":
+                    return "linked implementation execution policy is invalid"
+            except StoreError as error:
+                return str(error)
+            return None
         if (
             target is not None
             and self._audience_mode(session) != self._pr_audience(target)["mode"]
@@ -1709,8 +1981,973 @@ class SessionStore:
             raise Conflict("session execution_policy target does not match")
         if policy["mode"] == "no_exec":
             raise Conflict("session execution policy forbids target code execution")
+        if policy["mode"] == "gateway_attested":
+            raise Conflict(
+                "gateway-attested sessions permit only verified output application"
+            )
         self.read_trusted_context()
         return policy
+
+    # ---- linked implementation authority ----------------------------
+
+    def _implementation_link_document(self, row):
+        return {
+            "version": 1,
+            "link_id": row["link_id"],
+            "state": row["state"],
+            "source_session_id": row["source_session_id"]
+            if "source_session_id" in row.keys()
+            else None,
+            "source_action_seq": row["source_action_seq"],
+            "source_action_id": row["source_action_id"],
+            "source_beat": row["source_beat"],
+            "source_beat_revision": row["source_beat_revision"],
+            "source_beat_sha256": row["source_beat_sha256"],
+            "target_sha256": row["target_sha256"],
+            "actor": row["actor"],
+            "approval": row["approval"],
+            "child_session_id": row["child_session_id"],
+            "child_path": row["child_path"],
+            "branch": row["branch"],
+            "created_at": row["created_at"],
+            "ready_at": row["ready_at"],
+        }
+
+    def _link_row(self, db, link_id):
+        row = db.execute(
+            "SELECT links.*, session.session_id AS source_session_id "
+            "FROM implementation_links AS links JOIN session ON session.singleton = 1 "
+            "WHERE links.link_id = ?",
+            (link_id,),
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"no implementation link {link_id}")
+        return row
+
+    def implementation_link(self, link_id):
+        if not isinstance(link_id, str) or not _SHA256.fullmatch(link_id):
+            raise StoreError("implementation link id must be a SHA-256 digest")
+        with self._read() as db:
+            return self._implementation_link_document(self._link_row(db, link_id))
+
+    def authorize_implementation(self, source_action_seq, source_beat, actor, approval):
+        _positive(source_action_seq, "source action seq")
+        _positive(source_beat, "source beat")
+        if not isinstance(actor, str) or not actor.strip():
+            raise StoreError("implementation actor must be non-empty text")
+        if not isinstance(approval, str) or not approval.strip():
+            raise StoreError("implementation approval must be non-empty text")
+        actor, approval = actor.strip(), approval.strip()
+        target = self.verify_target_files()
+        if "trusted_context_sha256" not in target:
+            raise Conflict("implementation requires frozen trusted context")
+        if "object_bundle_sha256" not in target:
+            raise Conflict("implementation requires a frozen Git object bundle")
+        with self._write() as db:
+            session_row = self._session_row(db)
+            session = json.loads(session_row["body_json"])
+            policy = self._required_execution_policy(session)
+            if self._audience_mode(session) not in ("review", "report"):
+                raise Conflict("implementation authorization requires review or report audience")
+            if policy["mode"] != "no_exec":
+                raise Conflict("source session must retain its no_exec policy")
+            if session.get("target") != target:
+                raise Conflict("source target changed during implementation authorization")
+            action = self._action_row(db, source_action_seq)
+            if action["kind"] != "accept" or action["beat_n"] != source_beat:
+                raise Conflict(
+                    f"action {source_action_seq} is not the accept for beat {source_beat}"
+                )
+            if action["state"] != "acked":
+                raise Conflict(
+                    f"accept action {source_action_seq} must be acknowledged first"
+                )
+            beat_row = self._beat_row(db, source_beat)
+            beat = json.loads(beat_row["body_json"])
+            if beat.get("state") != "accepted":
+                raise Conflict(f"beat {source_beat} is not accepted")
+            beat_json = _dump(beat)
+            beat_sha256 = hashlib.sha256(beat_json.encode("utf-8")).hexdigest()
+            target_sha256 = hashlib.sha256(_dump(target).encode("utf-8")).hexdigest()
+            bound = {
+                "version": 1,
+                "sourceSessionId": session_row["session_id"],
+                "sourceActionSeq": source_action_seq,
+                "sourceActionId": action["action_id"],
+                "sourceBeat": source_beat,
+                "sourceBeatRevision": beat_row["revision"],
+                "sourceBeatSha256": beat_sha256,
+                "targetSha256": target_sha256,
+                "actor": actor,
+                "approval": approval,
+            }
+            link_id = hashlib.sha256(_dump(bound).encode("utf-8")).hexdigest()
+            child_path = f"implementations/{link_id}"
+            branch = f"underwrite/implementation-{link_id[:16]}"
+            existing = db.execute(
+                "SELECT links.*, session.session_id AS source_session_id "
+                "FROM implementation_links AS links JOIN session ON session.singleton = 1 "
+                "WHERE links.source_action_seq = ?",
+                (source_action_seq,),
+            ).fetchone()
+            if existing is not None:
+                expected = (
+                    link_id, action["action_id"], source_beat, beat_row["revision"],
+                    beat_json, beat_sha256, target_sha256, actor, approval,
+                    child_path, branch,
+                )
+                actual = (
+                    existing["link_id"], existing["source_action_id"],
+                    existing["source_beat"], existing["source_beat_revision"],
+                    existing["source_beat_json"], existing["source_beat_sha256"],
+                    existing["target_sha256"], existing["actor"],
+                    existing["approval"], existing["child_path"], existing["branch"],
+                )
+                if actual != expected:
+                    raise Conflict(
+                        f"action {source_action_seq} already has a different implementation authorization"
+                    )
+                return self._implementation_link_document(existing)
+            db.execute(
+                "INSERT INTO implementation_links "
+                "(link_id, source_action_seq, source_action_id, source_beat, "
+                "source_beat_revision, source_beat_json, source_beat_sha256, "
+                "target_sha256, actor, approval, child_path, branch, state, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'reserved', ?)",
+                (
+                    link_id, source_action_seq, action["action_id"], source_beat,
+                    beat_row["revision"], beat_json, beat_sha256, target_sha256,
+                    actor, approval, child_path, branch, _now(),
+                ),
+            )
+            return self._implementation_link_document(self._link_row(db, link_id))
+
+    def _linked_projection_identities(self, target):
+        expected = {
+            "pr.diff": (target["diff_sha256"], target["diff_bytes"]),
+        }
+        if "trusted_context_sha256" in target:
+            expected["trusted-context.json"] = (
+                target["trusted_context_sha256"], target["trusted_context_bytes"]
+            )
+        if "object_bundle_sha256" in target:
+            expected["pr.bundle"] = (
+                target["object_bundle_sha256"], target["object_bundle_bytes"]
+            )
+        metadata = self.root / "pr.json"
+        try:
+            expected["pr.json"] = _file_identity(metadata)
+        except FileNotFoundError as error:
+            raise Conflict("frozen target projection pr.json is missing") from error
+        return expected
+
+    def _copy_linked_projections(self, child_root, target):
+        implementation_root = child_root.parent
+        for directory, label in (
+            (implementation_root, "implementation root"),
+            (child_root, "linked child path"),
+        ):
+            created = False
+            try:
+                directory.mkdir(mode=0o700)
+                created = True
+            except FileExistsError:
+                pass
+            try:
+                details = directory.lstat()
+            except OSError as error:
+                raise Conflict(f"{label} cannot be inspected") from error
+            if not stat.S_ISDIR(details.st_mode) or stat.S_ISLNK(details.st_mode):
+                raise Conflict(f"{label} must be a real directory")
+            if created:
+                _fsync_directory(directory.parent)
+        expected = self._linked_projection_identities(target)
+        staged = []
+        try:
+            for name, identity in expected.items():
+                try:
+                    path, digest, size = _stage_copy(
+                        self.root / name, child_root, name
+                    )
+                except FileNotFoundError as error:
+                    raise Conflict(f"frozen target projection {name} is missing") from error
+                staged.append((path, name))
+                if (digest, size) != identity:
+                    raise Conflict(f"frozen target projection {name} does not match")
+            for path, name in staged:
+                os.replace(str(path), str(child_root / name))
+            staged.clear()
+            _fsync_directory(child_root)
+        finally:
+            for path, _name in staged:
+                try:
+                    path.unlink()
+                except FileNotFoundError:
+                    pass
+
+    def _linked_child_body(self, link, target):
+        provenance = {
+            "version": 1,
+            "link_id": link["link_id"],
+            "source_session_id": link["source_session_id"],
+            "source_action_seq": link["source_action_seq"],
+            "source_action_id": link["source_action_id"],
+            "source_beat": link["source_beat"],
+            "source_beat_revision": link["source_beat_revision"],
+            "source_beat_sha256": link["source_beat_sha256"],
+            "target_sha256": link["target_sha256"],
+            "actor": link["actor"],
+            "approval": link["approval"],
+        }
+        return {
+            "repo": target["repo"],
+            "cursor": link["source_beat"],
+            "lands": [],
+            "audience": {
+                "mode": "branch",
+                "why": "approved implementation of a frozen PR finding",
+            },
+            "delivery_branch": link["branch"],
+            "target": _copy(target),
+            "execution_policy": self._execution_policy(
+                target, "gateway_attested", link["link_id"]
+            ),
+            "linked_implementation": provenance,
+        }
+
+    def _guard_existing_linked_child(self, child_root, link, target):
+        try:
+            child_details = child_root.lstat()
+        except FileNotFoundError:
+            return None
+        except OSError as error:
+            raise Conflict("linked child path cannot be inspected") from error
+        if not stat.S_ISDIR(child_details.st_mode) or stat.S_ISLNK(
+            child_details.st_mode
+        ):
+            raise Conflict("linked child path must be a real directory")
+
+        database = child_root / "session.sqlite3"
+        lock = child_root / ".session.lock"
+        for path, label in (
+            (database, "linked child database"),
+            (lock, "linked child lock"),
+        ):
+            try:
+                details = path.lstat()
+            except OSError as error:
+                raise Conflict(f"{label} cannot be inspected") from error
+            if (
+                not stat.S_ISREG(details.st_mode)
+                or stat.S_ISLNK(details.st_mode)
+                or details.st_nlink != 1
+            ):
+                raise Conflict(f"{label} must be one real regular file")
+
+        journal = child_root / "session.sqlite3-journal"
+        try:
+            journal.lstat()
+        except FileNotFoundError:
+            pass
+        except OSError as error:
+            raise Conflict("linked child journal cannot be inspected") from error
+        else:
+            raise Conflict("linked child has an unfinished journal")
+
+        for name, identity in self._linked_projection_identities(target).items():
+            path = child_root / name
+            try:
+                details = path.lstat()
+            except OSError as error:
+                raise Conflict(
+                    f"linked child projection {name} cannot be inspected"
+                ) from error
+            if (
+                not stat.S_ISREG(details.st_mode)
+                or stat.S_ISLNK(details.st_mode)
+                or details.st_nlink != 1
+                or _file_identity(path) != identity
+            ):
+                raise Conflict(f"linked child projection {name} changed")
+
+        db = None
+        try:
+            uri = database.resolve().as_uri() + "?mode=ro&immutable=1"
+            db = sqlite3.connect(uri, uri=True)
+            version = db.execute("PRAGMA user_version").fetchone()[0]
+            row = db.execute(
+                "SELECT session_id, format_version, body_json "
+                "FROM session WHERE singleton = 1"
+            ).fetchone()
+            counts = db.execute(
+                "SELECT (SELECT COUNT(*) FROM actions), "
+                "(SELECT COUNT(*) FROM beats)"
+            ).fetchone()
+        except (OSError, sqlite3.Error) as error:
+            raise Conflict("linked child database cannot be read safely") from error
+        finally:
+            if db is not None:
+                db.close()
+        if row is None:
+            raise Conflict("linked child database has no session")
+        if version != DB_SCHEMA_VERSION or row[1] != SCHEMA_VERSION:
+            raise Conflict("linked child database has an unsupported version")
+        try:
+            body = json.loads(row[2])
+        except (TypeError, json.JSONDecodeError) as error:
+            raise Conflict("linked child session is malformed") from error
+        expected = self._linked_child_body(link, target)
+        if isinstance(body, dict):
+            body = _copy(body)
+            body["lands"] = []
+        if body != expected:
+            raise Conflict("linked child path already contains another session")
+        if tuple(counts) != (1, 1):
+            raise Conflict("linked child session does not contain its exact finding")
+        if link.get("child_session_id") not in (None, row[0]):
+            raise Conflict("linked child session identity changed")
+        return row[0]
+
+    def _initialize_linked_child(self, child, link, target):
+        desired_body = self._linked_child_body(link, target)
+        source_beat = json.loads(link["source_beat_json"])
+        child_beat = _copy(source_beat)
+        for name in ("landed", "branch", "delivery_kind", "delivery"):
+            child_beat.pop(name, None)
+        child_beat["state"] = "accepted"
+        child_beat["call"] = link["approval"]
+        timestamp = _now()
+        with child._write() as db:
+            row = child._session_row(db)
+            current = json.loads(row["body_json"])
+            if current.get("linked_implementation") is not None:
+                fixed = _copy(current)
+                fixed["lands"] = []
+                if fixed != desired_body:
+                    raise Conflict("linked child session has different immutable provenance")
+                action = db.execute("SELECT * FROM actions WHERE seq = 1").fetchone()
+                beat = db.execute(
+                    "SELECT * FROM beats WHERE n = ?", (link["source_beat"],)
+                ).fetchone()
+                if action is None or beat is None:
+                    raise Conflict("linked child session initialization is incomplete")
+                counts = db.execute(
+                    "SELECT (SELECT COUNT(*) FROM actions), "
+                    "(SELECT COUNT(*) FROM beats)"
+                ).fetchone()
+                actual_beat = json.loads(beat["body_json"])
+                for name in ("landed", "branch", "delivery_kind", "delivery"):
+                    actual_beat.pop(name, None)
+                expected_application = child._application(
+                    {
+                        "kind": "beat",
+                        "n": child_beat["n"],
+                        "state": "accepted",
+                        "call": link["approval"],
+                    },
+                    desired_body,
+                    (child_beat,),
+                )
+                if (
+                    tuple(counts) != (1, 1)
+                    or actual_beat != child_beat
+                    or action["action_id"] != f"implementation:{link['link_id']}"
+                    or action["beat_n"] != child_beat["n"]
+                    or action["kind"] != "accept"
+                    or action["note"] != link["approval"]
+                    or action["state"] not in ("applied", "acked")
+                    or json.loads(action["result_json"]) != expected_application
+                ):
+                    raise Conflict("linked child session does not contain its exact finding")
+                return row["session_id"]
+            has_work = db.execute(
+                "SELECT EXISTS(SELECT 1 FROM beats) OR EXISTS(SELECT 1 FROM actions)"
+            ).fetchone()[0]
+            if current or has_work:
+                raise Conflict("linked child path already contains another session")
+            child._session_document(desired_body)
+            db.execute(
+                "UPDATE session SET body_json = ?, render_revision = 1 WHERE singleton = 1",
+                (_dump(desired_body),),
+            )
+            delivery = {
+                "cause_seq": 1,
+                "kind": "commit",
+            }
+            db.execute(
+                "INSERT INTO beats "
+                "(n, revision, body_json, delivery_state, delivery_json) "
+                "VALUES (?, 1, ?, 'pending', ?)",
+                (child_beat["n"], _dump(child_beat), _dump(delivery)),
+            )
+            result = {
+                "kind": "beat",
+                "n": child_beat["n"],
+                "state": "accepted",
+                "call": link["approval"],
+            }
+            application = child._application(result, desired_body, (child_beat,))
+            child._insert_action(
+                db,
+                1,
+                f"implementation:{link['link_id']}",
+                child_beat["n"],
+                "accept",
+                link["approval"],
+                "applied",
+                application,
+                evidence="linked implementation authorization",
+                produced_at=timestamp,
+                applied_at=timestamp,
+            )
+            return row["session_id"]
+
+    def create_linked_implementation(self, link_id):
+        link = self.implementation_link(link_id)
+        with self._read() as db:
+            live = self._link_row(db, link_id)
+            action = self._action_row(db, live["source_action_seq"])
+            beat = self._beat_row(db, live["source_beat"])
+            session_row = self._session_row(db)
+            session = json.loads(session_row["body_json"])
+            target = session.get("target")
+            if action["state"] != "acked" or action["kind"] != "accept":
+                raise Conflict("implementation source accept is no longer acknowledged")
+            if action["beat_n"] != live["source_beat"]:
+                raise Conflict("implementation source action no longer matches its beat")
+            if beat["revision"] != live["source_beat_revision"]:
+                raise Conflict("implementation source beat revision moved")
+            if beat["body_json"] != live["source_beat_json"]:
+                raise Conflict("implementation source beat content moved")
+            if hashlib.sha256(beat["body_json"].encode("utf-8")).hexdigest() != live["source_beat_sha256"]:
+                raise Conflict("implementation source beat digest does not match")
+            if hashlib.sha256(_dump(target).encode("utf-8")).hexdigest() != live["target_sha256"]:
+                raise Conflict("implementation source target moved")
+            link = self._implementation_link_document(live)
+            link["source_beat_json"] = live["source_beat_json"]
+        if self.verify_target_files() != target:
+            raise Conflict("implementation source target moved")
+        child_root = self.root / link["child_path"]
+        existing_session_id = self._guard_existing_linked_child(
+            child_root, link, target
+        )
+        if existing_session_id is None:
+            implementation_root = child_root.parent
+            created_root = False
+            try:
+                implementation_root.mkdir(mode=0o700)
+                created_root = True
+            except FileExistsError:
+                pass
+            try:
+                root_details = implementation_root.lstat()
+            except OSError as error:
+                raise Conflict("implementation root cannot be inspected") from error
+            if not stat.S_ISDIR(root_details.st_mode) or stat.S_ISLNK(
+                root_details.st_mode
+            ):
+                raise Conflict("implementation root must be a real directory")
+            if created_root:
+                _fsync_directory(implementation_root.parent)
+
+            staging = Path(
+                tempfile.mkdtemp(
+                    prefix=f".{link['link_id']}.",
+                    suffix=".tmp",
+                    dir=str(implementation_root),
+                )
+            )
+            try:
+                self._copy_linked_projections(staging, target)
+                staged_child = SessionStore(staging)
+                self._initialize_linked_child(staged_child, link, target)
+                staged_child.verify_target_files()
+                _fsync_directory(staging)
+                try:
+                    os.rename(staging, child_root)
+                except OSError as error:
+                    if self._guard_existing_linked_child(
+                        child_root, link, target
+                    ) is None:
+                        raise Conflict("linked child could not be published") from error
+                else:
+                    _fsync_directory(implementation_root)
+            finally:
+                if staging.exists():
+                    shutil.rmtree(staging)
+
+        child = SessionStore(child_root)
+        child_session_id = self._initialize_linked_child(child, link, target)
+        child.verify_target_files()
+        return {
+            "link": self.implementation_link(link_id),
+            "child_root": str(child_root.resolve()),
+            "child_session_id": child_session_id,
+            "action_seq": 1,
+            "beat": link["source_beat"],
+            "branch": link["branch"],
+        }
+
+    def complete_implementation_link(self, link_id, child_session_id):
+        if not isinstance(child_session_id, str) or not child_session_id.strip():
+            raise StoreError("child_session_id must be non-empty text")
+        child_session_id = child_session_id.strip()
+        link = self.implementation_link(link_id)
+        target = self.verify_target_files()
+        child_root = self.root / link["child_path"]
+        for directory, label in (
+            (child_root.parent, "implementation root"),
+            (child_root, "linked child path"),
+        ):
+            try:
+                details = directory.lstat()
+            except OSError as error:
+                raise Conflict(f"{label} cannot be inspected") from error
+            if not stat.S_ISDIR(details.st_mode) or stat.S_ISLNK(details.st_mode):
+                raise Conflict(f"{label} must be a real directory")
+        self._guard_existing_linked_child(child_root, link, target)
+        child = SessionStore(child_root)
+        with child._read() as child_db:
+            child_row = child._session_row(child_db)
+            child_body = json.loads(child_row["body_json"])
+            if child_row["session_id"] != child_session_id:
+                raise Conflict("linked child session identity does not match")
+            expected = self._linked_child_body(link, target)
+            fixed = _copy(child_body)
+            fixed["lands"] = []
+            if fixed != expected:
+                raise Conflict("linked child provenance does not match")
+            child._required_execution_policy(child_body)
+        if child.verify_target_files() != target:
+            raise Conflict("linked child target does not match its source")
+        with self._write() as db:
+            row = self._link_row(db, link_id)
+            if row["state"] == "ready":
+                if row["child_session_id"] != child_session_id:
+                    raise Conflict("implementation link names a different child session")
+                return self._implementation_link_document(row)
+            if row["child_session_id"] not in (None, child_session_id):
+                raise Conflict("implementation link names a different child session")
+            db.execute(
+                "UPDATE implementation_links SET state = 'ready', "
+                "child_session_id = ?, ready_at = ? WHERE link_id = ?",
+                (child_session_id, _now(), link_id),
+            )
+            return self._implementation_link_document(self._link_row(db, link_id))
+
+    def _trusted_implementation_profile(self, document):
+        if not isinstance(document, dict) or set(document) != _TRUSTED_PROFILE_FIELDS:
+            raise StoreError("trusted profile has an unsupported shape")
+        profile = _copy(document)
+        if type(profile["version"]) is not int or profile["version"] != 1:
+            raise StoreError("trusted profile version must be 1")
+        key_id = profile["keyId"]
+        if (
+            not isinstance(key_id, str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", key_id)
+        ):
+            raise StoreError("trusted profile keyId must name a SHA-256 key fingerprint")
+        for name in ("signerId", "executorId"):
+            value = profile[name]
+            if not isinstance(value, str) or not value.strip() or value != value.strip():
+                raise StoreError(f"trusted profile {name} must be non-empty text")
+        for name in ("job", "sandbox"):
+            if not isinstance(profile[name], dict):
+                raise StoreError(f"trusted profile {name} must be an object")
+        _non_negative(profile["exitCode"], "trusted profile exitCode")
+        if profile["exitCode"] > 255:
+            raise StoreError("trusted profile exitCode must not exceed 255")
+        try:
+            encoded = _dump(profile).encode("utf-8")
+        except (TypeError, ValueError) as error:
+            raise StoreError("trusted profile must be canonical JSON data") from error
+        if len(encoded) > MAX_IMPLEMENTATION_PROFILE_BYTES:
+            raise StoreError("trusted profile exceeds the implementation byte limit")
+        return profile
+
+    def _linked_attempt_context(self, db, action_seq):
+        action_seq = _positive(action_seq, "action seq")
+        session_row = self._session_row(db)
+        session = json.loads(session_row["body_json"])
+        linked = session.get("linked_implementation")
+        if linked is None:
+            raise Conflict("session is not a linked implementation")
+        linked = self._linked_implementation_document(linked)
+        policy = self._required_execution_policy(session)
+        if policy["mode"] != "gateway_attested":
+            raise Conflict("linked implementation has no attested execution policy")
+        action = self._action_row(db, action_seq)
+        if (
+            action["seq"] != 1
+            or action["kind"] != "accept"
+            or action["beat_n"] != linked["source_beat"]
+            or action["state"] not in ("applied", "acked")
+        ):
+            raise Conflict("action is not the linked implementation accept")
+        return session_row, session, linked, action
+
+    def _implementation_attempt_document(self, db, row):
+        action = self._action_row(db, row["action_seq"])
+        return {
+            "version": 1,
+            "action_seq": row["action_seq"],
+            "beat": action["beat_n"],
+            "attempt": row["attempt"],
+            "state": row["state"],
+            "challenge": row["challenge"],
+            "request": json.loads(row["request_json"]),
+            "request_sha256": row["request_sha256"],
+            "trusted_profile": json.loads(row["trusted_profile_json"]),
+            "capability": row["capability"],
+            "receipt": row["receipt"],
+            "evidence": None if row["evidence_json"] is None else json.loads(row["evidence_json"]),
+            "commit_plan": None if row["commit_plan_json"] is None else json.loads(row["commit_plan_json"]),
+            "failure": row["failure"],
+            "created_at": row["created_at"],
+            "verified_at": row["verified_at"],
+            "prepared_at": row["prepared_at"],
+            "landed_at": row["landed_at"],
+            "failed_at": row["failed_at"],
+        }
+
+    def _attempt_row(self, db, action_seq, attempt=None):
+        _positive(action_seq, "action seq")
+        if attempt is None:
+            row = db.execute(
+                "SELECT * FROM implementation_attempts WHERE action_seq = ? "
+                "ORDER BY attempt DESC LIMIT 1",
+                (action_seq,),
+            ).fetchone()
+        else:
+            _positive(attempt, "attempt")
+            row = db.execute(
+                "SELECT * FROM implementation_attempts "
+                "WHERE action_seq = ? AND attempt = ?",
+                (action_seq, attempt),
+            ).fetchone()
+        if row is None:
+            suffix = "" if attempt is None else f" attempt {attempt}"
+            raise StoreError(f"action {action_seq} has no implementation{suffix}")
+        return row
+
+    def implementation_attempt(self, action_seq, attempt=None):
+        with self._read() as db:
+            self._linked_attempt_context(db, action_seq)
+            return self._implementation_attempt_document(
+                db, self._attempt_row(db, action_seq, attempt)
+            )
+
+    def reserve_implementation_attempt(self, action_seq, trusted_profile):
+        profile = self._trusted_implementation_profile(trusted_profile)
+        profile_json = _dump(profile)
+        with self._write() as db:
+            session_row, session, linked, action = self._linked_attempt_context(
+                db, action_seq
+            )
+            latest = db.execute(
+                "SELECT * FROM implementation_attempts WHERE action_seq = ? "
+                "ORDER BY attempt DESC LIMIT 1",
+                (action_seq,),
+            ).fetchone()
+            if latest is not None:
+                if latest["trusted_profile_json"] != profile_json:
+                    raise Conflict("implementation attempt already binds a different trusted profile")
+                if latest["state"] != "failed":
+                    return self._implementation_attempt_document(db, latest)
+                number = latest["attempt"] + 1
+            else:
+                number = 1
+            challenge = secrets.token_hex(32)
+            request = {
+                "version": 1,
+                "sessionId": session_row["session_id"],
+                "challenge": challenge,
+                "target": _copy(session["target"]),
+                "action": {
+                    "seq": action_seq,
+                    "beat": action["beat_n"],
+                    "attempt": number,
+                },
+                "job": _copy(profile["job"]),
+                "sandbox": _copy(profile["sandbox"]),
+                "exitCode": profile["exitCode"],
+            }
+            request_json = _dump(request)
+            if len(request_json.encode("utf-8")) > MAX_IMPLEMENTATION_REQUEST_BYTES:
+                raise StoreError("implementation request exceeds its byte limit")
+            request_sha256 = hashlib.sha256(request_json.encode("utf-8")).hexdigest()
+            timestamp = _now()
+            db.execute(
+                "INSERT INTO implementation_attempts "
+                "(action_seq, attempt, challenge, state, trusted_profile_json, "
+                "request_json, request_sha256, created_at) "
+                "VALUES (?, ?, ?, 'reserved', ?, ?, ?, ?)",
+                (
+                    action_seq, number, challenge, profile_json, request_json,
+                    request_sha256, timestamp,
+                ),
+            )
+            beat_row = self._beat_row(db, action["beat_n"])
+            beat = json.loads(beat_row["body_json"])
+            detail = {
+                "cause_seq": action_seq,
+                "kind": "commit",
+                "attempt": number,
+            }
+            changed, _revision, _state, _detail = self._save_beat(
+                db, beat, "pending", detail
+            )
+            if changed:
+                self._bump_render(db)
+            return self._implementation_attempt_document(
+                db, self._attempt_row(db, action_seq, number)
+            )
+
+    def _artifact_descriptor(self, document, label):
+        if not isinstance(document, dict) or set(document) != {"sha256", "bytes"}:
+            raise StoreError(f"implementation evidence {label} has an unsupported shape")
+        value = _copy(document)
+        if not isinstance(value["sha256"], str) or not _SHA256.fullmatch(value["sha256"]):
+            raise StoreError(f"implementation evidence {label} digest is invalid")
+        _positive(value["bytes"], f"implementation evidence {label} bytes")
+        return value
+
+    def _stream_descriptor(self, document, label):
+        if not isinstance(document, dict) or set(document) != {"sha256", "bytes", "truncated"}:
+            raise StoreError(f"implementation evidence {label} has an unsupported shape")
+        value = _copy(document)
+        if not isinstance(value["sha256"], str) or not _SHA256.fullmatch(value["sha256"]):
+            raise StoreError(f"implementation evidence {label} digest is invalid")
+        _non_negative(value["bytes"], f"implementation evidence {label} bytes")
+        if value["truncated"] is not False:
+            raise StoreError(f"implementation evidence {label} must not be truncated")
+        return value
+
+    def _implementation_evidence(self, document, attempt, capability, receipt):
+        if not isinstance(document, dict) or set(document) != _IMPLEMENTATION_EVIDENCE_FIELDS:
+            raise StoreError("implementation evidence has an unsupported shape")
+        evidence = _copy(document)
+        profile = json.loads(attempt["trusted_profile_json"])
+        if type(evidence["version"]) is not int or evidence["version"] != 1:
+            raise StoreError("implementation evidence version must be 1")
+        expected = {
+            "requestSha256": attempt["request_sha256"],
+            "keyId": profile["keyId"],
+            "signerId": profile["signerId"],
+            "executorId": profile["executorId"],
+            "capabilitySha256": hashlib.sha256(capability).hexdigest(),
+            "receiptSha256": hashlib.sha256(receipt).hexdigest(),
+            "exitCode": profile["exitCode"],
+        }
+        for name, value in expected.items():
+            if evidence[name] != value:
+                raise Conflict(f"implementation evidence {name} does not match")
+        for name in (
+            "requestSha256", "capabilitySha256", "receiptSha256",
+            "inputTree", "outputTree",
+        ):
+            if not isinstance(evidence[name], str) or not _SHA256.fullmatch(evidence[name]):
+                raise StoreError(f"implementation evidence {name} is invalid")
+        evidence["outputBundle"] = self._artifact_descriptor(
+            evidence["outputBundle"], "outputBundle"
+        )
+        evidence["stdout"] = self._stream_descriptor(evidence["stdout"], "stdout")
+        evidence["stderr"] = self._stream_descriptor(evidence["stderr"], "stderr")
+        return evidence
+
+    def record_verified_implementation(
+        self, action_seq, attempt, capability, receipt, evidence
+    ):
+        if not isinstance(capability, bytes) or not capability:
+            raise StoreError("verified capability must be non-empty bytes")
+        if not isinstance(receipt, bytes) or not receipt:
+            raise StoreError("verified receipt must be non-empty bytes")
+        with self._write() as db:
+            self._linked_attempt_context(db, action_seq)
+            row = self._attempt_row(db, action_seq, attempt)
+            verified = self._implementation_evidence(
+                evidence, row, capability, receipt
+            )
+            evidence_json = _dump(verified)
+            if row["state"] in ("verified", "prepared", "landed"):
+                if (
+                    row["capability"] != capability
+                    or row["receipt"] != receipt
+                    or row["evidence_json"] != evidence_json
+                ):
+                    raise Conflict("implementation attempt already has different verified evidence")
+                return self._implementation_attempt_document(db, row)
+            if row["state"] != "reserved":
+                raise Conflict(f"implementation attempt is {row['state']}, not reserved")
+            db.execute(
+                "UPDATE implementation_attempts SET state = 'verified', "
+                "capability = ?, receipt = ?, evidence_json = ?, verified_at = ? "
+                "WHERE action_seq = ? AND attempt = ?",
+                (capability, receipt, evidence_json, _now(), action_seq, attempt),
+            )
+            return self._implementation_attempt_document(
+                db, self._attempt_row(db, action_seq, attempt)
+            )
+
+    def fail_implementation_attempt(self, action_seq, attempt, failure):
+        if not isinstance(failure, str) or not failure.strip():
+            raise StoreError("implementation failure must be non-empty text")
+        failure = failure.strip()
+        with self._write() as db:
+            _session_row, _session, _linked, action = self._linked_attempt_context(
+                db, action_seq
+            )
+            row = self._attempt_row(db, action_seq, attempt)
+            if row["state"] == "failed":
+                if row["failure"] != failure:
+                    raise Conflict("implementation attempt failed for a different reason")
+                return self._implementation_attempt_document(db, row)
+            if row["state"] != "reserved":
+                raise Conflict(f"implementation attempt is {row['state']}, not reserved")
+            db.execute(
+                "UPDATE implementation_attempts SET state = 'failed', failure = ?, "
+                "failed_at = ? WHERE action_seq = ? AND attempt = ?",
+                (failure, _now(), action_seq, attempt),
+            )
+            beat_row = self._beat_row(db, action["beat_n"])
+            beat = json.loads(beat_row["body_json"])
+            detail = {
+                "error": failure,
+                "owed": "retry attested implementation",
+                "cause_seq": action_seq,
+                "kind": "commit",
+                "attempt": attempt,
+            }
+            changed, _revision, _state, _detail = self._save_beat(
+                db, beat, "failed", detail
+            )
+            if changed:
+                self._bump_render(db)
+            return self._implementation_attempt_document(
+                db, self._attempt_row(db, action_seq, attempt)
+            )
+
+    def _implementation_commit_plan(self, document, session, attempt):
+        if not isinstance(document, dict) or set(document) != _COMMIT_PLAN_FIELDS:
+            raise StoreError("implementation commit plan has an unsupported shape")
+        plan = _copy(document)
+        if type(plan["version"]) is not int or plan["version"] != 1:
+            raise StoreError("implementation commit plan version must be 1")
+        for name in ("commit", "parent", "tree"):
+            if not isinstance(plan[name], str) or not _FULL_SHA.fullmatch(plan[name]):
+                raise StoreError(f"implementation commit plan {name} is invalid")
+        if not isinstance(plan["outputTree"], str) or not _SHA256.fullmatch(plan["outputTree"]):
+            raise StoreError("implementation commit plan outputTree is invalid")
+        if plan["parent"] != session["target"]["head_sha"]:
+            raise Conflict("implementation commit parent is not the frozen target head")
+        evidence = json.loads(attempt["evidence_json"])
+        if plan["outputTree"] != evidence["outputTree"]:
+            raise Conflict("implementation commit plan does not match verified output")
+        if plan["branch"] != session["delivery_branch"]:
+            raise Conflict("implementation commit plan names a different branch")
+        return plan
+
+    def prepare_implementation_land(self, action_seq, attempt, commit_plan):
+        with self._write() as db:
+            _session_row, session, _linked, _action = self._linked_attempt_context(
+                db, action_seq
+            )
+            row = self._attempt_row(db, action_seq, attempt)
+            if row["state"] not in ("verified", "prepared", "landed"):
+                raise Conflict(f"implementation attempt is {row['state']}, not verified")
+            if row["evidence_json"] is None:
+                raise Conflict("implementation attempt has no verified evidence")
+            plan = self._implementation_commit_plan(commit_plan, session, row)
+            plan_json = _dump(plan)
+            if row["state"] in ("prepared", "landed"):
+                if row["commit_plan_json"] != plan_json:
+                    raise Conflict("implementation attempt already has a different commit plan")
+                return self._implementation_attempt_document(db, row)
+            db.execute(
+                "UPDATE implementation_attempts SET state = 'prepared', "
+                "commit_plan_json = ?, prepared_at = ? "
+                "WHERE action_seq = ? AND attempt = ?",
+                (plan_json, _now(), action_seq, attempt),
+            )
+            return self._implementation_attempt_document(
+                db, self._attempt_row(db, action_seq, attempt)
+            )
+
+    def finish_implementation_land(self, action_seq, attempt, commit, branch):
+        if not isinstance(commit, str) or not _FULL_SHA.fullmatch(commit):
+            raise StoreError("implementation commit must be a full lowercase SHA")
+        if not isinstance(branch, str) or not branch.strip() or branch != branch.strip():
+            raise StoreError("implementation branch must be non-empty text")
+        with self._write() as db:
+            _session_row, session, _linked, action = self._linked_attempt_context(
+                db, action_seq
+            )
+            row = self._attempt_row(db, action_seq, attempt)
+            if row["state"] not in ("prepared", "landed"):
+                raise Conflict(f"implementation attempt is {row['state']}, not prepared")
+            plan = json.loads(row["commit_plan_json"])
+            if commit != plan["commit"] or branch != plan["branch"]:
+                raise Conflict("implementation landing does not match its persisted plan")
+            beat_row = self._beat_row(db, action["beat_n"])
+            current = json.loads(beat_row["delivery_json"]) if beat_row["delivery_json"] else None
+            entry = {
+                "state": "landed",
+                "what": json.loads(beat_row["body_json"]).get("claim", ""),
+                "where": commit,
+            }
+            desired = {
+                "artifact": commit,
+                "branch": branch,
+                "cause_seq": action_seq,
+                "kind": "commit",
+                "entry": entry,
+                "attempt": attempt,
+                "attestation": json.loads(row["evidence_json"]),
+            }
+            if row["state"] == "landed":
+                if beat_row["delivery_state"] != "landed" or current != desired:
+                    raise Conflict("landed implementation receipt no longer matches")
+                if action["state"] == "applied":
+                    db.execute(
+                        "UPDATE actions SET state = 'acked', acked_at = ? WHERE seq = ?",
+                        (_now(), action_seq),
+                    )
+                return self._delivery_receipt(
+                    action_seq, action["beat_n"], "landed", current
+                )
+            beat = json.loads(beat_row["body_json"])
+            if beat.get("state") != "accepted":
+                raise Conflict("linked implementation beat is no longer accepted")
+            beat["landed"] = commit
+            beat["delivery_kind"] = "commit"
+            beat["branch"] = branch
+            beat_changed, _revision, _state, _detail = self._save_beat(
+                db, beat, "landed", desired
+            )
+            lands = session.setdefault("lands", [])
+            if not isinstance(lands, list):
+                raise StoreError("session lands must be a list")
+            session_changed = False
+            if entry not in lands:
+                lands.append(entry)
+                session_changed = self._save_session(
+                    db, session, allow_new_lands=True
+                )
+            db.execute(
+                "UPDATE implementation_attempts SET state = 'landed', landed_at = ? "
+                "WHERE action_seq = ? AND attempt = ?",
+                (_now(), action_seq, attempt),
+            )
+            if action["state"] == "applied":
+                db.execute(
+                    "UPDATE actions SET state = 'acked', acked_at = ? WHERE seq = ?",
+                    (_now(), action_seq),
+                )
+            if beat_changed or session_changed:
+                self._bump_render(db)
+            return self._delivery_receipt(
+                action_seq, action["beat_n"], "landed", desired
+            )
 
     def read_trusted_context(self):
         with self._session_lock():
@@ -1742,7 +2979,11 @@ class SessionStore:
                 )
             path = self.root / "pr.bundle"
             try:
-                data = path.read_bytes()
+                data = _bounded_file_bytes(
+                    path,
+                    expected_size,
+                    "frozen Git object bundle",
+                )
             except FileNotFoundError as error:
                 raise Conflict("frozen Git object bundle is missing") from error
             digest = hashlib.sha256(data).hexdigest()
@@ -1825,7 +3066,9 @@ class SessionStore:
             target = self.frozen_target()
             path = self.root / "pr.diff"
             try:
-                digest, size = _file_identity(path)
+                digest, size = _bounded_file_identity(
+                    path, target["diff_bytes"], "frozen target projection pr.diff"
+                )
             except FileNotFoundError as error:
                 raise Conflict("frozen target projection pr.diff is missing") from error
             if size != target["diff_bytes"] or digest != target["diff_sha256"]:
@@ -1833,7 +3076,11 @@ class SessionStore:
             if "trusted_context_sha256" in target:
                 path = self.root / "trusted-context.json"
                 try:
-                    digest, size = _file_identity(path)
+                    digest, size = _bounded_file_identity(
+                        path,
+                        target["trusted_context_bytes"],
+                        "frozen trusted context",
+                    )
                 except FileNotFoundError as error:
                     raise Conflict("frozen trusted context is missing") from error
                 if (
@@ -1844,7 +3091,11 @@ class SessionStore:
             if "object_bundle_sha256" in target:
                 path = self.root / "pr.bundle"
                 try:
-                    digest, size = _file_identity(path)
+                    digest, size = _bounded_file_identity(
+                        path,
+                        target["object_bundle_bytes"],
+                        "frozen Git object bundle",
+                    )
                 except FileNotFoundError as error:
                     raise Conflict("frozen Git object bundle is missing") from error
                 if (
@@ -1886,6 +3137,8 @@ class SessionStore:
         beat = self._beat_document(document)
         with self._first_work_write() as db:
             session, _execution_policy = self._session_execution_policy(db)
+            if session.get("linked_implementation") is not None:
+                raise Conflict("linked implementation finding is immutable")
             row = db.execute(
                 "SELECT body_json, delivery_state, delivery_json FROM beats WHERE n = ?",
                 (beat["n"],),
@@ -2066,6 +3319,10 @@ class SessionStore:
             if session_id is not None and self._session_row(db)["session_id"] != session_id:
                 raise Conflict("session identity does not match")
             session, execution_policy = self._session_execution_policy(db)
+            if session.get("linked_implementation") is not None:
+                raise Conflict(
+                    "linked implementation actions are reserved for the attested gateway"
+                )
             existing = db.execute(
                 "SELECT * FROM actions WHERE action_id = ?", (action_id,)
             ).fetchone()
@@ -2413,6 +3670,13 @@ class SessionStore:
                 raise Conflict(
                     f"{kind} delivery does not match {session.get('audience')!r}"
                 )
+            if (
+                execution_policy is not None
+                and execution_policy.get("mode") == "gateway_attested"
+            ):
+                raise Conflict(
+                    "gateway-attested commit delivery must use the implementation gateway"
+                )
             if current and current.get("kind") not in (None, kind):
                 raise Conflict(
                     f"beat {beat_n} expects {current.get('kind')} delivery, not {kind}"
@@ -2500,6 +3764,10 @@ class SessionStore:
             beat = json.loads(row["body_json"])
             current = json.loads(row["delivery_json"]) if row["delivery_json"] else None
             session = json.loads(self._session_row(db)["body_json"])
+            if session.get("linked_implementation") is not None:
+                raise Conflict(
+                    "linked implementation failure must use the implementation gateway"
+                )
             if self._audience_mode(session) == "report":
                 raise Conflict("report inclusion has no external delivery to fail")
             desired = {

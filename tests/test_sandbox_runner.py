@@ -148,6 +148,7 @@ class RequestValidationTests(unittest.TestCase):
             "source/./nested",
             "source\\nested",
             "source\nchild",
+            "x" * 256,
             "x" * 4097,
         )
         for value in invalid:
@@ -166,10 +167,13 @@ class RequestValidationTests(unittest.TestCase):
     def test_executable_requires_one_canonical_absolute_path(self):
         invalid = (
             "usr/local/bin/python3",
+            "/",
             "//usr/local/bin/python3",
             "/usr/local/../bin/python3",
             "/usr/local/bin/python3/",
             "/usr/local/bin/py\nthon3",
+            "/" + "x" * 256,
+            "/" + "/".join("x" * 255 for _ in range(16)),
         )
         for value in invalid:
             request = request_value()
@@ -177,6 +181,23 @@ class RequestValidationTests(unittest.TestCase):
             request["job"]["argv"][0] = value
             with self.subTest(value=value):
                 with self.assertRaisesRegex(sandbox_runner.RunnerError, "executable path"):
+                    sandbox_runner._validate_request(request)
+
+    def test_argv_and_environment_fit_the_fixed_exec_vector_budget(self):
+        invalid = []
+        argument = request_value()
+        argument["job"]["argv"].append("x" * (128 * 1024))
+        invalid.append(argument)
+        pointers = request_value()
+        pointers["job"]["argv"].extend([""] * 15_000)
+        invalid.append(pointers)
+        environment = request_value()
+        environment["job"]["environment"]["OVERSIZED"] = "x" * (128 * 1024)
+        invalid.append(environment)
+
+        for request in invalid:
+            with self.subTest(arguments=len(request["job"]["argv"])):
+                with self.assertRaisesRegex(sandbox_runner.RunnerError, "exec"):
                     sandbox_runner._validate_request(request)
 
     def test_argv_must_name_the_verified_executable(self):

@@ -496,12 +496,15 @@ class GatewayPolicyTests(unittest.TestCase):
     def test_policy_rejects_noncanonical_executable_paths_and_unsafe_integers(self):
         invalid_paths = (
             "usr/bin/python3",
+            "/",
             "//usr/bin/python3",
             "/usr//bin/python3",
             "/usr/../bin/python3",
             "/usr/bin/./python3",
             "/usr\\bin\\python3",
             "/usr/bin/python3\x01",
+            "/" + "x" * 256,
+            "/" + "/".join("x" * 255 for _ in range(16)),
         )
         for path in invalid_paths:
             with self.subTest(path=path):
@@ -640,6 +643,15 @@ class ExecutionRequestTests(unittest.TestCase):
         value = copy.deepcopy(self.request)
         value["exitCode"] = 9_007_199_254_740_992
         invalid.append(value)
+        value = copy.deepcopy(self.request)
+        value["exitCode"] = 256
+        invalid.append(value)
+        value = copy.deepcopy(self.request)
+        value["job"]["cwd"] = "x" * 256
+        invalid.append(value)
+        value = copy.deepcopy(self.request)
+        value["job"]["cwd"] = "x" * 4097
+        invalid.append(value)
 
         for value in invalid:
             with self.subTest(value=value):
@@ -651,6 +663,20 @@ class ExecutionRequestTests(unittest.TestCase):
         value["target"]["head_sha"] = "NOT-A-COMMIT"
         with self.assertRaises(GatewayError):
             ExecutionRequest(value, self.policy)
+
+    def test_request_rejects_exec_vectors_that_linux_cannot_launch(self):
+        invalid = []
+        argument = copy.deepcopy(self.request)
+        argument["job"]["argv"].append("x" * (128 * 1024))
+        invalid.append(argument)
+        pointers = copy.deepcopy(self.request)
+        pointers["job"]["argv"].extend([""] * 15_000)
+        invalid.append(pointers)
+
+        for value in invalid:
+            with self.subTest(arguments=len(value["job"]["argv"])):
+                with self.assertRaises(GatewayError):
+                    ExecutionRequest(value, self.policy)
 
 
 class ExecutionBrokerTests(BrokerCase):

@@ -583,6 +583,11 @@ def _git_deadline():
     return time.monotonic() + _GIT_WALL_SECONDS
 
 
+def _check_deadline(deadline):
+    if deadline - time.monotonic() <= 0:
+        raise ArtifactError("Git artifact verification timed out")
+
+
 def _run_git(
     executable,
     environment,
@@ -1179,15 +1184,15 @@ def build_output_bundle(
     return BuiltOutputBundle(bundle, verified)
 
 
-def verify_output_bundle(
+def _verified_output_records(
     bundle,
     *,
     maximum_workspace_bytes,
     maximum_bundle_bytes,
-    expected=None,
-    git="git",
+    expected,
+    git,
+    deadline=None,
 ):
-    """Derive a fixed-ref output descriptor in a fresh SHA-256 quarantine."""
     maximum_workspace_bytes = _positive_limit(
         maximum_workspace_bytes,
         "maximum_workspace_bytes",
@@ -1197,8 +1202,16 @@ def verify_output_bundle(
         raise ArtifactError("output bundle must be non-empty bytes")
     if len(bundle) > maximum_bundle_bytes:
         raise ArtifactError("output bundle exceeds its byte limit")
+    digest = hashlib.sha256(bundle).hexdigest()
+    if expected is not None:
+        if not isinstance(expected, ArtifactDescriptor):
+            raise ArtifactError(
+                "expected output descriptor must be an ArtifactDescriptor"
+            )
+        if len(bundle) != expected.size or digest != expected.sha256:
+            raise ArtifactError("output bundle does not match its expected descriptor")
     executable = _git_path(git)
-    deadline = _git_deadline()
+    deadline = _git_deadline() if deadline is None else deadline
     temporary, repo, environment, refs = _quarantine_bundle(
         bundle,
         "sha256",
@@ -1222,7 +1235,9 @@ def verify_output_bundle(
         )
         workspace = Path(temporary.name) / "materialized"
         _materialize_records(records, workspace, maximum_workspace_bytes)
+        _check_deadline(deadline)
         tree = synthetic_git_tree(workspace, maximum_bytes=maximum_workspace_bytes)
+        _check_deadline(deadline)
         raw_tree = _run_git(
             executable,
             environment,
@@ -1236,9 +1251,122 @@ def verify_output_bundle(
         temporary.cleanup()
     descriptor = ArtifactDescriptor(
         tree,
-        hashlib.sha256(bundle).hexdigest(),
+        digest,
         len(bundle),
     )
     if expected is not None and descriptor != expected:
         raise ArtifactError("output bundle does not match its expected descriptor")
+    return descriptor, records
+
+
+def verify_output_bundle(
+    bundle,
+    *,
+    maximum_workspace_bytes,
+    maximum_bundle_bytes,
+    expected=None,
+    git="git",
+    deadline=None,
+):
+    """Derive a fixed-ref output descriptor in a fresh SHA-256 quarantine."""
+    descriptor, _records = _verified_output_records(
+        bundle,
+        maximum_workspace_bytes=maximum_workspace_bytes,
+        maximum_bundle_bytes=maximum_bundle_bytes,
+        expected=expected,
+        git=git,
+        deadline=deadline,
+    )
     return descriptor
+
+
+def materialize_output_bundle(
+    bundle,
+    destination,
+    *,
+    maximum_workspace_bytes,
+    maximum_bundle_bytes,
+    expected,
+    git="git",
+    deadline=None,
+):
+    """Verify an expected output bundle and materialize it into a new directory."""
+    if not isinstance(expected, ArtifactDescriptor):
+        raise ArtifactError("expected output descriptor must be an ArtifactDescriptor")
+    descriptor, records = _verified_output_records(
+        bundle,
+        maximum_workspace_bytes=maximum_workspace_bytes,
+        maximum_bundle_bytes=maximum_bundle_bytes,
+        expected=expected,
+        git=git,
+        deadline=deadline,
+    )
+    workspace = _materialize_records(
+        records,
+        destination,
+        maximum_workspace_bytes,
+    )
+    if deadline is not None:
+        _check_deadline(deadline)
+    if (
+        synthetic_git_tree(workspace, maximum_bytes=maximum_workspace_bytes)
+        != descriptor.git_tree
+    ):
+        raise ArtifactError("materialized output tree does not match its descriptor")
+    if deadline is not None:
+        _check_deadline(deadline)
+    return descriptor
+
+
+def measure_commit_tree(
+    repo,
+    commit,
+    *,
+    maximum_workspace_bytes,
+    git="git",
+    deadline=None,
+):
+    """Measure one exact SHA-1 commit as a synthetic SHA-256 tree."""
+    maximum_workspace_bytes = _positive_limit(
+        maximum_workspace_bytes,
+        "maximum_workspace_bytes",
+    )
+    if not isinstance(commit, str) or not _SHA1.fullmatch(commit):
+        raise ArtifactError("commit must be a full lowercase SHA-1 object ID")
+    repository = Path(os.fsdecode(_path_bytes(repo, "repository")))
+    executable = _git_path(git)
+    deadline = _git_deadline() if deadline is None else deadline
+    with tempfile.TemporaryDirectory(prefix="underwrite-commit-tree-") as name:
+        root = Path(name)
+        environment = _git_environment(root, executable)
+        try:
+            object_format = _run_git(
+                executable,
+                environment,
+                repository,
+                ["rev-parse", "--show-object-format"],
+                deadline=deadline,
+            ).decode("ascii", "strict").strip()
+        except UnicodeError as error:
+            raise ArtifactError("Git returned a non-ASCII object format") from error
+        if object_format != "sha1":
+            raise ArtifactError("repository must use SHA-1 objects")
+        if _resolve_commit(executable, environment, repository, commit, deadline) != commit:
+            raise ArtifactError("commit must identify one exact SHA-1 commit")
+        records = _git_tree_records(
+            executable,
+            environment,
+            repository,
+            commit,
+            maximum_workspace_bytes,
+            deadline,
+        )
+        workspace = root / "materialized"
+        _materialize_records(records, workspace, maximum_workspace_bytes)
+        _check_deadline(deadline)
+        measured = synthetic_git_tree(
+            workspace,
+            maximum_bytes=maximum_workspace_bytes,
+        )
+        _check_deadline(deadline)
+        return measured

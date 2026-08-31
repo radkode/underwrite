@@ -3,6 +3,7 @@
 import importlib.util
 import hashlib
 import json
+import os
 import shutil
 import sqlite3
 import subprocess
@@ -495,7 +496,7 @@ class FrozenTargets(unittest.TestCase):
         (self.root / "trusted-context.json").write_text("{}\n", encoding="utf-8")
         with self.assertRaisesRegex(session_store.Conflict, "does not match"):
             self.store.read_trusted_context()
-        with self.assertRaisesRegex(session_store.Conflict, "does not match"):
+        with self.assertRaisesRegex(session_store.Conflict, "one exact regular file"):
             self.store.check_execution()
 
     def test_trusted_context_rejects_a_governing_symlink(self):
@@ -831,7 +832,7 @@ class FrozenTargets(unittest.TestCase):
     def test_exact_replay_repairs_a_corrupt_projection(self):
         target = self.freeze()
         (self.root / "pr.diff").write_bytes(b"tampered")
-        with self.assertRaisesRegex(session_store.Conflict, "does not match"):
+        with self.assertRaisesRegex(session_store.Conflict, "one exact regular file"):
             self.store.verify_target_files()
 
         replay = self.freeze()
@@ -885,9 +886,9 @@ class FrozenTargets(unittest.TestCase):
         with self.assertRaisesRegex(session_store.Conflict, "does not match"):
             self.store.copy_verified_object_bundle(bad_copy)
         self.assertFalse(bad_copy.exists())
-        with self.assertRaisesRegex(session_store.Conflict, "does not match"):
+        with self.assertRaisesRegex(session_store.Conflict, "one exact regular file"):
             self.store.read_object_bundle()
-        with self.assertRaisesRegex(session_store.Conflict, "does not match"):
+        with self.assertRaisesRegex(session_store.Conflict, "one exact regular file"):
             self.store.verify_target_files()
 
     def test_concurrent_different_freezes_cannot_split_identity_and_diff(self):
@@ -1344,7 +1345,7 @@ class CreatingAndMigrating(StoreCase):
 
     def test_the_database_and_export_format_are_versioned(self):
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
             self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "delete")
         db = self.store._connect()
         try:
@@ -1364,7 +1365,7 @@ class CreatingAndMigrating(StoreCase):
 
         self.assertNotIn("execution_policy", upgraded.snapshot()[0])
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
 
     def test_the_session_identity_survives_restart_but_not_recreation(self):
         first = self.store.delivery_state()["session_id"]
@@ -1389,7 +1390,7 @@ class CreatingAndMigrating(StoreCase):
         self.assertEqual(upgraded.head()["action_id"], action["action_id"])
         self.assertTrue(upgraded.delivery_state()["session_id"])
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
             columns = {row[1] for row in db.execute("PRAGMA table_info(session)")}
         self.assertIn("session_id", columns)
 
@@ -1411,7 +1412,7 @@ class CreatingAndMigrating(StoreCase):
         failed = upgraded.presentation_snapshot()[1][0]["delivery"]
         self.assertEqual(failed["owed"], "retry with the fixture")
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 4)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
 
     def test_a_v2_upgrade_removes_a_failure_injected_fix(self):
         beat = self.beat(1)
@@ -1493,13 +1494,13 @@ class CreatingAndMigrating(StoreCase):
         (self.root / "session.sqlite3").unlink()
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
             self.assertEqual(db.execute("PRAGMA journal_mode = WAL").fetchone()[0], "wal")
-            db.execute("PRAGMA user_version = 5")
+            db.execute("PRAGMA user_version = 6")
 
         with self.assertRaisesRegex(session_store.StoreError, "newer than supported"):
             session_store.SessionStore(self.root)
 
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
             self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
 
     def test_legacy_actions_without_an_ack_migrate_as_handled(self):
@@ -2304,6 +2305,481 @@ class RecoveringAndDelivering(StoreCase):
             (self.root / "session.json").read_text(encoding="utf-8")
         )
         self.assertEqual(exported["title"], "new")
+
+
+class LinkedImplementations(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.source_root = self.root / "source"
+        self.source = session_store.SessionStore(self.source_root)
+        self.target = {
+            "version": 1,
+            "kind": "github_pr",
+            "repo": "acme/widget",
+            "number": 17,
+            "state": "open",
+            "merged_at": None,
+            "base_sha": "a" * 40,
+            "head_sha": "b" * 40,
+            "head_repo_id": 123,
+            "head_repo": "acme/widget",
+            "head_ref": "feature",
+            "merge_base_sha": "c" * 40,
+            "changed_files": 1,
+        }
+        diff = self.root / "pr.diff"
+        metadata = self.root / "pr.json"
+        context = self.root / "trusted-context.json"
+        bundle = self.root / "pr.bundle"
+        diff.write_bytes(b"diff --git a/a.py b/a.py\n")
+        metadata.write_text('{"number":17}\n', encoding="utf-8")
+        context.write_text(
+            json.dumps(
+                {"version": 1, "base_sha": "a" * 40, "files": []},
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        bundle.write_bytes(b"frozen object bundle")
+        self.target = self.source.freeze_target(
+            self.target, diff, metadata, context, bundle
+        )
+        self.source.put_beat(FLAG)
+        action = self.source.produce("accept-source", 1, "accept", "approved finding")
+        self.source.ack(action["seq"])
+        self.source_action = action["seq"]
+
+    def profile(self):
+        return {
+            "version": 1,
+            "keyId": "sha256:" + "d" * 64,
+            "signerId": "urn:underwrite:signer:test",
+            "executorId": "urn:underwrite:executor:test",
+            "job": {"argv": ["python3", "fix.py"]},
+            "sandbox": {"limits": {"workspaceBytes": 1024, "outputBytes": 1024}},
+            "exitCode": 0,
+        }
+
+    def authorize(self, actor="reviewer", approval="implement this finding"):
+        return self.source.authorize_implementation(
+            self.source_action, 1, actor, approval
+        )
+
+    def create_child(self):
+        link = self.authorize()
+        created = self.source.create_linked_implementation(link["link_id"])
+        ready = self.source.complete_implementation_link(
+            link["link_id"], created["child_session_id"]
+        )
+        self.assertEqual(ready["state"], "ready")
+        return session_store.SessionStore(created["child_root"]), link, created
+
+    def evidence(self, attempt, capability=b"capability", receipt=b"receipt"):
+        profile = attempt["trusted_profile"]
+        return capability, receipt, {
+            "version": 1,
+            "requestSha256": attempt["request_sha256"],
+            "keyId": profile["keyId"],
+            "signerId": profile["signerId"],
+            "executorId": profile["executorId"],
+            "capabilitySha256": hashlib.sha256(capability).hexdigest(),
+            "receiptSha256": hashlib.sha256(receipt).hexdigest(),
+            "inputTree": "e" * 64,
+            "outputTree": "f" * 64,
+            "outputBundle": {"sha256": "1" * 64, "bytes": 19},
+            "stdout": {"sha256": hashlib.sha256(b"").hexdigest(), "bytes": 0, "truncated": False},
+            "stderr": {"sha256": hashlib.sha256(b"").hexdigest(), "bytes": 0, "truncated": False},
+            "exitCode": profile["exitCode"],
+        }
+
+    def test_authorization_is_distinct_idempotent_and_does_not_mutate_the_source(self):
+        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+            before = db.execute(
+                "SELECT body_json, render_revision FROM session WHERE singleton = 1"
+            ).fetchone()
+            beat_before = db.execute("SELECT * FROM beats WHERE n = 1").fetchone()
+
+        link = self.authorize()
+        self.assertEqual(self.authorize(), link)
+        self.assertEqual(link["source_beat"], 1)
+        self.assertEqual(link["child_path"], f"implementations/{link['link_id']}")
+        self.assertEqual(
+            link["branch"], f"underwrite/implementation-{link['link_id'][:16]}"
+        )
+        with self.assertRaisesRegex(session_store.Conflict, "different implementation"):
+            self.authorize(approval="different approval")
+        with self.assertRaisesRegex(session_store.Conflict, "not the accept"):
+            self.source.authorize_implementation(self.source_action, 2, "reviewer", "yes")
+
+        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+            self.assertEqual(
+                db.execute(
+                    "SELECT body_json, render_revision FROM session WHERE singleton = 1"
+                ).fetchone(),
+                before,
+            )
+            self.assertEqual(db.execute("SELECT * FROM beats WHERE n = 1").fetchone(), beat_before)
+
+    def test_create_is_recoverable_and_seeds_one_immutable_gateway_child(self):
+        link = self.authorize()
+        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+            source_before = db.execute(
+                "SELECT body_json, render_revision FROM session WHERE singleton = 1"
+            ).fetchone()
+            beat_before = db.execute("SELECT * FROM beats WHERE n = 1").fetchone()
+        created = self.source.create_linked_implementation(link["link_id"])
+        replay = self.source.create_linked_implementation(link["link_id"])
+        self.assertEqual(replay, created)
+        self.source.complete_implementation_link(
+            link["link_id"], created["child_session_id"]
+        )
+        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+            self.assertEqual(
+                db.execute(
+                    "SELECT body_json, render_revision FROM session WHERE singleton = 1"
+                ).fetchone(),
+                source_before,
+            )
+            self.assertEqual(
+                db.execute("SELECT * FROM beats WHERE n = 1").fetchone(), beat_before
+            )
+        child = session_store.SessionStore(created["child_root"])
+        session, beats = child.snapshot()
+        self.assertEqual(session["audience"]["mode"], "branch")
+        self.assertEqual(session["delivery_branch"], link["branch"])
+        self.assertEqual(session["execution_policy"]["mode"], "gateway_attested")
+        self.assertEqual(session["execution_policy"]["link_id"], link["link_id"])
+        self.assertEqual(session["linked_implementation"]["target_sha256"], link["target_sha256"])
+        self.assertEqual([beat["n"] for beat in beats], [1])
+        self.assertEqual(beats[0]["state"], "accepted")
+        self.assertEqual(child.head()["action_id"], f"implementation:{link['link_id']}")
+        pending = child.reconcile()["pending_deliveries"]
+        self.assertEqual(pending[0]["kind"], "commit")
+        self.assertEqual(child.verify_target_files(), self.source.verify_target_files())
+
+        with self.assertRaisesRegex(session_store.Conflict, "verified output application"):
+            child.check_execution()
+        with self.assertRaisesRegex(session_store.Conflict, "reserved for the attested gateway"):
+            child.produce("ordinary-action", 1, "note", "bypass")
+        with self.assertRaisesRegex(session_store.Conflict, "implementation gateway"):
+            child.land(1, 1, "9" * 40, "commit", branch=link["branch"])
+        with self.assertRaisesRegex(session_store.Conflict, "finding is immutable"):
+            child.put_beat(beats[0])
+        with self.assertRaisesRegex(session_store.Conflict, "must use the implementation gateway"):
+            child.fail(1, "bypass", "retry")
+        changed = dict(session["linked_implementation"], actor="attacker")
+        with self.assertRaisesRegex(session_store.Conflict, "metadata is immutable"):
+            child.patch_session({"linked_implementation": changed})
+
+    def test_precreated_symlink_cannot_redirect_the_child_session(self):
+        link = self.authorize()
+        implementation_root = self.source_root / "implementations"
+        implementation_root.mkdir()
+        outside = self.root / "outside"
+        outside.mkdir()
+        (implementation_root / link["link_id"]).symlink_to(
+            outside, target_is_directory=True
+        )
+
+        with self.assertRaisesRegex(session_store.Conflict, "real directory"):
+            self.source.create_linked_implementation(link["link_id"])
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_foreign_child_session_is_rejected_before_projection_replacement(self):
+        link = self.authorize()
+        child_root = self.source_root / link["child_path"]
+        foreign = session_store.SessionStore(child_root)
+        foreign.patch_session({"title": "foreign session"})
+        marker = child_root / "pr.diff"
+        marker.write_bytes(b"foreign projection\n")
+        before = {
+            path.name: path.read_bytes()
+            for path in child_root.iterdir()
+            if path.is_file()
+        }
+
+        with self.assertRaisesRegex(session_store.Conflict, "projection pr.diff changed"):
+            self.source.create_linked_implementation(link["link_id"])
+
+        after = {
+            path.name: path.read_bytes()
+            for path in child_root.iterdir()
+            if path.is_file()
+        }
+        self.assertEqual(after, before)
+
+    def test_foreign_directory_without_database_is_never_adopted(self):
+        link = self.authorize()
+        child_root = self.source_root / link["child_path"]
+        child_root.mkdir(parents=True)
+        (child_root / "session.json").write_bytes(b'{"title":"foreign"}\n')
+        (child_root / "notes.txt").write_bytes(b"keep me\n")
+        before = {
+            path.name: path.read_bytes()
+            for path in child_root.iterdir()
+        }
+
+        with self.assertRaisesRegex(session_store.Conflict, "database cannot be inspected"):
+            self.source.create_linked_implementation(link["link_id"])
+
+        self.assertEqual(
+            {path.name: path.read_bytes() for path in child_root.iterdir()},
+            before,
+        )
+
+    def test_hard_linked_foreign_database_is_never_opened_as_a_child(self):
+        link = self.authorize()
+        foreign_root = self.root / "foreign"
+        foreign = session_store.SessionStore(foreign_root)
+        foreign.patch_session({"title": "foreign session"})
+        database = foreign_root / "session.sqlite3"
+        before = database.read_bytes()
+        child_root = self.source_root / link["child_path"]
+        child_root.mkdir(parents=True)
+        os.link(database, child_root / "session.sqlite3")
+        (child_root / ".session.lock").write_bytes(b"")
+
+        with self.assertRaisesRegex(session_store.Conflict, "database"):
+            self.source.create_linked_implementation(link["link_id"])
+
+        self.assertEqual(database.read_bytes(), before)
+        self.assertEqual(foreign.snapshot()[0]["title"], "foreign session")
+        self.assertFalse((child_root / "pr.diff").exists())
+
+    def test_child_database_replacement_blocks_link_completion(self):
+        link = self.authorize()
+        created = self.source.create_linked_implementation(link["link_id"])
+        child_root = Path(created["child_root"])
+        database = child_root / "session.sqlite3"
+        external = self.root / "external-child.sqlite3"
+        database.rename(external)
+        database.symlink_to(external)
+        before = external.read_bytes()
+
+        with self.assertRaisesRegex(session_store.Conflict, "database must be"):
+            self.source.complete_implementation_link(
+                link["link_id"], created["child_session_id"]
+            )
+
+        self.assertEqual(external.read_bytes(), before)
+
+    def test_crash_before_child_publish_leaves_no_partial_final_directory(self):
+        link = self.authorize()
+        with mock.patch.object(
+            session_store.SessionStore,
+            "_initialize_linked_child",
+            side_effect=RuntimeError("stopped before child publish"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "stopped"):
+                self.source.create_linked_implementation(link["link_id"])
+
+        child_root = self.source_root / link["child_path"]
+        self.assertFalse(child_root.exists())
+        self.assertEqual(list(child_root.parent.iterdir()), [])
+        created = self.source.create_linked_implementation(link["link_id"])
+        ready = self.source.complete_implementation_link(
+            link["link_id"], created["child_session_id"]
+        )
+
+        self.assertEqual(ready["state"], "ready")
+        child = session_store.SessionStore(child_root)
+        self.assertEqual(
+            child.snapshot()[0]["linked_implementation"]["link_id"],
+            link["link_id"],
+        )
+
+    def test_published_child_with_a_hot_journal_is_not_opened_or_recovered(self):
+        link = self.authorize()
+        self.source.create_linked_implementation(link["link_id"])
+        child_root = self.source_root / link["child_path"]
+        database = child_root / "session.sqlite3"
+        crashed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import os,sqlite3,sys; "
+                "db=sqlite3.connect(sys.argv[1]); "
+                "db.execute('PRAGMA journal_mode=DELETE'); "
+                "db.execute('BEGIN IMMEDIATE'); "
+                "db.execute(\"UPDATE session SET body_json='{\\\"partial\\\":true}'\"); "
+                "os._exit(0)",
+                str(database),
+            ],
+            check=False,
+        )
+        self.assertEqual(crashed.returncode, 0)
+        self.assertTrue((child_root / "session.sqlite3-journal").exists())
+        before = {
+            path.name: path.read_bytes()
+            for path in child_root.iterdir()
+            if path.is_file()
+        }
+
+        with self.assertRaisesRegex(session_store.Conflict, "unfinished journal"):
+            self.source.create_linked_implementation(link["link_id"])
+
+        self.assertEqual(
+            {
+                path.name: path.read_bytes()
+                for path in child_root.iterdir()
+                if path.is_file()
+            },
+            before,
+        )
+
+    def test_changed_source_beat_cannot_seed_an_authorized_child(self):
+        link = self.authorize()
+        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+            row = db.execute("SELECT body_json FROM beats WHERE n = 1").fetchone()
+            beat = json.loads(row[0])
+            beat["slots"]["what"] = "changed after authorization"
+            db.execute(
+                "UPDATE beats SET revision = revision + 1, body_json = ? WHERE n = 1",
+                (json.dumps(beat, separators=(",", ":"), sort_keys=True),),
+            )
+
+        with self.assertRaisesRegex(session_store.Conflict, "revision moved"):
+            self.source.create_linked_implementation(link["link_id"])
+        self.assertFalse((self.source_root / link["child_path"] / "session.sqlite3").exists())
+
+    def test_attempt_reservation_and_failure_replay_are_exact(self):
+        child, _link, _created = self.create_child()
+        first = child.reserve_implementation_attempt(1, self.profile())
+        self.assertEqual(first["state"], "reserved")
+        self.assertEqual(child.reserve_implementation_attempt(1, self.profile()), first)
+        self.assertEqual(len(first["challenge"]), 64)
+        self.assertEqual(first["request"]["challenge"], first["challenge"])
+        self.assertEqual(first["request"]["action"], {"seq": 1, "beat": 1, "attempt": 1})
+        changed = dict(self.profile(), executorId="different")
+        with self.assertRaisesRegex(session_store.Conflict, "different trusted profile"):
+            child.reserve_implementation_attempt(1, changed)
+
+        failed = child.fail_implementation_attempt(1, 1, "gateway unavailable")
+        self.assertEqual(failed["state"], "failed")
+        self.assertEqual(
+            child.fail_implementation_attempt(1, 1, "gateway unavailable"), failed
+        )
+        with self.assertRaisesRegex(session_store.Conflict, "different reason"):
+            child.fail_implementation_attempt(1, 1, "another failure")
+        resumed = session_store.SessionStore(child.root)
+        second = resumed.reserve_implementation_attempt(1, self.profile())
+        self.assertEqual(second["attempt"], 2)
+        self.assertNotEqual(second["challenge"], first["challenge"])
+        self.assertEqual(resumed.reconcile()["pending_deliveries"][0]["attempt"], 2)
+
+    def test_attempt_profile_bounds_fail_before_reservation(self):
+        child, _link, _created = self.create_child()
+        profiles = []
+        oversized = self.profile()
+        oversized["job"]["argv"].append(
+            "x" * session_store.MAX_IMPLEMENTATION_PROFILE_BYTES
+        )
+        profiles.append(("byte limit", oversized))
+        exit_code = self.profile()
+        exit_code["exitCode"] = 256
+        profiles.append(("exitCode", exit_code))
+
+        for name, profile in profiles:
+            with self.subTest(name=name):
+                with self.assertRaises(session_store.StoreError):
+                    child.reserve_implementation_attempt(1, profile)
+                with sqlite3.connect(str(child.root / "session.sqlite3")) as db:
+                    self.assertEqual(
+                        db.execute(
+                            "SELECT COUNT(*) FROM implementation_attempts"
+                        ).fetchone()[0],
+                        0,
+                    )
+
+    def test_verified_plan_survives_restart_and_only_exact_commit_lands(self):
+        child, link, _created = self.create_child()
+        attempt = child.reserve_implementation_attempt(1, self.profile())
+        capability, receipt, evidence = self.evidence(attempt)
+        verified = child.record_verified_implementation(
+            1, 1, capability, receipt, evidence
+        )
+        self.assertEqual(verified["state"], "verified")
+        self.assertEqual(
+            child.record_verified_implementation(1, 1, capability, receipt, evidence),
+            verified,
+        )
+        plan = {
+            "version": 1,
+            "commit": "2" * 40,
+            "parent": self.target["head_sha"],
+            "tree": "3" * 40,
+            "outputTree": evidence["outputTree"],
+            "branch": link["branch"],
+        }
+        prepared = child.prepare_implementation_land(1, 1, plan)
+        self.assertEqual(prepared["state"], "prepared")
+        restarted = session_store.SessionStore(child.root)
+        self.assertEqual(restarted.implementation_attempt(1, 1)["commit_plan"], plan)
+        with self.assertRaisesRegex(session_store.Conflict, "persisted plan"):
+            restarted.finish_implementation_land(1, 1, "4" * 40, link["branch"])
+        landed = restarted.finish_implementation_land(
+            1, 1, plan["commit"], plan["branch"]
+        )
+        self.assertEqual(landed["artifact"], plan["commit"])
+        self.assertEqual(
+            restarted.finish_implementation_land(1, 1, plan["commit"], plan["branch"]),
+            landed,
+        )
+        self.assertEqual(restarted.implementation_attempt(1, 1)["state"], "landed")
+        self.assertFalse(restarted.delivery_state()["recovery"])
+
+    def test_plan_rejects_a_moved_parent_and_unverified_output(self):
+        child, link, _created = self.create_child()
+        attempt = child.reserve_implementation_attempt(1, self.profile())
+        capability, receipt, evidence = self.evidence(attempt)
+        child.record_verified_implementation(1, 1, capability, receipt, evidence)
+        base = {
+            "version": 1,
+            "commit": "2" * 40,
+            "parent": "4" * 40,
+            "tree": "3" * 40,
+            "outputTree": evidence["outputTree"],
+            "branch": link["branch"],
+        }
+        with self.assertRaisesRegex(session_store.Conflict, "frozen target head"):
+            child.prepare_implementation_land(1, 1, base)
+        base["parent"] = self.target["head_sha"]
+        base["outputTree"] = "5" * 64
+        with self.assertRaisesRegex(session_store.Conflict, "verified output"):
+            child.prepare_implementation_land(1, 1, base)
+
+    def test_v4_upgrade_adds_authority_tables_without_changing_session_state(self):
+        before = self.source.snapshot()
+        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+            db.execute("DROP TABLE implementation_attempts")
+            db.execute("DROP TABLE implementation_links")
+            db.execute("PRAGMA user_version = 4")
+
+        upgraded = session_store.SessionStore(self.source_root)
+
+        self.assertEqual(upgraded.snapshot(), before)
+        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+            names = {
+                row[0]
+                for row in db.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
+        self.assertIn("implementation_links", names)
+        self.assertIn("implementation_attempts", names)
+
+    def test_linked_json_export_cannot_be_reimported_without_attempt_authority(self):
+        child, _link, _created = self.create_child()
+        child.reserve_implementation_attempt(1, self.profile())
+        child.export_json()
+        (child.root / "session.sqlite3").unlink()
+
+        with self.assertRaisesRegex(session_store.MigrationError, "authoritative database"):
+            session_store.SessionStore(child.root)
 
 
 if __name__ == "__main__":
