@@ -22,6 +22,20 @@ import pr_snapshot  # noqa: E402
 import session_store  # noqa: E402
 
 
+class LookupTimeoutCase(unittest.TestCase):
+    def test_load_pr_bounds_the_github_process(self):
+        command = ["gh", "api"]
+        with mock.patch.object(
+            pr_snapshot.subprocess,
+            "run",
+            side_effect=subprocess.TimeoutExpired(command, 0.25),
+        ) as run:
+            with self.assertRaisesRegex(pr_snapshot.SnapshotError, "gh timed out"):
+                pr_snapshot.load_pr("owner/repo", 7, timeout=0.25)
+
+        self.assertEqual(run.call_args.kwargs["timeout"], 0.25)
+
+
 class SnapshotCase(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())

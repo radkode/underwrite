@@ -30,6 +30,11 @@ _MAX_WORKSPACE_BYTES = 64 * 1024 * 1024
 _MAX_OUTPUT_BYTES = 16 * 1024 * 1024
 _MAX_WALL_SECONDS = 900
 _MAX_CPU_SECONDS = 900
+_MAX_EXECUTABLE_PATH_BYTES = 4095
+_MAX_PATH_COMPONENT_BYTES = 255
+_MAX_EXEC_VECTOR_BYTES = 128 * 1024
+_MAX_EXEC_STRING_BYTES = 128 * 1024 - 1
+_EXEC_POINTER_BYTES = 8
 _SHA256 = frozenset("0123456789abcdef")
 _WORKSPACE_MOUNT = "/workspace"
 _WORKSPACE_ROOT = "/workspace/source"
@@ -204,7 +209,10 @@ def _validate_relative_path(value):
         raise RunnerError("job cwd must be a normalized relative POSIX path")
     if len(value.encode("utf-8")) > 4096:
         raise RunnerError("job cwd exceeds its byte limit")
-    return tuple(os.fsencode(part) for part in value.split("/"))
+    components = tuple(os.fsencode(part) for part in value.split("/"))
+    if any(len(component) > _MAX_PATH_COMPONENT_BYTES for component in components):
+        raise RunnerError("job cwd component exceeds its byte limit")
+    return components
 
 
 def _validate_executable(value):
@@ -213,15 +221,39 @@ def _validate_executable(value):
     if (
         not isinstance(path, str)
         or not path.startswith("/")
+        or path == "/"
         or path.startswith("//")
         or "\x00" in path
         or posixpath.normpath(path) != path
         or any(ord(character) < 32 or ord(character) == 127 for character in path)
     ):
         raise RunnerError("job executable path is not normalized and absolute")
+    encoded = path.encode("utf-8")
+    components = tuple(part.encode("utf-8") for part in path[1:].split("/"))
+    if len(encoded) > _MAX_EXECUTABLE_PATH_BYTES:
+        raise RunnerError("job executable path exceeds its byte limit")
+    if any(len(component) > _MAX_PATH_COMPONENT_BYTES for component in components):
+        raise RunnerError("job executable path component exceeds its byte limit")
     _sha256(value["sha256"], "job executable digest")
     _positive(value["bytes"], "job executable bytes")
     return value
+
+
+def _validate_exec_vector(argv, environment):
+    sizes = []
+    for argument in argv:
+        size = len(argument.encode("utf-8"))
+        if size > _MAX_EXEC_STRING_BYTES:
+            raise RunnerError("job argv contains an oversized exec string")
+        sizes.append(size + 1)
+    for name, value in environment.items():
+        size = len(name.encode("utf-8")) + 1 + len(value.encode("utf-8"))
+        if size > _MAX_EXEC_STRING_BYTES:
+            raise RunnerError("job environment contains an oversized exec string")
+        sizes.append(size + 1)
+    pointer_bytes = (len(argv) + len(environment) + 2) * _EXEC_POINTER_BYTES
+    if pointer_bytes + sum(sizes) > _MAX_EXEC_VECTOR_BYTES:
+        raise RunnerError("job argv and environment exceed the exec vector byte limit")
 
 
 def _validate_request(value):
@@ -297,6 +329,7 @@ def _validate_request(value):
             or "\x00" in item
         ):
             raise RunnerError("job environment contains an invalid entry")
+    _validate_exec_vector(argv, environment)
     if job["stdin"] != "closed":
         raise RunnerError("job standard input must be closed")
     return value

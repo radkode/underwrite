@@ -240,6 +240,7 @@ def _absolute_path(value, label):
     if (
         not isinstance(value, str)
         or not value.startswith("/")
+        or value == "/"
         or value.startswith("//")
         or "\x00" in value
         or "\\" in value
@@ -247,6 +248,18 @@ def _absolute_path(value, label):
         or any(ord(character) < 32 or ord(character) == 127 for character in value)
     ):
         raise GatewayError(f"{label} must be a normalized absolute POSIX path")
+    try:
+        encoded = value.encode("utf-8")
+        components = [part.encode("utf-8") for part in value[1:].split("/")]
+    except UnicodeEncodeError as error:
+        raise GatewayError(f"{label} must be valid UTF-8") from error
+    if len(encoded) > execution_receipt.MAX_EXECUTABLE_PATH_BYTES:
+        raise GatewayError(f"{label} exceeds the executable path byte limit")
+    if any(
+        len(component) > execution_receipt.MAX_JOB_CWD_COMPONENT_BYTES
+        for component in components
+    ):
+        raise GatewayError(f"{label} contains an oversized path component")
     return value
 
 
@@ -525,6 +538,8 @@ class ExecutionRequest:
         if value["sandbox"] != policy.sandbox:
             raise GatewayError("request sandbox does not match trusted policy")
         _nonnegative(value["exitCode"], "expected exit code")
+        if value["exitCode"] > 255:
+            raise GatewayError("expected exit code must not exceed 255")
         try:
             execution_receipt.build_host_capability_payload(
                 {

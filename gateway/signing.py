@@ -62,14 +62,13 @@ def _key_file(path, label):
     return path, before, data
 
 
-class OpenSSLSigner:
-    """Sign PAE bytes without exposing a generic signing endpoint to the job."""
+class OpenSSLVerifier:
+    """Verify PAE bytes against one host-pinned P-256 public key."""
 
     algorithm = "ecdsa-p256-sha256"
 
     def __init__(
         self,
-        private_key,
         public_key,
         signer_id,
         openssl="openssl",
@@ -78,14 +77,9 @@ class OpenSSLSigner:
         if executable is None:
             raise SigningError("openssl is not available")
         self.openssl = str(Path(executable).resolve())
-        self.private_key, private_details, self._private_key_bytes = _key_file(
-            private_key, "private key"
-        )
         self.public_key, _public_details, self._public_key_bytes = _key_file(
             public_key, "public key"
         )
-        if stat.S_IMODE(private_details.st_mode) & 0o077:
-            raise SigningError("private key must not be accessible to group or other")
         if not isinstance(signer_id, str) or not signer_id or "\x00" in signer_id:
             raise SigningError("signer identity must be non-empty text")
         self.signer_id = signer_id
@@ -104,10 +98,6 @@ class OpenSSLSigner:
         if len(public_der) != 91 or not public_der.startswith(_P256_SPKI_PREFIX):
             raise SigningError("signing key must be named-curve ECDSA P-256")
         self.key_id = "sha256:" + hashlib.sha256(public_der).hexdigest()
-        probe = b"underwrite signer preflight"
-        signature = self.sign(probe, self.key_id)
-        if self.verify(probe, self.key_id, signature) != self.signer_id:
-            raise SigningError("private and public signing keys do not match")
 
     def _run(self, command, data=None):
         environment = {
@@ -139,26 +129,6 @@ class OpenSSLSigner:
         handle.write(data)
         handle.flush()
         return handle
-
-    def sign(self, pae, key_id):
-        if not isinstance(pae, bytes) or not pae:
-            raise SigningError("signature input must be non-empty bytes")
-        if key_id != self.key_id:
-            raise SigningError("signature key ID does not match the configured key")
-        with self._temporary(self._private_key_bytes, "private-key-") as private:
-            signature = self._run(
-                [
-                    self.openssl,
-                    "dgst",
-                    "-sha256",
-                    "-sign",
-                    private.name,
-                ],
-                pae,
-            )
-        if not signature:
-            raise SigningError("openssl returned an empty signature")
-        return signature
 
     def verify(self, pae, key_id, signature):
         if not isinstance(pae, bytes) or not pae:
@@ -198,3 +168,45 @@ class OpenSSLSigner:
         if completed.returncode:
             raise SigningError("signature verification failed")
         return self.signer_id
+
+
+class OpenSSLSigner(OpenSSLVerifier):
+    """Sign PAE bytes without exposing a generic signing endpoint to the job."""
+
+    def __init__(
+        self,
+        private_key,
+        public_key,
+        signer_id,
+        openssl="openssl",
+    ):
+        super().__init__(public_key, signer_id, openssl=openssl)
+        self.private_key, private_details, self._private_key_bytes = _key_file(
+            private_key, "private key"
+        )
+        if stat.S_IMODE(private_details.st_mode) & 0o077:
+            raise SigningError("private key must not be accessible to group or other")
+        probe = b"underwrite signer preflight"
+        signature = self.sign(probe, self.key_id)
+        if self.verify(probe, self.key_id, signature) != self.signer_id:
+            raise SigningError("private and public signing keys do not match")
+
+    def sign(self, pae, key_id):
+        if not isinstance(pae, bytes) or not pae:
+            raise SigningError("signature input must be non-empty bytes")
+        if key_id != self.key_id:
+            raise SigningError("signature key ID does not match the configured key")
+        with self._temporary(self._private_key_bytes, "private-key-") as private:
+            signature = self._run(
+                [
+                    self.openssl,
+                    "dgst",
+                    "-sha256",
+                    "-sign",
+                    private.name,
+                ],
+                pae,
+            )
+        if not signature:
+            raise SigningError("openssl returned an empty signature")
+        return signature

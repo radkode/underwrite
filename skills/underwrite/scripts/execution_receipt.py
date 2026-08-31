@@ -27,6 +27,12 @@ MAX_PAYLOAD_BYTES = 512_000
 MAX_SIGNATURE_BYTES = 16_384
 MAX_CAPABILITY_SECONDS = 300
 MAX_JSON_INTEGER = 9_007_199_254_740_991
+MAX_JOB_CWD_BYTES = 4096
+MAX_JOB_CWD_COMPONENT_BYTES = 255
+MAX_EXECUTABLE_PATH_BYTES = 4095
+MAX_EXEC_VECTOR_BYTES = 128 * 1024
+MAX_EXEC_STRING_BYTES = 128 * 1024 - 1
+_EXEC_POINTER_BYTES = 8
 
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _GIT_OBJECT = re.compile(r"^[0-9a-f]{40}$")
@@ -75,6 +81,15 @@ _EXECUTION_EXPECTED_FIELDS = _COMMON_EXPECTED_FIELDS | {
     "stderr",
     "exitCode",
 }
+_EXECUTION_PROFILE_FIELDS = {
+    "version",
+    "keyId",
+    "signerId",
+    "executorId",
+    "job",
+    "sandbox",
+    "exitCode",
+}
 
 
 class ReceiptError(ValueError):
@@ -99,6 +114,16 @@ def _duplicate_object(pairs):
 
 def _non_finite(value):
     raise ReceiptError(f"JSON number {value} is not finite")
+
+
+def _bounded_json_integer(raw):
+    digits = raw[1:] if raw.startswith("-") else raw
+    if len(digits) > len(str(MAX_JSON_INTEGER)):
+        raise ReceiptError("JSON integer exceeds the supported range")
+    value = int(raw)
+    if not -MAX_JSON_INTEGER <= value <= MAX_JSON_INTEGER:
+        raise ReceiptError("JSON integer exceeds the supported range")
+    return value
 
 
 def _unicode_scalars(value, label):
@@ -132,10 +157,11 @@ def _load_json(data, label, maximum):
             text,
             object_pairs_hook=_duplicate_object,
             parse_constant=_non_finite,
+            parse_int=_bounded_json_integer,
         )
     except ReceiptError:
         raise
-    except (json.JSONDecodeError, RecursionError) as error:
+    except (json.JSONDecodeError, ValueError, RecursionError) as error:
         raise ReceiptError(f"{label} is not one complete JSON value") from error
     try:
         _unicode_scalars(value, label)
@@ -252,10 +278,10 @@ def _text(value, label, allow_empty=False):
     return value
 
 
-def _integer(value, label, minimum=0):
-    if type(value) is not int or not minimum <= value <= MAX_JSON_INTEGER:
+def _integer(value, label, minimum=0, maximum=MAX_JSON_INTEGER):
+    if type(value) is not int or not minimum <= value <= maximum:
         raise ReceiptError(
-            f"{label} must be an integer from {minimum} to {MAX_JSON_INTEGER}"
+            f"{label} must be an integer from {minimum} to {maximum}"
         )
     return value
 
@@ -450,6 +476,8 @@ def _validate_action(action):
 
 def _relative_path(value, label):
     _text(value, label)
+    if len(value.encode("utf-8")) > MAX_JOB_CWD_BYTES:
+        raise ReceiptError(f"{label} exceeds {MAX_JOB_CWD_BYTES} UTF-8 bytes")
     if value == ".":
         return
     if (
@@ -462,6 +490,13 @@ def _relative_path(value, label):
     parts = value.split("/")
     if any(part in ("", ".", "..") for part in parts):
         raise ReceiptError(f"{label} must be a normalized relative POSIX path")
+    if any(
+        len(part.encode("utf-8")) > MAX_JOB_CWD_COMPONENT_BYTES
+        for part in parts
+    ):
+        raise ReceiptError(
+            f"{label} components exceed {MAX_JOB_CWD_COMPONENT_BYTES} UTF-8 bytes"
+        )
 
 
 def _absolute_path(value, label):
@@ -474,8 +509,43 @@ def _absolute_path(value, label):
         or any(ord(character) < 32 or ord(character) == 127 for character in value)
     ):
         raise ReceiptError(f"{label} must be a normalized absolute POSIX path")
-    if any(part in ("", ".", "..") for part in value[1:].split("/")):
+    parts = value[1:].split("/")
+    if any(part in ("", ".", "..") for part in parts):
         raise ReceiptError(f"{label} must be a normalized absolute POSIX path")
+    if len(value.encode("utf-8")) > MAX_EXECUTABLE_PATH_BYTES:
+        raise ReceiptError(
+            f"{label} exceeds {MAX_EXECUTABLE_PATH_BYTES} UTF-8 bytes"
+        )
+    if any(
+        len(part.encode("utf-8")) > MAX_JOB_CWD_COMPONENT_BYTES
+        for part in parts
+    ):
+        raise ReceiptError(
+            f"{label} components exceed {MAX_JOB_CWD_COMPONENT_BYTES} UTF-8 bytes"
+        )
+
+
+def _validate_exec_vector(argv, environment):
+    sizes = []
+    for index, argument in enumerate(argv):
+        size = len(argument.encode("utf-8"))
+        if size > MAX_EXEC_STRING_BYTES:
+            raise ReceiptError(
+                f"expected job argv[{index}] exceeds the exec string byte limit"
+            )
+        sizes.append(size + 1)
+    for name, value in environment.items():
+        size = len(name.encode("utf-8")) + 1 + len(value.encode("utf-8"))
+        if size > MAX_EXEC_STRING_BYTES:
+            raise ReceiptError(
+                f"expected environment {name} exceeds the exec string byte limit"
+            )
+        sizes.append(size + 1)
+    pointer_bytes = (len(argv) + len(environment) + 2) * _EXEC_POINTER_BYTES
+    if pointer_bytes + sum(sizes) > MAX_EXEC_VECTOR_BYTES:
+        raise ReceiptError(
+            f"expected job argv and environment exceed {MAX_EXEC_VECTOR_BYTES} bytes"
+        )
 
 
 def _validate_job(job):
@@ -498,6 +568,7 @@ def _validate_job(job):
         if "=" in name:
             raise ReceiptError("expected environment names must not contain equals")
         _text(value, f"expected environment {name}", allow_empty=True)
+    _validate_exec_vector(argv, environment)
     executable = _object(
         job["executable"],
         "expected job executable",
@@ -592,8 +663,24 @@ def _expected(expected, execution):
             > expected["sandbox"]["limits"]["outputBytes"]
         ):
             raise ReceiptError("expected streams exceed the sandbox output limit")
-        _integer(expected["exitCode"], "expected exitCode")
+        _integer(expected["exitCode"], "expected exitCode", maximum=255)
     return copy.deepcopy(expected)
+
+
+def validate_execution_profile(profile):
+    """Validate the independent host inputs used to verify one execution."""
+    profile = _object(profile, "execution profile", _EXECUTION_PROFILE_FIELDS)
+    if type(profile["version"]) is not int or profile["version"] != 1:
+        raise ReceiptError("execution profile version must be 1")
+    key_id = _text(profile["keyId"], "execution profile keyId")
+    if not key_id.startswith("sha256:") or not _SHA256.fullmatch(key_id[7:]):
+        raise ReceiptError("execution profile keyId must be a SHA-256 fingerprint")
+    _text(profile["signerId"], "execution profile signerId")
+    _text(profile["executorId"], "execution profile executorId")
+    _validate_job(profile["job"])
+    _validate_sandbox(profile["sandbox"])
+    _integer(profile["exitCode"], "execution profile exitCode", maximum=255)
+    return copy.deepcopy(profile)
 
 
 def _invocation(expected):

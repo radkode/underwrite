@@ -9,6 +9,8 @@ so you steer. When something is worth flagging, the action names what happens ne
 Implement applies and verifies a branch fix, Include in review queues a finding for the
 GitHub review, and Include in report records a finding in the durable report.
 Record decision stores an answer whose words complete the work.
+Including a PR finding never authorizes execution. A separate implementation approval may
+link one accepted finding to an attested child session that lands a local branch commit.
 
 ## Install
 
@@ -63,7 +65,9 @@ FIX    npx --yes @arethetypeswrong/cli@0.18.5
 `FIX` is the smallest concrete implementation intent, review recommendation, or decision
 owed. For local branch and working-tree targets, choosing Implement authorizes Underwrite
 to apply that intent and run verification. It does not claim that an exact patch already
-exists. PR snapshots are no-exec and keep implementation unavailable.
+exists. A PR snapshot remains no-exec and cannot implement directly. After its finding has
+been accepted and acknowledged, a separate approval may create a one-finding child with
+branch audience and `gateway_attested` execution. The source session stays unchanged.
 
 **Finish.** Local branch and working-tree targets may land requested implementations as
 commits. An open PR lands accepted findings as one anchor-validated GitHub review. The
@@ -71,6 +75,8 @@ review carries the frozen full head as `commit_id`, so a PR update cannot silent
 delivery onto code that was never walked. A non-open PR has no open review delivery
 target, so Include in report makes the accepted SQLite beat its terminal report outcome.
 It does not call `land` or create a GitHub effect.
+A linked child may land its verified output as one commit whose only parent is the frozen
+PR head. It updates only its generated local branch and never pushes.
 
 ## Trust and execution
 
@@ -95,15 +101,29 @@ The host execution protocol is documented in
 [`docs/host-execution-protocol.md`](docs/host-execution-protocol.md). Its
 [`execution_receipt.py`](skills/underwrite/scripts/execution_receipt.py) module checks a
 signed receipt contract plus caller-supplied bindings through an out-of-band verifier. It
-does not provide signing keys, authenticate a host on its own, consume replay state, mutate
-sessions, or authorize execution.
+does not provide signing keys or authenticate a host on its own.
 
 The repository includes a standalone privileged host gateway in
-[`gateway/`](gateway/README.md), but the current Underwrite workflow does not invoke it and
-never accepts a caller-supplied sandbox label or conforming receipt as authorization. Every
-PR session remains `no-exec`; audience and execution policy remain separate decisions.
-The gateway must run in its own supervised process because it installs process-wide host
-resource limits before handling untrusted artifacts.
+[`gateway/`](gateway/README.md). Every source PR session still remains `no_exec` with its
+frozen review or report audience. A separate implementation authorization binds one
+acknowledged source accept, its exact beat revision, the frozen target, an actor, and the
+actor's approval text. It creates a one-beat child with branch audience and
+`gateway_attested` execution instead of changing the source session.
+
+The child accepts execution evidence only for its reserved request. It independently
+checks the frozen source bundle, signed capability and receipt, output bundle, complete
+streams, trusted job and sandbox profile, and expected exit code. Signatures must verify
+under a pinned P-256 public key whose fingerprint matches that profile. A conforming
+receipt or caller-supplied sandbox label alone remains evidence, not authorization.
+
+Landing materializes the verified output, creates a local SHA-1 commit with the frozen PR
+head as its sole parent, remeasures that commit against the signed SHA-256 output tree, and
+compare-and-swap updates only the generated local branch. The target repository requires
+Git 2.36 or newer, explicit object and ref durability, and exclusive controller access while
+linking or landing. Session directories and Git metadata must be private local POSIX storage
+that gateway jobs and untrusted concurrent writers cannot modify. The gateway must run in
+its own supervised process because it installs process-wide host resource limits before
+handling untrusted artifacts. Neither the gateway nor the linked implementation path pushes.
 
 ## The page drives
 
@@ -123,6 +143,9 @@ so closing the tab never strands a session.
 The labels describe the delegated effect without changing the durable protocol. Implement,
 Include in review, and Include in report all record the existing `accept` action. Record
 decision uses the existing `decide` action.
+For a PR source, that `accept` delivers only to its frozen review or report audience. The
+separate linked implementation authorization records its own actor and approval and never
+reinterprets Include in review or Include in report as execution permission.
 
 A no-exec PR review flow looks like this:
 
@@ -142,6 +165,19 @@ records the landing ------>  accepted beats show the review URL
 For a non-open PR, Include in report records `accept` and the accepted beat is complete in
 the SQLite-backed report immediately. There is no pending delivery, `land` call, or GitHub
 effect. `report.html` is a regenerable view of that durable state, not its delivery receipt.
+
+An optional linked implementation continues in a separate child:
+
+```
+accepted source finding + explicit implementation approval
+                         -> one frozen one-beat child
+reserved request         -> supervised gateway execution
+six-file evidence set    -> pinned signature and artifact verification
+verified output          -> exact local commit, compare-and-swap branch update
+```
+
+The source session keeps its original audience and `no_exec` policy throughout. A moved PR
+head requires a replacement source snapshot; it never refreshes either session in place.
 
 The server is loopback-only and takes no path from any request: every read and write is a
 fixed name inside the session directory. Loopback is not authentication on its own, so it
@@ -166,6 +202,15 @@ pr.diff          frozen local three-dot diff, hash-bound to the target
 pr.bundle        frozen base and head Git objects, hash-bound to the target
 trusted-context.json  frozen base instructions, hash-bound to the target
 report.html      rendered, regenerable
+implementations/<link-id>/  one linked child, nested below the source session
+  session.sqlite3           authoritative child, attempt, evidence, and landing state
+  implementation-evidence/<attempt>/
+    request.json            exact reserved gateway request
+    capability.dsse.json    signed host capability
+    receipt.dsse.json       signed execution receipt
+    output.bundle           verified output transport
+    stdout                  complete captured standard output
+    stderr                  complete captured standard error
 ```
 
 The scripts are Python 3 stdlib, with no dependencies. `serve.py` runs the walk and
@@ -185,6 +230,17 @@ objects without checking out the PR.
 diff, trusted context, and object bundle are checked by byte count and SHA-256.
 Controller cleanliness is rechecked immediately before capture freezes the target. It is
 a point-in-time precondition, not an attestation against a concurrent local writer.
+
+Linked creation is deterministic for one source action and refuses a conflicting second
+authorization. A complete child is atomically published at its deterministic path, so a
+crash cannot expose a partial final session. Request reservation reuses a nonfailed attempt;
+a definite failed attempt gets a new attempt number and challenge. Evidence consumption and
+landing accept identical retries but reject changed bytes. The prepared commit plan is
+durable before the branch update, so a restart can observe an already-updated ref and finish
+the SQLite receipt. A
+moved target before the update blocks landing and requires a replacement source snapshot.
+A move detected after the local update preserves the landed commit and reports that a
+replacement is required, without causing another effect.
 
 `render-report.py` turns a session into the page and validates it on the way through. A
 flag with no fix, a clean beat with no proof, or a proof naming no command gets an

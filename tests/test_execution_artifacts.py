@@ -592,6 +592,86 @@ class OutputBundleTests(ArtifactCase):
                 expected=wrong,
             )
 
+    def test_expected_output_bundle_materializes_exact_tree(self):
+        workspace = self.workspace()
+        built = artifacts.build_output_bundle(
+            workspace,
+            maximum_workspace_bytes=WORKSPACE_LIMIT,
+            maximum_bundle_bytes=BUNDLE_LIMIT,
+        )
+        destination = self.root / "verified-output"
+
+        descriptor = artifacts.materialize_output_bundle(
+            built.bundle,
+            destination,
+            maximum_workspace_bytes=WORKSPACE_LIMIT,
+            maximum_bundle_bytes=BUNDLE_LIMIT,
+            expected=built.descriptor,
+        )
+
+        self.assertEqual(descriptor, built.descriptor)
+        self.assertEqual(
+            artifacts.synthetic_git_tree(
+                destination,
+                maximum_bytes=WORKSPACE_LIMIT,
+            ),
+            built.descriptor.git_tree,
+        )
+        self.assertEqual((destination / "result").read_bytes(), b"review result\n")
+        self.assertTrue((destination / "bin" / "tool").stat().st_mode & stat.S_IXUSR)
+        self.assertEqual(os.readlink(destination / "latest"), "result")
+
+    def test_output_materialization_fails_closed_before_destination_creation(self):
+        built = artifacts.build_output_bundle(
+            self.workspace(),
+            maximum_workspace_bytes=WORKSPACE_LIMIT,
+            maximum_bundle_bytes=BUNDLE_LIMIT,
+        )
+        destination = self.root / "untrusted-output"
+        wrong = replace(built.descriptor, git_tree="0" * 64)
+
+        with self.assertRaisesRegex(artifacts.ArtifactError, "expected descriptor"):
+            artifacts.materialize_output_bundle(
+                built.bundle,
+                destination,
+                maximum_workspace_bytes=WORKSPACE_LIMIT,
+                maximum_bundle_bytes=BUNDLE_LIMIT,
+                expected=wrong,
+            )
+        self.assertFalse(destination.exists())
+
+        with self.assertRaisesRegex(artifacts.ArtifactError, "expected descriptor"):
+            artifacts.materialize_output_bundle(
+                built.bundle[:-16],
+                destination,
+                maximum_workspace_bytes=WORKSPACE_LIMIT,
+                maximum_bundle_bytes=BUNDLE_LIMIT,
+                expected=built.descriptor,
+            )
+        self.assertFalse(destination.exists())
+
+    def test_output_materialization_never_reuses_an_existing_destination(self):
+        built = artifacts.build_output_bundle(
+            self.workspace(),
+            maximum_workspace_bytes=WORKSPACE_LIMIT,
+            maximum_bundle_bytes=BUNDLE_LIMIT,
+        )
+        destination = self.root / "existing"
+        destination.mkdir()
+        sentinel = destination / "sentinel"
+        sentinel.write_bytes(b"keep")
+
+        with self.assertRaisesRegex(artifacts.ArtifactError, "must not already exist"):
+            artifacts.materialize_output_bundle(
+                built.bundle,
+                destination,
+                maximum_workspace_bytes=WORKSPACE_LIMIT,
+                maximum_bundle_bytes=BUNDLE_LIMIT,
+                expected=built.descriptor,
+            )
+
+        self.assertEqual(sentinel.read_bytes(), b"keep")
+
     def test_output_bundle_is_bounded_and_integrity_checked(self):
         built = artifacts.build_output_bundle(
             self.workspace(),
@@ -655,6 +735,92 @@ class OutputBundleTests(ArtifactCase):
                 maximum_workspace_bytes=WORKSPACE_LIMIT,
                 maximum_bundle_bytes=BUNDLE_LIMIT,
             )
+
+
+class CommitTreeMeasurementTests(ArtifactCase):
+    def make_commit(self):
+        repo = self.init_repo("candidate")
+        (repo / "payload").write_bytes(b"committed\n")
+        (repo / "bin").mkdir()
+        (repo / "bin" / "tool").write_bytes(b"#!/bin/sh\n")
+        os.chmod(repo / "bin" / "tool", 0o755)
+        os.symlink(b"payload", os.fsencode(repo / "latest"))
+        self.git("-C", repo, "add", ".")
+        self.git("-C", repo, "commit", "-m", "candidate")
+        commit = self.git("-C", repo, "rev-parse", "HEAD").decode("ascii")
+        expected = self.root / "expected"
+        expected.mkdir()
+        (expected / "payload").write_bytes(b"committed\n")
+        (expected / "bin").mkdir()
+        (expected / "bin" / "tool").write_bytes(b"#!/bin/sh\n")
+        os.chmod(expected / "bin" / "tool", 0o755)
+        os.symlink(b"payload", os.fsencode(expected / "latest"))
+        return repo, commit, expected
+
+    def test_measures_one_exact_commit_independent_of_worktree_state(self):
+        repo, commit, expected = self.make_commit()
+        (repo / "payload").write_bytes(b"uncommitted replacement\n")
+
+        tree = artifacts.measure_commit_tree(
+            repo,
+            commit,
+            maximum_workspace_bytes=WORKSPACE_LIMIT,
+        )
+
+        self.assertEqual(
+            tree,
+            artifacts.synthetic_git_tree(
+                expected,
+                maximum_bytes=WORKSPACE_LIMIT,
+            ),
+        )
+
+    def test_commit_measurement_rejects_refs_abbreviations_and_sha256_repos(self):
+        repo, commit, _expected = self.make_commit()
+        for candidate in ("HEAD", commit[:12], commit.upper()):
+            with self.subTest(candidate=candidate):
+                with self.assertRaisesRegex(artifacts.ArtifactError, "full lowercase"):
+                    artifacts.measure_commit_tree(
+                        repo,
+                        candidate,
+                        maximum_workspace_bytes=WORKSPACE_LIMIT,
+                    )
+
+        sha256 = self.init_repo("sha256-candidate", object_format="sha256")
+        with self.assertRaisesRegex(artifacts.ArtifactError, "SHA-1 objects"):
+            artifacts.measure_commit_tree(
+                sha256,
+                "0" * 40,
+                maximum_workspace_bytes=WORKSPACE_LIMIT,
+            )
+
+    def test_commit_measurement_does_not_run_repository_filters(self):
+        repo = self.init_repo("filtered")
+        marker = self.root / "filter-ran"
+        (repo / ".gitattributes").write_text(
+            "payload filter=hostile\n",
+            encoding="utf-8",
+        )
+        (repo / "payload").write_bytes(b"raw committed bytes\n")
+        self.git("-C", repo, "add", ".")
+        self.git("-C", repo, "commit", "-m", "filtered candidate")
+        commit = self.git("-C", repo, "rev-parse", "HEAD").decode("ascii")
+        self.git(
+            "-C",
+            repo,
+            "config",
+            "filter.hostile.smudge",
+            f"touch {marker}",
+        )
+
+        tree = artifacts.measure_commit_tree(
+            repo,
+            commit,
+            maximum_workspace_bytes=WORKSPACE_LIMIT,
+        )
+
+        self.assertRegex(tree, r"\A[0-9a-f]{64}\Z")
+        self.assertFalse(marker.exists())
 
 
 if __name__ == "__main__":

@@ -676,6 +676,16 @@ class ProducerContracts(ReceiptCase):
 
 
 class StrictEnvelopeParsing(ReceiptCase):
+    def test_rejects_oversized_integers_and_deep_nesting_before_verification(self):
+        malformed = {
+            "oversized integer": b'{"unknown":' + b"9" * 5000 + b"}",
+            "deep nesting": b"[" * 1100 + b"0" + b"]" * 1100,
+        }
+        for name, envelope in malformed.items():
+            with self.subTest(name=name):
+                callback = self.assert_capability_rejected(envelope=envelope)
+                self.assertEqual(callback.calls, [])
+
     def test_rejects_invalid_envelope_json_before_signature_verification(self):
         text = self.capability_envelope.decode("utf-8")
         bad_envelopes = {
@@ -938,6 +948,32 @@ class CapabilityBindings(ReceiptCase):
         executable = self.capability_expected()
         executable["job"]["argv"][0] = "/usr/bin/env"
         self.assert_capability_rejected(expected=executable)
+
+    def test_rejects_linux_impossible_executable_paths_and_exec_vectors(self):
+        invalid = []
+        component = self.capability_expected()
+        component["job"]["executable"]["path"] = "/" + "x" * 256
+        component["job"]["argv"][0] = component["job"]["executable"]["path"]
+        invalid.append(component)
+        path = self.capability_expected()
+        path["job"]["executable"]["path"] = "/" + "/".join(
+            "x" * 255 for _ in range(16)
+        )
+        path["job"]["argv"][0] = path["job"]["executable"]["path"]
+        invalid.append(path)
+        argument = self.capability_expected()
+        argument["job"]["argv"].append("x" * (128 * 1024))
+        invalid.append(argument)
+        pointers = self.capability_expected()
+        pointers["job"]["argv"].extend([""] * 15_000)
+        invalid.append(pointers)
+        environment = self.capability_expected()
+        environment["job"]["environment"]["OVERSIZED"] = "x" * (128 * 1024)
+        invalid.append(environment)
+
+        for expected in invalid:
+            with self.subTest(arguments=len(expected["job"]["argv"])):
+                self.assert_capability_rejected(expected=expected)
 
     def test_rejects_every_frozen_target_field_mutation(self):
         for field, value in self.target.items():
@@ -1298,7 +1334,10 @@ class ArchitecturalIsolation(unittest.TestCase):
         cli_source = (SCRIPTS / "sessionctl.py").read_text(encoding="utf-8")
         self.assertNotIn("execution_receipt", store_source)
         self.assertNotIn("execution_receipt", cli_source)
-        self.assertIn('EXECUTION_MODES = ("no_exec",)', store_source)
+        self.assertIn(
+            'EXECUTION_MODES = ("no_exec", "gateway_attested")',
+            store_source,
+        )
 
 
 if __name__ == "__main__":

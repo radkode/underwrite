@@ -15,7 +15,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from gateway.signing import OpenSSLSigner, SigningError
+from gateway.signing import OpenSSLSigner, OpenSSLVerifier, SigningError
 from gateway.store import (
     ArtifactRef,
     ContentStore,
@@ -477,6 +477,46 @@ class OpenSSLSignerTests(unittest.TestCase):
         with self.assertRaisesRegex(SigningError, "key ID"):
             signer.sign(pae, "sha256:" + "0" * 64)
 
+    def test_public_verifier_never_loads_or_probes_the_private_key(self):
+        signer = OpenSSLSigner(
+            self.private_key,
+            self.public_key,
+            "host:test-signer",
+            openssl=self.openssl,
+        )
+        pae = b"DSSEv1 4 test 15 public boundary"
+        signature = signer.sign(pae, signer.key_id)
+        self.private_key.unlink()
+
+        real_run = subprocess.run
+        with mock.patch(
+            "gateway.signing.subprocess.run",
+            wraps=real_run,
+        ) as run:
+            verifier = OpenSSLVerifier(
+                self.public_key,
+                "host:test-signer",
+                openssl=self.openssl,
+            )
+
+        self.assertEqual(verifier.key_id, signer.key_id)
+        self.assertFalse(hasattr(verifier, "private_key"))
+        self.assertFalse(
+            any("-sign" in call.args[0] for call in run.call_args_list)
+        )
+        self.assertEqual(
+            verifier.verify(pae, verifier.key_id, signature),
+            "host:test-signer",
+        )
+        with self.assertRaisesRegex(SigningError, "key ID"):
+            verifier.verify(pae, "sha256:" + "0" * 64, signature)
+        with self.assertRaisesRegex(SigningError, "verification failed"):
+            verifier.verify(
+                pae,
+                verifier.key_id,
+                signature[:-1] + bytes((signature[-1] ^ 1,)),
+            )
+
     def test_private_key_must_not_be_group_or_world_accessible(self):
         self.private_key.chmod(0o644)
         with self.assertRaisesRegex(SigningError, "group or other"):
@@ -512,6 +552,12 @@ class OpenSSLSignerTests(unittest.TestCase):
         with self.assertRaisesRegex(SigningError, "P-256"):
             OpenSSLSigner(
                 private_key,
+                public_key,
+                "host:test-signer",
+                openssl=self.openssl,
+            )
+        with self.assertRaisesRegex(SigningError, "P-256"):
+            OpenSSLVerifier(
                 public_key,
                 "host:test-signer",
                 openssl=self.openssl,

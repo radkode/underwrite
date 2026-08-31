@@ -72,7 +72,7 @@ def _repo(value):
     return value
 
 
-def _run(command, cwd=None, stdout=None, env=None):
+def _run(command, cwd=None, stdout=None, env=None, timeout=None):
     try:
         completed = subprocess.run(
             command,
@@ -80,7 +80,10 @@ def _run(command, cwd=None, stdout=None, env=None):
             stdout=subprocess.PIPE if stdout is None else stdout,
             stderr=subprocess.PIPE,
             env=env,
+            timeout=timeout,
         )
+    except subprocess.TimeoutExpired as error:
+        raise SnapshotError(f"{command[0]} timed out") from error
     except OSError as error:
         raise SnapshotError(f"could not run {command[0]}: {error}") from error
     if completed.returncode:
@@ -107,7 +110,7 @@ def _git_environment(literal_paths=True):
     return env
 
 
-def load_pr(repo, number):
+def load_pr(repo, number, timeout=None):
     repo, number = _repo(repo), _positive(number, "PR number")
     raw = _run([
         "gh",
@@ -115,7 +118,7 @@ def load_pr(repo, number):
         "-H",
         "Accept: application/vnd.github+json",
         f"repos/{repo}/pulls/{number}",
-    ])
+    ], timeout=timeout)
     try:
         value = json.loads(raw.decode("utf-8"))
     except (UnicodeError, json.JSONDecodeError) as error:

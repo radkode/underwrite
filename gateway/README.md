@@ -5,10 +5,11 @@ verifies a frozen source bundle, prepares an isolated Linux container, issues a 
 host capability, runs one exact job, verifies every returned artifact, signs the linked
 receipt, and commits the evidence to a replay-protected host store.
 
-It is deliberately separate from the current Underwrite workflow. Review sessions remain
-`no_exec` until the supervised application work lands separately. A receipt is evidence,
-not permission to apply a bundle, push a branch, publish a review, or cause another external
-effect.
+It remains separate from every source review or report session. Those sessions stay
+`no_exec`; accepting a finding does not authorize execution. A separately approved,
+one-finding child may submit its reserved request to this gateway and consume the returned
+evidence under `gateway_attested` policy. A receipt is evidence, not permission to apply a
+bundle, push a branch, publish a review, or cause another external effect.
 
 ## Runtime profile
 
@@ -70,6 +71,12 @@ object-format support, and OpenSSL. Keep the ECDSA P-256 private key in a host-o
 file with no group or other permissions. Provision it with P-256 named-curve encoding.
 `OpenSSLSigner` derives its key ID from the public key, enforces that exact
 `prime256v1` profile, and verifies the key pair during startup.
+
+Provision the linked application side with the public key only. `OpenSSLVerifier` enforces
+the same P-256 profile, derives the same SHA-256 key ID, and never reads the private key.
+Keep its trusted profile and pinned public key outside repositories, sessions, jobs, and
+returned evidence. The profile binds the expected key ID, signer, executor, job, sandbox,
+and exit code used to verify each child request.
 
 The trusted computing base includes the dedicated gateway OS account, host kernel and
 clock, container runtime, Docker daemon and its administrators, protected local Docker
@@ -162,3 +169,32 @@ An ambiguous teardown permanently poisons the gateway process, and the broker re
 later requests until its supervisor replaces that dedicated process. The replacement
 process reconciles the stable runtime container under the shared store lease before it can
 return replayed evidence or begin another execution.
+
+A supervised adapter hands one `StoredExecution` to the linked child as a directory with
+exactly these files:
+
+```
+request.json
+capability.dsse.json
+receipt.dsse.json
+output.bundle
+stdout
+stderr
+```
+
+The first three are `StoredExecution.request`, `.capability`, and `.receipt` byte for byte.
+The remaining files are the content-store bytes referenced by the `outputBundle`, `stdout`,
+and `stderr` artifacts. Do not include `sourceBundle`, the gateway validation record, a
+trusted profile, or a verification key. The child reads its authoritative source bundle
+from the frozen source session and receives profile and key through separate host-controlled
+paths.
+
+The adapter must create a real private directory and fixed regular files without symlinks
+or hard links, then stop writing before the consumer begins. The linked consumer still
+verifies every byte, both signatures, and all trusted expected context independently. It
+stores the accepted evidence immutably, creates an exact local commit only after those
+checks, and compare-and-swap updates its generated local branch. That consumer requires Git
+2.36 or newer plus exclusive controller access to the target repository while linking or
+landing. Its session directories and Git metadata must remain on private local POSIX storage
+that gateway jobs and untrusted concurrent writers cannot modify. Neither the adapter nor
+the gateway checks out that branch, pushes it, opens a pull request, or publishes a review.
