@@ -63,6 +63,10 @@ class ExecutionFailed(GatewayError):
     """The sandbox ran or prepared, but no conforming receipt can be issued."""
 
 
+class AttemptFailed(ExecutionFailed):
+    """The replay ledger durably proves that this attempt has no receipt."""
+
+
 class _FrozenDict(dict):
     def __init__(self, value):
         dict.__init__(
@@ -106,6 +110,7 @@ def _implementation_sha256():
     paths = {
         name: root / name
         for name in (
+            "adapter.py",
             "artifacts.py",
             "broker.py",
             "docker_client.py",
@@ -577,6 +582,7 @@ class ExecutionBroker:
         clock=None,
         *,
         dedicated_process,
+        git="git",
     ):
         if dedicated_process is not True:
             raise GatewayError("broker requires an explicit dedicated-process claim")
@@ -610,6 +616,7 @@ class ExecutionBroker:
         self.content = ContentStore(Path(store_root))
         self.ledger = ReplayLedger(self.content)
         self.runner = runner
+        self.git = git
         self.clock = clock or (lambda: datetime.now(timezone.utc))
 
     def _acquire_store_lease(self):
@@ -727,13 +734,18 @@ class ExecutionBroker:
             ) as temporary_name:
                 temporary = Path(temporary_name)
                 workspace = temporary / "input"
+                source_arguments = {
+                    "maximum_workspace_bytes": self.policy.sandbox["limits"][
+                        "workspaceBytes"
+                    ]
+                }
+                if self.git != "git":
+                    source_arguments["git"] = self.git
                 source_result = artifacts.verify_source_bundle(
                     source_bytes,
                     target,
                     workspace,
-                    maximum_workspace_bytes=self.policy.sandbox["limits"][
-                        "workspaceBytes"
-                    ],
+                    **source_arguments,
                 )
                 input_tree = source_result.git_tree
                 archive = artifacts.pack_workspace(
@@ -799,16 +811,24 @@ class ExecutionBroker:
                 )
                 return completed
         except Exception as error:
+            failure_recorded = False
             if owns_reservation:
                 try:
                     self.ledger.fail(
                         replay_key, str(error) or type(error).__name__
                     )
+                    failure_recorded = True
                 except (StoreError, ReplayConflict):
                     pass
             if isinstance(error, (GatewayError, StoreError, ReplayConflict)):
+                exposed = error
+            else:
+                exposed = GatewayError("execution gateway failed closed")
+            if failure_recorded:
+                raise AttemptFailed(str(exposed)) from error
+            if exposed is error:
                 raise
-            raise GatewayError("execution gateway failed closed") from error
+            raise exposed from error
         finally:
             if prepared is not None:
                 prepared.close()
@@ -851,10 +871,15 @@ class ExecutionBroker:
             raise ExecutionFailed("sandbox output tree does not match returned workspace")
         workspace_limit = self.policy.sandbox["limits"]["workspaceBytes"]
         bundle_limit = workspace_limit * 2
+        output_arguments = {
+            "maximum_workspace_bytes": workspace_limit,
+            "maximum_bundle_bytes": bundle_limit,
+        }
+        if self.git != "git":
+            output_arguments["git"] = self.git
         output_bundle = artifacts.build_output_bundle(
             output_root,
-            maximum_workspace_bytes=workspace_limit,
-            maximum_bundle_bytes=bundle_limit,
+            **output_arguments,
         )
         if output_bundle.descriptor.git_tree != output_tree:
             raise ExecutionFailed(
@@ -862,9 +887,8 @@ class ExecutionBroker:
             )
         verified_bundle = artifacts.verify_output_bundle(
             output_bundle.bundle,
-            maximum_workspace_bytes=workspace_limit,
-            maximum_bundle_bytes=bundle_limit,
             expected=output_bundle.descriptor,
+            **output_arguments,
         )
         if verified_bundle != output_bundle.descriptor:
             raise ExecutionFailed("output bundle did not survive quarantine verification")

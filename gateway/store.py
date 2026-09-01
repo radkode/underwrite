@@ -17,6 +17,10 @@ class StoreError(RuntimeError):
 class ReplayConflict(StoreError):
     """An execution identity was already consumed or left ambiguous."""
 
+    def __init__(self, message, *, state=None):
+        super().__init__(message)
+        self.state = state
+
 
 @dataclass(frozen=True)
 class ArtifactRef:
@@ -437,7 +441,8 @@ class ReplayLedger:
         if row["state"] == "complete":
             return self._stored(row)
         raise ReplayConflict(
-            f"execution replay identity is already {row['state']} and cannot run again"
+            f"execution replay identity is already {row['state']} and cannot run again",
+            state=row["state"],
         )
 
     def lookup_complete(self, replay_key, request, source):
@@ -464,7 +469,8 @@ class ReplayLedger:
         if row["state"] != "complete":
             raise ReplayConflict(
                 f"execution replay identity is already {row['state']} "
-                "and cannot run again"
+                "and cannot run again",
+                state=row["state"],
             )
         return self._stored(row)
 
@@ -565,7 +571,10 @@ class ReplayLedger:
         if row is None:
             raise StoreError("execution replay identity was not found")
         if row["state"] != "complete":
-            raise ReplayConflict(f"execution is {row['state']}, not complete")
+            raise ReplayConflict(
+                f"execution is {row['state']}, not complete",
+                state=row["state"],
+            )
         return self._stored(row)
 
     def _stored(self, row):

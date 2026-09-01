@@ -59,7 +59,7 @@ python -m unittest tests.test_gateway_live -v
 ```
 
 The suite fails when Docker or daemon seccomp support is missing. It exercises the real
-broker with a real source bundle and ephemeral ECDSA key, then probes exact environment,
+one-shot adapter and broker with a real source bundle and ephemeral ECDSA key, then probes exact environment,
 closed stdin, zero target capabilities, denied network and process syscalls, denied host
 writes, denied workspace execution, teardown, output capture, timeouts, replay, output
 quarantine, receipt verification, and evidence persistence.
@@ -77,6 +77,12 @@ the same P-256 profile, derives the same SHA-256 key ID, and never reads the pri
 Keep its trusted profile and pinned public key outside repositories, sessions, jobs, and
 returned evidence. The profile binds the expected key ID, signer, executor, job, sandbox,
 and exit code used to verify each child request.
+
+Run the gateway and linked consumer as distinct OS users. Put only those two trusted users
+in one dedicated evidence handoff group and configure its numeric ID as `consumerGid`.
+Never add a target job account, container runtime identity, repository user, or other
+untrusted principal to that group. The consumer account must not be able to read the
+gateway configuration, private key, store, or temporary files.
 
 The trusted computing base includes the dedicated gateway OS account, host kernel and
 clock, container runtime, Docker daemon and its administrators, protected local Docker
@@ -170,8 +176,132 @@ later requests until its supervisor replaces that dedicated process. The replace
 process reconciles the stable runtime container under the shared store lease before it can
 return replayed evidence or begin another execution.
 
-A supervised adapter hands one `StoredExecution` to the linked child as a directory with
-exactly these files:
+## One-shot supervised adapter
+
+`gateway/adapter.py` is the reference host adapter. Each invocation loads one private
+configuration, constructs one broker inside that dedicated process, submits one reserved
+child request with its authoritative source bundle, publishes one evidence directory, and
+exits. The configuration is version 1 with exactly these fields:
+
+```json
+{
+  "version": 1,
+  "privateKey": "/absolute/path/signing-private.pem",
+  "publicKey": "/absolute/path/signing-public.pem",
+  "storeRoot": "/absolute/private/gateway-store",
+  "docker": "/absolute/path/to/docker",
+  "openssl": "/absolute/path/to/openssl",
+  "git": "/absolute/path/to/git",
+  "deploymentId": "urn:underwrite:gateway:deployment",
+  "runtimeDomainId": "urn:underwrite:runtime-domain:host-a",
+  "dockerHost": "unix:///var/run/docker.sock",
+  "image": "sha256:<64 lowercase hex characters>",
+  "platform": "linux/amd64",
+  "runnerSha256": "<64 lowercase hex characters>",
+  "targetUid": 65532,
+  "targetGid": 65532,
+  "consumerGid": 2001,
+  "capabilitySeconds": 300,
+  "maxSourceBundleBytes": 67108864,
+  "profile": {
+    "version": 1,
+    "keyId": "sha256:<64 lowercase hex characters>",
+    "signerId": "urn:underwrite:signer:host-a",
+    "executorId": "urn:underwrite:executor:docker-single-process-v1:<digest>",
+    "job": {
+      "argv": ["/usr/local/bin/python3", "-I", "-S", "/opt/underwrite/implement.py"],
+      "cwd": ".",
+      "environment": {"LANG": "C", "TZ": "UTC"},
+      "executable": {
+        "path": "/usr/local/bin/python3",
+        "sha256": "<64 lowercase hex characters>",
+        "bytes": 1
+      },
+      "stdin": "closed"
+    },
+    "sandbox": {
+      "policy": "https://github.com/radkode/underwrite/sandbox-policy/v1",
+      "credentials": "absent",
+      "network": "denied",
+      "hostWrites": "denied",
+      "gitHooks": "disabled",
+      "gitFilters": "disabled",
+      "timeout": "enforced",
+      "limits": {
+        "wallSeconds": 60,
+        "cpuSeconds": 60,
+        "memoryBytes": 134217728,
+        "processes": 1,
+        "workspaceBytes": 67108864,
+        "outputBytes": 1048576
+      }
+    },
+    "exitCode": 0
+  }
+}
+```
+
+The embedded `profile` is the exact separately provisioned profile later given to
+`implementationctl.py`. Its key ID must match the configured key pair, and its executor ID
+must match the policy derived from this deployment. The request's complete `job`, `sandbox`,
+and `exitCode` must match it. The `docker`, `openssl`, and `git` values are explicit absolute
+host executable paths. They must be trusted regular executables owned by root or the gateway
+account and not writable by group or other. The job executable is instead an absolute path
+inside the pinned runtime image.
+
+Preprovision `storeRoot` as a gateway-owned `0700` directory. Separately, provision the
+immediate outbox parent as gateway-owned, group-owned by `consumerGid`, and exactly `0710`.
+Every outbox ancestor must either reject group and other writes or be a sticky shared
+ancestor, and it must be traversable by the consumer group or by other users. The adapter
+publishes a gateway-owned `0750` final directory containing six gateway-owned,
+consumer-group `0640` files. The outbox's lack of
+read permission prevents directory listing, so the supervisor must give the consumer the
+exact final path. Keep the configuration, private key, store, and temporary root outside
+the shared group path. All host state and the outbox must be on supported local POSIX
+storage outside repositories and target workspaces. The trusted supervisor selects every
+argument; never take an adapter path or trusted profile value from target code.
+
+Install the gateway and Python interpreter beneath root-owned or gateway-owned directory
+ancestry that is not writable by group or other. A sticky shared parent such as `/tmp` is
+permitted only when every descendant on the selected path is still owned by root or the
+gateway account. Apply the same rule to every configured executable and data path.
+
+Run the adapter as a fresh isolated Python process:
+
+```bash
+/absolute/path/to/python3 -I -S /absolute/path/gateway/adapter.py \
+  --config /srv/underwrite-gateway/private/gateway.json \
+  --request /srv/underwrite-gateway/private/request.json \
+  --source-bundle /srv/underwrite-gateway/private/pr.bundle \
+  --evidence-dir /srv/underwrite-handoff/outbox/attempt-1
+```
+
+Handled outcomes write exactly one JSON object to stdout. A completed handoff exits zero:
+
+```json
+{"evidenceDir":"/srv/underwrite-handoff/outbox/attempt-1","status":"complete","version":1}
+```
+
+A recoverable or ambiguous outcome exits one:
+
+```json
+{"reason":"retry the same request and source bundle","status":"retry","version":1}
+```
+
+A replay identity that can no longer produce a receipt exits two:
+
+```json
+{"reason":"gateway attempt is terminal without a receipt","status":"failed","version":1}
+```
+
+Only the exact `failed` result paired with exit code two authorizes the controller to call
+`implementationctl.py fail` for that child attempt and then request a fresh challenge. A
+`retry` result, missing or malformed stdout, process interruption, unknown exit code, or any
+other ambiguous outcome requires the same request and source bundle to be retried. A
+`complete` result supplies the exact evidence directory to `implementationctl.py consume`.
+The adapter never invokes `fail`, `consume`, or `land` itself.
+
+A completed evidence directory contains exactly:
 
 ```
 request.json
@@ -183,18 +313,20 @@ stderr
 ```
 
 The first three are `StoredExecution.request`, `.capability`, and `.receipt` byte for byte.
-The remaining files are the content-store bytes referenced by the `outputBundle`, `stdout`,
-and `stderr` artifacts. Do not include `sourceBundle`, the gateway validation record, a
-trusted profile, or a verification key. The child reads its authoritative source bundle
-from the frozen source session and receives profile and key through separate host-controlled
-paths.
+The remaining files are the content-store bytes referenced by `outputBundle`, `stdout`, and
+`stderr`. The adapter never exports `sourceBundle`, the gateway validation record, the
+profile, or a key. It writes the files under a private deterministic staging name, makes
+them durable, atomically renames the complete directory into place, and only then grants
+the consumer group read access. Repeating an exact completed request returns the stored
+broker result. An existing evidence directory is accepted only when all six files are
+byte-identical and its parent directory has passed the durability barrier. A retry holding
+the parent lock removes only the staging directory derived from that exact final name. It
+also repairs a complete `0700` final directory left by interruption before group handoff.
 
-The adapter must create a real private directory and fixed regular files without symlinks
-or hard links, then stop writing before the consumer begins. The linked consumer still
-verifies every byte, both signatures, and all trusted expected context independently. It
-stores the accepted evidence immutably, creates an exact local commit only after those
-checks, and compare-and-swap updates its generated local branch. That consumer requires Git
-2.36 or newer plus exclusive controller access to the target repository while linking or
-landing. Its session directories and Git metadata must remain on private local POSIX storage
-that gateway jobs and untrusted concurrent writers cannot modify. Neither the adapter nor
-the gateway checks out that branch, pushes it, opens a pull request, or publishes a review.
+If publication fails after the broker commits a result, retry the same request and source
+bundle to recover the stored result. The linked consumer independently verifies every byte,
+both signatures, and all trusted expected context before it persists evidence or changes a
+local branch. After `implementationctl.py consume` durably succeeds, the gateway-owner
+supervisor may delete the final transport directory. The consumer cannot and must not
+delete it through the `0710` parent. Neither the adapter nor the gateway checks out the
+branch, pushes it, opens a pull request, or publishes a review.

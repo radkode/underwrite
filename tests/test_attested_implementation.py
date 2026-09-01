@@ -13,6 +13,7 @@ import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 
@@ -25,6 +26,9 @@ for path in (ROOT, SCRIPTS):
 import attested_implementation as bridge  # noqa: E402
 import execution_receipt  # noqa: E402
 from gateway import artifacts  # noqa: E402
+from gateway import adapter as gateway_adapter  # noqa: E402
+from gateway import broker as gateway_broker  # noqa: E402
+from gateway.broker import GatewayPolicy  # noqa: E402
 from gateway.signing import OpenSSLSigner  # noqa: E402
 from pr_snapshot import SnapshotError, TargetMoved, capture  # noqa: E402
 from session_store import Conflict, SessionStore  # noqa: E402
@@ -1222,6 +1226,231 @@ class AttestedImplementationCase(unittest.TestCase):
             self.branch_head(linked["branch"]),
             landed["commit_plan"]["commit"],
         )
+
+    def test_supervised_adapter_runs_request_through_consume_and_land_once(self):
+        before = self.source.snapshot()
+        linked, child_root, child = self.linked()
+        deployment_id = "urn:underwrite:gateway:test:linked-adapter"
+        runtime_domain_id = "urn:underwrite:runtime-domain:test:linked-adapter"
+        docker_host = "unix:///var/run/docker.sock"
+        image = "sha256:" + "0" * 64
+        platform = "linux/arm64"
+        runner_sha256 = "1" * 64
+        policy = GatewayPolicy(
+            signer_id=self.profile["signerId"],
+            deployment_id=deployment_id,
+            runtime_domain_id=runtime_domain_id,
+            docker_host=docker_host,
+            image=image,
+            platform=platform,
+            runner_sha256=runner_sha256,
+            executable=self.profile["job"]["executable"],
+            environment=self.profile["job"]["environment"],
+            sandbox=self.profile["sandbox"],
+            target_uid=65532,
+            target_gid=65532,
+        )
+        self.profile["executorId"] = policy.executor_id
+        request_value = bridge.request(
+            child_root,
+            self.source_root,
+            self.profile,
+            api=self.api,
+        )
+
+        class PreparedRun:
+            def __init__(prepared_self, owner, preparation, workspace):
+                prepared_self.owner = owner
+                prepared_self.ready = SimpleNamespace(
+                    input_tree=preparation["inputTree"],
+                    executable=copy.deepcopy(preparation["job"]["executable"]),
+                    runner_sha256=preparation["runnerSha256"],
+                )
+                with tempfile.TemporaryDirectory(
+                    prefix="underwrite-adapter-output-"
+                ) as name:
+                    output = Path(name) / "output"
+                    measured = artifacts.unpack_workspace(
+                        workspace,
+                        output,
+                        maximum_bytes=self.workspace_limit,
+                    )
+                    self.assertEqual(measured, preparation["inputTree"])
+                    (output / "app.py").write_text(
+                        "VALUE = 2\n", encoding="utf-8"
+                    )
+                    prepared_self.output_tree = artifacts.synthetic_git_tree(
+                        output,
+                        maximum_bytes=self.workspace_limit,
+                    )
+                    prepared_self.workspace = artifacts.pack_workspace(
+                        output,
+                        maximum_bytes=self.workspace_limit,
+                    )
+
+            def run(prepared_self, _capability_digest, _issued_at, _expires_at):
+                prepared_self.owner.run_calls += 1
+                finished = datetime.now(timezone.utc)
+                return SimpleNamespace(
+                    status="exited",
+                    failure="",
+                    exit_code=0,
+                    started_at=finished,
+                    finished_at=finished,
+                    output_tree=prepared_self.output_tree,
+                    stdout=b"implementation complete\n",
+                    stderr=b"",
+                    workspace=prepared_self.workspace,
+                )
+
+            def close(prepared_self):
+                prepared_self.owner.prepared_close_calls += 1
+
+        class FakeRunner:
+            def __init__(runner_self):
+                runner_self.image = policy.image
+                runner_self.platform = policy.platform
+                runner_self.docker_host = policy.docker_host
+                runner_self.deployment_id = policy.deployment_id
+                runner_self.runtime_domain_id = policy.runtime_domain_id
+                runner_self.poisoned = False
+                runner_self.reconcile_calls = 0
+                runner_self.prepare_calls = 0
+                runner_self.run_calls = 0
+                runner_self.prepared_close_calls = 0
+                runner_self.close_calls = 0
+
+            def reconcile(runner_self):
+                runner_self.reconcile_calls += 1
+
+            def prepare(runner_self, preparation, workspace):
+                runner_self.prepare_calls += 1
+                return PreparedRun(runner_self, preparation, workspace)
+
+            def close(runner_self):
+                runner_self.close_calls += 1
+
+        gateway_store = (self.root / "gateway-store").resolve()
+        gateway_store.mkdir(mode=0o700)
+        outbox = tempfile.TemporaryDirectory(
+            prefix="underwrite-adapter-outbox-",
+            dir="/tmp",
+        )
+        self.addCleanup(outbox.cleanup)
+        evidence_dir = Path(outbox.name).resolve()
+        os.chown(evidence_dir, -1, os.getegid())
+        evidence_dir.chmod(0o710)
+        evidence_dir = evidence_dir / "attempt-1"
+        request_path = (self.root / "adapter-request.json").resolve()
+        request_path.write_bytes(canonical(request_value))
+        request_path.chmod(0o600)
+        openssl = Path(shutil.which("openssl")).resolve()
+        git = Path(shutil.which("git")).resolve()
+        configuration = {
+            "version": 1,
+            "privateKey": str(self.private_key.resolve()),
+            "publicKey": str(self.public_key.resolve()),
+            "storeRoot": str(gateway_store),
+            "docker": str(Path(sys.executable).resolve()),
+            "openssl": str(openssl),
+            "git": str(git),
+            "deploymentId": deployment_id,
+            "runtimeDomainId": runtime_domain_id,
+            "dockerHost": docker_host,
+            "image": image,
+            "platform": platform,
+            "runnerSha256": runner_sha256,
+            "targetUid": 65532,
+            "targetGid": 65532,
+            "consumerGid": os.getegid(),
+            "capabilitySeconds": 300,
+            "maxSourceBundleBytes": 64 * 1024 * 1024,
+            "profile": self.profile,
+        }
+        configuration_path = (self.root / "adapter-config.json").resolve()
+        configuration_path.write_bytes(canonical(configuration))
+        configuration_path.chmod(0o600)
+        source_bundle = (self.source_root / "pr.bundle").resolve()
+        runner = FakeRunner()
+
+        with mock.patch.object(
+            gateway_adapter,
+            "DockerRunner",
+            return_value=runner,
+        ) as runner_factory, mock.patch.object(
+            gateway_broker,
+            "_claim_dedicated_process",
+        ):
+            first_export = gateway_adapter.run(
+                str(configuration_path),
+                str(request_path),
+                str(source_bundle),
+                str(evidence_dir),
+            )
+            verified = bridge.consume(
+                child_root,
+                self.source_root,
+                self.profile,
+                self.public_key,
+                evidence_dir,
+                now=datetime.now(timezone.utc),
+            )
+            verified_record = child.implementation_attempt(1, 1)
+            first_land = bridge.land(
+                child_root,
+                self.source_root,
+                self.repo,
+                attempt=1,
+                message="fix: pin the value",
+                api=self.api,
+            )
+            second_export = gateway_adapter.run(
+                str(configuration_path),
+                str(request_path),
+                str(source_bundle),
+                str(evidence_dir),
+            )
+            replayed = bridge.consume(
+                child_root,
+                self.source_root,
+                self.profile,
+                self.public_key,
+                evidence_dir,
+                now=datetime.now(timezone.utc),
+            )
+            second_land = bridge.land(
+                child_root,
+                self.source_root,
+                self.repo,
+                attempt=1,
+                message="fix: pin the value",
+                api=self.api,
+            )
+            replayed_record = child.implementation_attempt(1, 1)
+
+        self.assertEqual(first_export, second_export)
+        self.assertEqual(Path(first_export["evidenceDir"]), evidence_dir)
+        self.assertEqual({path.name for path in evidence_dir.iterdir()}, bridge._EVIDENCE_FILES)
+        self.assertEqual(verified["state"], "verified")
+        self.assertEqual(replayed["state"], "landed")
+        for name in ("evidence", "capability", "receipt"):
+            self.assertEqual(verified_record[name], replayed_record[name])
+        self.assertEqual(first_land, second_land)
+        commit = first_land["artifact"]
+        self.assertEqual(self.branch_head(linked["branch"]), commit)
+        self.assertEqual(
+            self.git("rev-list", "--parents", "-n", "1", commit, cwd=self.repo).split(),
+            [commit, self.head],
+        )
+        self.assertEqual(self.git("show", f"{commit}:app.py", cwd=self.repo), "VALUE = 2")
+        self.assertEqual(child.implementation_attempt(1, 1)["state"], "landed")
+        self.assertEqual(self.source.snapshot(), before)
+        self.assertEqual(runner_factory.call_count, 2)
+        self.assertEqual(runner.reconcile_calls, 2)
+        self.assertEqual(runner.prepare_calls, 1)
+        self.assertEqual(runner.run_calls, 1)
+        self.assertEqual(runner.prepared_close_calls, 1)
+        self.assertEqual(runner.close_calls, 2)
 
     def test_moved_head_prevents_link_and_request_side_effects(self):
         moved = copy.deepcopy(self.metadata)

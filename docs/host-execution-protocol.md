@@ -585,8 +585,10 @@ automatic checkout, commit, push, review, or other external effect.
 
 ### Linked implementation evidence transport
 
-The reference linked implementation receives one gateway result through a directory with
-this exact file set:
+The reference one-shot host adapter, `gateway/adapter.py`, loads only private trusted host
+configuration and receives one reserved request plus its authoritative source bundle. It
+runs one `ExecutionBroker` in a dedicated process and publishes the result through a
+directory with this exact file set:
 
 ```
 request.json
@@ -603,6 +605,31 @@ stderr
 The source bundle is not part of this transport; the consumer obtains it from the
 authoritative frozen source session and verifies its stored digest and byte count.
 
+The gateway and linked consumer run as distinct OS users in one dedicated handoff group.
+The group contains no job or runtime identities. `consumerGid` pins that group. The gateway
+store remains gateway-owned `0700`. The separate immediate outbox parent is gateway-owned,
+group-owned by `consumerGid`, and `0710`; every ancestor is protected from untrusted writes
+and traversable by the consumer. The exact path lets the consumer enter the final
+gateway-owned `0750` directory and read its six consumer-group `0640` files without listing
+the outbox.
+
+The adapter stages all six single-link regular files in a private directory whose name is
+derived from the exact destination, makes the files and directory durable, atomically
+renames the complete directory into place, and then grants consumer-group read access. A
+completed broker replay reuses the stored result without another execution. An existing
+destination is accepted only when its exact file set and every byte match that result; any
+difference is a conflict. A locked retry removes only that destination's recognized staging
+directory and can promote a complete `0700` destination left by interruption before group
+handoff. It then re-establishes the parent directory durability barrier.
+
+For handled outcomes, the adapter writes one version 1 JSON object. `status: complete` with
+exit code zero names `evidenceDir`; `status: retry` with exit code one requires the exact
+request and source bundle to be retried; `status: failed` with exit code two proves the
+gateway replay identity can no longer produce a receipt. Only that exact failed result
+authorizes the controller to mark the matching child attempt failed and reserve a new
+challenge. Missing or malformed output, interruption, and all other outcomes are retryable,
+not terminal.
+
 The directory and every entry are untrusted transport. The reference consumer requires a
 real, non-symlink directory with no extra or missing names. It opens each entry without
 following symlinks, requires a single-link regular file, applies its configured byte limit,
@@ -614,6 +641,8 @@ verification. It reconstructs expected context from the reserved child request, 
 profile, authoritative source session, independently verified source and output bundles,
 and independently hashed streams. Only then does it call the envelope validator and copy
 the exact evidence bytes into the child's immutable attempt directory.
+After that durable consume succeeds, the gateway-owner supervisor MAY delete the final
+transport. The consumer cannot delete it through the non-writable outbox parent.
 
 ## Validator contract
 
