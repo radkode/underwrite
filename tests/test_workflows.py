@@ -563,6 +563,11 @@ class ReviewWorkflow(WorkflowCase):
 
 
 class DistributionInvariants(unittest.TestCase):
+    def test_local_worktrees_stay_ignored(self):
+        patterns = (ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+
+        self.assertIn(".worktrees/", patterns)
+
     def test_marketplace_plugin_and_entrypoints_stay_aligned(self):
         plugin = json.loads(
             (ROOT / ".claude-plugin" / "plugin.json").read_text(encoding="utf-8")
