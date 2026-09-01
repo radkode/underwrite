@@ -487,7 +487,7 @@ def beat_html(
         value = slots.get(key)
         if not value:
             continue
-        cls = ' class="risk"' if key == "risk" else ' class="fix"' if key == "fix" else ""
+        cls = f' class="{key}"'
         rows.append(f"<dt{cls}>{key}</dt><dd{cls}>{md(value)}</dd>")
 
     body = [f'<dl class="slots">{"".join(rows)}</dl>']
