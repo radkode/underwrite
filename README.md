@@ -109,6 +109,8 @@ frozen review or report audience. A separate implementation authorization binds 
 acknowledged source accept, its exact beat revision, the frozen target, an actor, and the
 actor's approval text. It creates a one-beat child with branch audience and
 `gateway_attested` execution instead of changing the source session.
+The gateway's one-shot [`adapter.py`](gateway/adapter.py) accepts that child's reserved
+request and publishes the exact six-file evidence handoff consumed by the linked workflow.
 
 The child accepts execution evidence only for its reserved request. It independently
 checks the frozen source bundle, signed capability and receipt, output bundle, complete

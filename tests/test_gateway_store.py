@@ -334,14 +334,16 @@ class ReplayLedgerTests(unittest.TestCase):
 
             restarted = ReplayLedger(self.content)
             with self.subTest(state=state):
-                with self.assertRaisesRegex(ReplayConflict, state):
+                with self.assertRaisesRegex(ReplayConflict, state) as lookup:
                     restarted.lookup_complete(
                         replay_key, self.request, self.source
                     )
-                with self.assertRaisesRegex(ReplayConflict, state):
+                with self.assertRaisesRegex(ReplayConflict, state) as reserve:
                     restarted.reserve(
                         replay_key, challenge_key, self.request, self.source
                     )
+                self.assertEqual(lookup.exception.state, state)
+                self.assertEqual(reserve.exception.state, state)
 
     def test_completed_record_detects_request_and_capability_tampering(self):
         self.complete_attempt()

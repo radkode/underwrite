@@ -488,8 +488,12 @@ gets a new number and challenge. It prints the request object as JSON. The trust
 submits that object to the gateway; the later evidence file must be the gateway's exact
 canonical `StoredExecution.request` bytes, not a copy of terminal formatting.
 
-If the supervised gateway definitely reports that it did not produce a receipt, record
-that outcome before requesting a fresh attempt:
+The one-shot adapter's handled stdout is a version 1 JSON object. `status: complete` with
+exit code zero names the six-file evidence directory. `status: retry` with exit code one,
+missing or malformed output, interruption, and every unknown outcome require retrying the
+same request and source bundle. Only `status: failed` with exit code two proves the gateway
+replay identity can no longer produce a receipt. Record only that outcome before
+requesting a fresh attempt:
 
 ```bash
 $S/scripts/implementationctl.py fail "$C" "$R" \
@@ -527,6 +531,8 @@ streams, and exit code. It then copies the exact evidence into
 `$C/implementation-evidence/<attempt>/` and records its digests in the child database.
 Neither the gateway's own validation record nor a conforming envelope substitutes for
 these checks.
+After `consume` durably succeeds, tell the gateway-owner supervisor it may delete the
+handoff directory. The consumer account cannot delete it through the non-writable outbox.
 
 Land only an attempt reported as verified:
 

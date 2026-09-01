@@ -5,7 +5,9 @@ import errno
 import hashlib
 import json
 import os
+import shutil
 import subprocess
+import sys
 import tempfile
 import unittest
 import uuid
@@ -13,15 +15,17 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from gateway import artifacts
-from gateway.broker import ExecutionBroker, GatewayPolicy
+from gateway.broker import GatewayPolicy
 from gateway.docker_runner import DockerRunner, runtime_container_name
 from gateway.signing import OpenSSLSigner
+from skills.underwrite.scripts.execution_receipt import verify_execution_receipt
 
 
 IMAGE_ENV = "UNDERWRITE_LIVE_GATEWAY_IMAGE"
 PLATFORM_ENV = "UNDERWRITE_LIVE_GATEWAY_PLATFORM"
 DOCKER_HOST_ENV = "UNDERWRITE_LIVE_GATEWAY_DOCKER_HOST"
 RUNNER_PATH = Path(__file__).parents[1] / "gateway" / "sandbox_runner.py"
+ADAPTER_PATH = (Path(__file__).parents[1] / "gateway" / "adapter.py").resolve()
 RUNTIME_DOMAIN_ID = "urn:underwrite:runtime-domain:live:local-docker"
 DIRECT_DEPLOYMENT_ID = "urn:underwrite:gateway:live:direct-conformance"
 
@@ -30,6 +34,11 @@ DIRECT_DEPLOYMENT_ID = "urn:underwrite:gateway:live:direct-conformance"
 class LiveGatewayTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
+        for tool in ("docker", "git", "openssl"):
+            candidate = shutil.which(tool)
+            if candidate is None:
+                raise RuntimeError("required live gateway tool is unavailable: %s" % tool)
+            setattr(cls, tool, str(Path(candidate).resolve()))
         cls.image = os.environ[IMAGE_ENV]
         cls.platform = os.environ.get(PLATFORM_ENV, "linux/amd64")
         cls.docker_host = os.environ.get(
@@ -43,7 +52,7 @@ class LiveGatewayTests(unittest.TestCase):
         )
         completed = subprocess.run(
             [
-                "docker",
+                cls.docker,
                 "--host",
                 cls.docker_host,
                 "run",
@@ -160,7 +169,7 @@ class LiveGatewayTests(unittest.TestCase):
 
     def remove_container(self, name):
         subprocess.run(
-            ["docker", "--host", self.docker_host, "rm", "--force", name],
+            [self.docker, "--host", self.docker_host, "rm", "--force", name],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
             check=False,
@@ -168,27 +177,31 @@ class LiveGatewayTests(unittest.TestCase):
 
     def source_bundle(self, root):
         repo = root / "source"
-        self.command(["git", "init", repo])
+        self.command([self.git, "init", repo])
         for name, value in (
             ("user.name", "Underwrite Live Test"),
             ("user.email", "live@underwrite.invalid"),
             ("commit.gpgsign", "false"),
         ):
-            self.command(["git", "config", name, value], cwd=repo)
+            self.command([self.git, "config", name, value], cwd=repo)
         (repo / "seed.txt").write_bytes(b"base input\n")
-        self.command(["git", "add", "."], cwd=repo)
-        self.command(["git", "commit", "-m", "base"], cwd=repo)
-        base = self.command(["git", "rev-parse", "HEAD"], cwd=repo).decode("ascii")
+        self.command([self.git, "add", "."], cwd=repo)
+        self.command([self.git, "commit", "-m", "base"], cwd=repo)
+        base = self.command([self.git, "rev-parse", "HEAD"], cwd=repo).decode("ascii")
         (repo / "seed.txt").write_bytes(b"frozen head input\n")
-        self.command(["git", "add", "."], cwd=repo)
-        self.command(["git", "commit", "-m", "head"], cwd=repo)
-        head = self.command(["git", "rev-parse", "HEAD"], cwd=repo).decode("ascii")
-        self.command(["git", "update-ref", artifacts.SOURCE_REFS[0], base], cwd=repo)
-        self.command(["git", "update-ref", artifacts.SOURCE_REFS[1], head], cwd=repo)
+        self.command([self.git, "add", "."], cwd=repo)
+        self.command([self.git, "commit", "-m", "head"], cwd=repo)
+        head = self.command([self.git, "rev-parse", "HEAD"], cwd=repo).decode("ascii")
+        self.command(
+            [self.git, "update-ref", artifacts.SOURCE_REFS[0], base], cwd=repo
+        )
+        self.command(
+            [self.git, "update-ref", artifacts.SOURCE_REFS[1], head], cwd=repo
+        )
         bundle_path = root / "source.bundle"
         self.command(
             [
-                "git",
+                self.git,
                 "bundle",
                 "create",
                 bundle_path,
@@ -197,7 +210,7 @@ class LiveGatewayTests(unittest.TestCase):
             cwd=repo,
         )
         bundle = bundle_path.read_bytes()
-        difference = self.command(["git", "diff", base, head], cwd=repo)
+        difference = self.command([self.git, "diff", base, head], cwd=repo)
         trusted_context = b"trusted base instructions\n"
         target = {
             "version": 1,
@@ -222,15 +235,17 @@ class LiveGatewayTests(unittest.TestCase):
         }
         return bundle_path, target
 
-    def test_broker_signs_and_persists_one_verified_end_to_end_execution(self):
-        with tempfile.TemporaryDirectory() as name:
-            root = Path(name)
+    def test_adapter_signs_and_publishes_one_verified_end_to_end_execution(self):
+        with tempfile.TemporaryDirectory(dir="/tmp") as name:
+            root = Path(name).resolve()
+            os.chown(root, -1, os.getegid())
+            root.chmod(0o710)
             container_name = runtime_container_name(RUNTIME_DOMAIN_ID)
             self.remove_container(container_name)
             self.addCleanup(self.remove_container, container_name)
             self.command(
                 [
-                    "docker",
+                    self.docker,
                     "--host",
                     self.docker_host,
                     "run",
@@ -252,7 +267,7 @@ class LiveGatewayTests(unittest.TestCase):
             )
             running = self.command(
                 [
-                    "docker",
+                    self.docker,
                     "--host",
                     self.docker_host,
                     "container",
@@ -267,7 +282,7 @@ class LiveGatewayTests(unittest.TestCase):
             public_key = root / "public.pem"
             self.command(
                 [
-                    "openssl",
+                    self.openssl,
                     "genpkey",
                     "-algorithm",
                     "EC",
@@ -283,7 +298,7 @@ class LiveGatewayTests(unittest.TestCase):
             public_key.write_bytes(
                 self.command(
                     [
-                        "openssl",
+                        self.openssl,
                         "pkey",
                         "-in",
                         private_key,
@@ -294,7 +309,7 @@ class LiveGatewayTests(unittest.TestCase):
             )
             signer_id = "https://runner.example/hosts/live-test"
             signer = OpenSSLSigner(
-                private_key, public_key, signer_id
+                private_key, public_key, signer_id, openssl=self.openssl
             )
             limits = self.limits()
             environment = {
@@ -304,12 +319,20 @@ class LiveGatewayTests(unittest.TestCase):
                 "PYTHONDONTWRITEBYTECODE": "1",
                 "PYTHONUTF8": "1",
             }
+            sandbox = self.sandbox(limits)
             code = (
                 "from pathlib import Path;"
                 "assert Path('seed.txt').read_bytes()==b'frozen head input\\n';"
                 "Path('executed.txt').write_bytes(b'gateway output\\n');"
                 "print('broker completed')"
             )
+            job = {
+                "argv": [self.executable["path"], "-I", "-S", "-c", code],
+                "cwd": ".",
+                "environment": environment,
+                "executable": self.executable,
+                "stdin": "closed",
+            }
             policy = GatewayPolicy(
                 signer_id=signer_id,
                 deployment_id="urn:underwrite:gateway:live-conformance",
@@ -320,7 +343,7 @@ class LiveGatewayTests(unittest.TestCase):
                 runner_sha256=self.runner_sha256,
                 executable=self.executable,
                 environment=environment,
-                sandbox=self.sandbox(limits),
+                sandbox=sandbox,
                 target_uid=65532,
                 target_gid=65532,
             )
@@ -330,63 +353,165 @@ class LiveGatewayTests(unittest.TestCase):
                 "challenge": os.urandom(32).hex(),
                 "target": target,
                 "action": {"seq": 1, "beat": 1, "attempt": 1},
-                "job": {
-                    "argv": [self.executable["path"], "-I", "-S", "-c", code],
-                    "cwd": ".",
-                    "environment": environment,
-                    "executable": self.executable,
-                    "stdin": "closed",
-                },
-                "sandbox": self.sandbox(limits),
+                "job": job,
+                "sandbox": sandbox,
                 "exitCode": 0,
             }
-            runner = DockerRunner(
-                self.image,
-                self.platform,
-                self.docker_host,
-                policy.deployment_id,
-                policy.runtime_domain_id,
-            )
-            self.addCleanup(runner.close)
-            self.addCleanup(runner._remove_container, container_name)
-            broker = ExecutionBroker(
-                policy,
-                signer,
-                root / "store",
-                runner,
-                dedicated_process=True,
-            )
+            profile = {
+                "version": 1,
+                "keyId": signer.key_id,
+                "signerId": signer_id,
+                "executorId": policy.executor_id,
+                "job": job,
+                "sandbox": sandbox,
+                "exitCode": 0,
+            }
+            store = root / "store"
+            outbox = root / "outbox"
+            store.mkdir(mode=0o700)
+            outbox.mkdir(mode=0o710)
+            evidence = outbox / "attempt-1"
+            configuration = {
+                "version": 1,
+                "privateKey": str(private_key),
+                "publicKey": str(public_key),
+                "storeRoot": str(store),
+                "docker": self.docker,
+                "openssl": self.openssl,
+                "git": self.git,
+                "deploymentId": policy.deployment_id,
+                "runtimeDomainId": policy.runtime_domain_id,
+                "dockerHost": self.docker_host,
+                "image": self.image,
+                "platform": self.platform,
+                "runnerSha256": self.runner_sha256,
+                "targetUid": 65532,
+                "targetGid": 65532,
+                "consumerGid": os.getegid(),
+                "capabilitySeconds": 300,
+                "maxSourceBundleBytes": 64 * 1024 * 1024,
+                "profile": profile,
+            }
+            def canonical(value):
+                return json.dumps(
+                    value,
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+            config_path = root / "adapter.json"
+            config_path.write_bytes(canonical(configuration))
+            config_path.chmod(0o600)
+            request_path = root / "request.json"
+            request_bytes = canonical(request)
+            request_path.write_bytes(request_bytes)
+            command = [
+                sys.executable,
+                "-I",
+                "-S",
+                str(ADAPTER_PATH),
+                "--config",
+                str(config_path),
+                "--request",
+                str(request_path),
+                "--source-bundle",
+                str(bundle_path),
+                "--evidence-dir",
+                str(evidence),
+            ]
 
-            stored = broker.execute(request, bundle_path)
+            first = json.loads(self.command(command))
 
             self.assertEqual(
-                broker.content.read(stored.artifact("stdout")),
-                b"broker completed\n",
+                first,
+                {
+                    "version": 1,
+                    "status": "complete",
+                    "evidenceDir": str(evidence),
+                },
             )
-            self.assertEqual(broker.content.read(stored.artifact("stderr")), b"")
-            validation = json.loads(stored.validation)
-            self.assertEqual(validation["status"], "accepted")
-            output_bundle = broker.content.read(stored.artifact("outputBundle"))
+            self.assertEqual(
+                {path.name for path in evidence.iterdir()},
+                {
+                    "request.json",
+                    "capability.dsse.json",
+                    "receipt.dsse.json",
+                    "output.bundle",
+                    "stdout",
+                    "stderr",
+                },
+            )
+            for path in evidence.iterdir():
+                details = path.stat()
+                self.assertTrue(path.is_file())
+                self.assertEqual(details.st_nlink, 1)
+            self.assertEqual((evidence / "request.json").read_bytes(), request_bytes)
+            stdout = (evidence / "stdout").read_bytes()
+            stderr = (evidence / "stderr").read_bytes()
+            self.assertEqual(stdout, b"broker completed\n")
+            self.assertEqual(stderr, b"")
+            output_bundle = (evidence / "output.bundle").read_bytes()
             descriptor = artifacts.verify_output_bundle(
                 output_bundle,
                 maximum_workspace_bytes=limits["workspaceBytes"],
                 maximum_bundle_bytes=limits["workspaceBytes"] * 2,
+                git=self.git,
             )
-            self.assertEqual(descriptor.git_tree, validation["outputTree"])
-            self.assertEqual(broker.execute(request, bundle_path), stored)
-            remaining = runner._command(
+            input_workspace = root / "expected-input"
+            input_workspace.mkdir()
+            (input_workspace / "seed.txt").write_bytes(b"frozen head input\n")
+            input_tree = artifacts.synthetic_git_tree(
+                input_workspace,
+                maximum_bytes=limits["workspaceBytes"],
+            )
+            def stream(value):
+                return {
+                    "sha256": hashlib.sha256(value).hexdigest(),
+                    "bytes": len(value),
+                    "truncated": False,
+                }
+            verified = verify_execution_receipt(
+                (evidence / "capability.dsse.json").read_bytes(),
+                (evidence / "receipt.dsse.json").read_bytes(),
+                {
+                    "signerId": signer_id,
+                    "executorId": policy.executor_id,
+                    "sessionId": request["sessionId"],
+                    "challenge": request["challenge"],
+                    "target": target,
+                    "action": request["action"],
+                    "job": job,
+                    "inputTree": input_tree,
+                    "sandbox": sandbox,
+                    "outputTree": descriptor.git_tree,
+                    "outputBundle": {
+                        "sha256": hashlib.sha256(output_bundle).hexdigest(),
+                        "bytes": len(output_bundle),
+                    },
+                    "stdout": stream(stdout),
+                    "stderr": stream(stderr),
+                    "exitCode": 0,
+                },
+                signer.verify,
+                datetime.now(timezone.utc),
+            )
+            self.assertEqual(verified.signer_id, signer_id)
+
+            self.assertEqual(json.loads(self.command(command)), first)
+            remaining = self.command(
                 [
+                    self.docker,
+                    "--host",
+                    self.docker_host,
                     "container",
                     "ls",
                     "--all",
                     "--quiet",
                     "--filter",
                     f"name=^/{container_name}$",
-                ],
-                check=False,
+                ]
             )
-            self.assertEqual(remaining.returncode, 0)
-            self.assertEqual(remaining.stdout.strip(), b"")
+            self.assertEqual(remaining, b"")
 
     def test_clean_job_has_only_the_declared_surface_and_round_trips_output(self):
         environment = {

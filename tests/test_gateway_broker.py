@@ -22,13 +22,14 @@ from unittest import mock
 from gateway import artifacts
 from gateway import broker as broker_module
 from gateway.broker import (
+    AttemptFailed,
     ExecutionBroker,
     ExecutionFailed,
     ExecutionRequest,
     GatewayError,
     GatewayPolicy,
 )
-from gateway.store import ReplayConflict, StoredExecution
+from gateway.store import ReplayConflict, StoreError, StoredExecution
 
 
 SIGNER_ID = "https://runner.example/hosts/runner-7"
@@ -905,7 +906,7 @@ class ExecutionBrokerTests(BrokerCase):
         self.result.exit_code = None
         broker = self.make_broker()
 
-        with self.assertRaisesRegex(ExecutionFailed, "resource limit"):
+        with self.assertRaisesRegex(AttemptFailed, "resource limit"):
             broker.execute(self.request, self.source_path)
 
         self.assertEqual(len(self.signer.sign_calls), 1)
@@ -916,6 +917,24 @@ class ExecutionBrokerTests(BrokerCase):
         self.assertIsNone(row["receipt"])
         self.assertEqual(self.runner.prepared[0].cancel_calls, 0)
         self.assertEqual(self.runner.prepared[0].close_calls, 1)
+
+    def test_failed_runner_is_retryable_when_failure_state_is_not_durable(self):
+        self.result.status = "failed"
+        self.result.failure = "resource limit exceeded"
+        self.result.exit_code = None
+        broker = self.make_broker()
+
+        with mock.patch.object(
+            broker.ledger,
+            "fail",
+            side_effect=StoreError("ledger unavailable"),
+        ):
+            with self.assertRaises(ExecutionFailed) as caught:
+                broker.execute(self.request, self.source_path)
+
+        self.assertNotIsInstance(caught.exception, AttemptFailed)
+        self.assertEqual(self.row(broker)["state"], "executing")
+        self.assertIsNone(self.row(broker)["receipt"])
 
     def test_teardown_failure_never_signs_or_persists_a_receipt(self):
         broker = self.make_broker()
