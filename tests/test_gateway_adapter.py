@@ -111,7 +111,7 @@ class GatewayAdapterCase(unittest.TestCase):
         }
 
     def configuration_value(self):
-        executable = str(Path(sys.executable).resolve())
+        executable = "/usr/bin/true"
         return {
             "version": 1,
             "privateKey": str(self.private_key),

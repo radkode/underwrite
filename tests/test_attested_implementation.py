@@ -1351,7 +1351,7 @@ class AttestedImplementationCase(unittest.TestCase):
             "privateKey": str(self.private_key.resolve()),
             "publicKey": str(self.public_key.resolve()),
             "storeRoot": str(gateway_store),
-            "docker": str(Path(sys.executable).resolve()),
+            "docker": "/usr/bin/true",
             "openssl": str(openssl),
             "git": str(git),
             "deploymentId": deployment_id,
