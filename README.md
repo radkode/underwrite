@@ -139,6 +139,8 @@ proof. When the walk ends, that ledger is the page, and it is what the final ren
 The keys do what the row under the beat says: Enter saves a note, or records a decision
 when the note is the decision; ⌘Enter or Ctrl+Enter fires the row's primary action; `n`
 is Next beat and `f` goes to the first open flag.
+Drop is the one control with no undo, so it asks: the first click arms it and the second
+one sends. Anything else answers no, including three seconds of nothing.
 
 Decisions happen there too. Review mode uses Include in review and Drop. Report mode uses
 Include in report and Drop. Local branch and working-tree sessions retain Implement. A

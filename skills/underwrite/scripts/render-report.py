@@ -73,12 +73,37 @@ LIVE_JS = """<script>
   const NAVIGATION = new Set(['next', 'back', 'skip']);
   let liveClass = 'live starting', liveText = 'connecting';
   let between = false, lastPhase = null, done = false;
+  let armed = null, armTimer = null;
   const pendingKey = 'underwrite.pending-action';
   let rev = null, known = new Set(), usable = false, connected = false, sessionId = null;
   let sending = false, pending = null;
   let desiredRev = null, swapPromise = null, swapRetry = null, resumedPending = false;
   let retryWhenIdle = false;
   let observedSeq = 0, awaitingSeq = null;
+
+  // Drop is the one control with no undo, so it asks once. Anything else the
+  // reviewer does answers no: another button, Escape, or three seconds of nothing.
+  const ARM_MSG = 'click again to drop, or wait';
+
+  function disarm() {
+    if (!armed) return;
+    clearTimeout(armTimer);
+    armed.button.textContent = armed.label;
+    armed.button.classList.remove('is-armed');
+    // Only take back the prompt disarming makes untrue; a send message outranks it.
+    const msg = armed.button.closest('.acts').querySelector('.act-msg');
+    if (msg && msg.textContent === ARM_MSG) msg.textContent = '';
+    armed = null;
+    armTimer = null;
+  }
+
+  function arm(button, n) {
+    disarm();
+    armed = { button, label: button.textContent };
+    button.textContent = n === 'walk' ? 'Drop?' : `Drop beat ${n}?`;
+    button.classList.add('is-armed');
+    armTimer = setTimeout(disarm, 3000);
+  }
 
   function paintLive(cls, text) {
     if (cls !== undefined) { liveClass = cls; liveText = text; }
@@ -222,6 +247,7 @@ LIVE_JS = """<script>
       }
     });
     known = beatIds();
+    armed = null;
     wire();
     paintLive();
     paintStage();
@@ -269,7 +295,7 @@ LIVE_JS = """<script>
       awaitingSeq = Number.isInteger(receipt.seq) && receipt.seq > observedSeq
         ? receipt.seq : null;
       remember(null);
-      showMessage(payload, '');
+      showMessage(payload, payload.action === 'next' ? owedNote() : '');
     } catch (err) {
       showMessage(
         payload,
@@ -285,6 +311,13 @@ LIVE_JS = """<script>
       }
     }
     return true;
+  }
+
+  // Next beat on an unresolved flag is legal and leaves it owed. The track and the
+  // ledger both say so; this says it where the click happened.
+  function owedNote() {
+    const staged = document.querySelector('#stage .beat.s-flag');
+    return staged ? `beat ${staged.dataset.n} stays owed` : '';
   }
 
   function resumePending() {
@@ -303,6 +336,13 @@ LIVE_JS = """<script>
     const n = row.dataset.acts;
     const note = row.querySelector('.note');
     const msg = row.querySelector('.act-msg');
+    const wasArmed = armed && armed.button === button;
+    disarm();
+    if (button.dataset.action === 'drop' && !wasArmed) {
+      arm(button, n);
+      msg.textContent = ARM_MSG;
+      return;
+    }
     const fresh = {
       id: crypto.randomUUID(),
       session_id: sessionId,
@@ -336,6 +376,7 @@ LIVE_JS = """<script>
   // is optional there, and a keystroke that reads as "save this" must not be terminal.
   document.addEventListener('keydown', event => {
     const target = event.target;
+    if (event.key === 'Escape') { disarm(); return; }
     if (target && target.classList && target.classList.contains('note')) {
       if (event.key !== 'Enter') return;
       const row = target.closest('.acts');
