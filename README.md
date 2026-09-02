@@ -233,8 +233,9 @@ command in `sessionctl.py` records the write-once target, including the head rep
 and ref, plus the trusted base context and Git object bundle. It records the no-exec policy
 and derives the PR audience from the captured lifecycle in the same transaction. Existing
 sessions keep their frozen audience; lifecycle drift requires a supervised replacement.
-`read-blob` and `context-log` are the argv-safe gateways for inspecting those frozen
-objects without checking out the PR.
+`diff`, `read-blob` and `context-log` are the argv-safe gateways for inspecting those
+frozen objects without checking out the PR; each one verifies against the frozen digest
+before it returns anything.
 `check-pr` refuses a moved base, head, route, or lifecycle before an external effect, while
 `check-controller` requires the clean controller to remain at the frozen base. The frozen
 diff, trusted context, and object bundle are checked by byte count and SHA-256.

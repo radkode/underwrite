@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Transactional storage for one underwrite session."""
+import base64
 import contextlib
 import fcntl
 import hashlib
@@ -2965,6 +2966,28 @@ class SessionStore:
             if len(data) != expected_size or digest != expected_digest:
                 raise Conflict("frozen trusted context does not match")
             return self._trusted_context_document(data, target)
+
+    def read_diff(self, max_bytes=1_000_000):
+        """The frozen three-dot diff as a document, for the review side. Verification is
+        read_verified_target_diff's; this adds the bound and the transport encoding so
+        the agent never has to open the projection file itself."""
+        max_bytes = _positive(max_bytes, "diff max_bytes")
+        target, data = self.read_verified_target_diff()
+        if len(data) > max_bytes:
+            raise Conflict(
+                f"frozen diff is {len(data)} bytes, above max_bytes {max_bytes}"
+            )
+        try:
+            content, encoding = data.decode("utf-8"), "utf-8"
+        except UnicodeError:
+            content = base64.b64encode(data).decode("ascii")
+            encoding = "base64"
+        return {
+            "bytes": len(data),
+            "content": content,
+            "encoding": encoding,
+            "sha256": target["diff_sha256"],
+        }
 
     def read_object_bundle(self):
         with self._session_lock():
