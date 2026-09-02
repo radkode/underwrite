@@ -322,25 +322,53 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
   gap: 14px;
 }
 
-/* ---- slots ---- */
+/* ---- slots ----
+   Six slots, two jobs. WHAT, PROOF, RISK and FIX carry the argument the reviewer
+   acts on; WHY and PRIOR qualify the slot above them, so they tuck under it and
+   drop back. Labels sit at --ink-2: --ink-3 is 3.85:1 on white and 4.10:1 on
+   --raised in dark, under the floor for 10px text. */
 
 .slots {
   display: grid;
-  grid-template-columns: 62px minmax(0, 1fr);
-  gap: 9px 16px;
+  grid-template-columns: 78px minmax(0, 1fr);
 }
+/* The column gutter is the label's padding, so a row's rule can cross both. */
 .slots dt {
   font-family: var(--mono);
   font-size: 10px;
   letter-spacing: 0.13em;
   text-transform: uppercase;
-  color: var(--ink-3);
-  padding-top: 4px;
+  color: var(--ink-2);
+  padding: 5px 16px 0 0;
 }
-.slots dd { margin: 0; font-size: 14px; line-height: 1.55; text-wrap: pretty; }
-.slots dd.risk { color: var(--flag); }
-.slots dt.risk { color: var(--flag); }
-.slots dd.fix  { color: var(--ink); }
+.slots dd {
+  margin: 0;
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--ink);
+  text-wrap: pretty;
+}
+
+/* Close enough to belong to the slot above, quiet enough not to compete with it. */
+.slots dt.why, .slots dd.why,
+.slots dt.prior, .slots dd.prior { margin-top: 4px; }
+.slots dd.why, .slots dd.prior { font-size: 13.5px; color: var(--ink-2); }
+
+/* Between the parts of the argument. */
+.slots dt.proof, .slots dd.proof,
+.slots dt.risk, .slots dd.risk { margin-top: 16px; }
+
+/* The one slot that earns colour. */
+.slots dt.risk, .slots dd.risk { color: var(--flag); }
+
+/* FIX is the line the buttons act on, so it gets the card's own separator. */
+.slots dt.fix, .slots dd.fix {
+  margin-top: 16px;
+  border-top: 1px solid var(--rule-soft);
+}
+.slots dd.fix { padding-top: 14px; font-weight: 560; }
+.slots dt.fix { padding-top: 19px; }
+
 .slots dd code, .b-claim code, .facts code, .next code {
   font-family: var(--mono);
   font-size: 0.87em;
@@ -574,8 +602,16 @@ footer {
   .b-tier { grid-column: 2; }
   .b-claim { grid-column: 2; }
   .b-path { grid-column: 2; }
-  .slots { grid-template-columns: minmax(0, 1fr); gap: 3px; }
-  .slots dt { padding-top: 8px; }
+  /* Stacked: the label carries the separation, so the rhythm cannot double up on
+     a row and the FIX rule cannot land under its own label. */
+  .slots { grid-template-columns: minmax(0, 1fr); }
+  .slots dt { padding: 0 0 3px; margin-top: 16px; }
+  .slots dt:first-child { margin-top: 0; }
+  .slots dd.why, .slots dd.proof, .slots dd.risk,
+  .slots dd.prior, .slots dd.fix { margin-top: 0; }
+  .slots dt.why, .slots dt.prior { margin-top: 9px; }
+  .slots dd.fix { padding-top: 0; border-top: 0; }
+  .slots dt.fix { margin-top: 16px; padding-top: 14px; }
   .next-row { grid-template-columns: minmax(0, 1fr); }
   .next-row .where { grid-column: 1; }
 }
