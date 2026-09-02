@@ -114,6 +114,10 @@ def parser():
     trusted_context = commands.add_parser("trusted-context")
     trusted_context.add_argument("session")
 
+    diff = commands.add_parser("diff")
+    diff.add_argument("session")
+    diff.add_argument("--max-bytes", type=int, default=1_000_000)
+
     context = commands.add_parser("context-log")
     context.add_argument("session")
     context.add_argument("--limit", type=int, default=20)
@@ -218,6 +222,8 @@ def run(args):
         return SessionStore(args.session).check_execution()
     elif args.command == "trusted-context":
         return SessionStore(args.session).read_trusted_context()
+    elif args.command == "diff":
+        return SessionStore(args.session).read_diff(args.max_bytes)
     elif args.command == "context-log":
         result = context_log(SessionStore(args.session), args.limit)
         result["path_tokens"] = [

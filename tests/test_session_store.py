@@ -463,6 +463,45 @@ class FrozenTargets(unittest.TestCase):
         with self.assertRaisesRegex(session_store.Conflict, "forbids"):
             self.store.check_execution()
 
+    def test_the_frozen_diff_is_read_through_the_store_and_hash_verified(self):
+        """SKILL.md says to inspect the frozen diff through Underwrite's own tools, and
+        read-blob covered only the blobs; opening pr.diff by hand was the only way."""
+        diff, metadata = self.inputs()
+        target = self.store.freeze_target(self.target(), diff, metadata)
+
+        read = self.store.read_diff()
+        self.assertEqual(read["sha256"], target["diff_sha256"])
+        self.assertEqual(read["bytes"], target["diff_bytes"])
+        self.assertEqual(read["encoding"], "utf-8")
+        self.assertEqual(
+            read["content"], (self.root / "pr.diff").read_text(encoding="utf-8")
+        )
+
+    def test_reading_the_diff_refuses_a_projection_that_no_longer_matches(self):
+        diff, metadata = self.inputs()
+        self.store.freeze_target(self.target(), diff, metadata)
+
+        (self.root / "pr.diff").write_text("not the frozen diff\n", encoding="utf-8")
+        with self.assertRaisesRegex(session_store.Conflict, "does not match"):
+            self.store.read_diff()
+
+        (self.root / "pr.diff").unlink()
+        with self.assertRaisesRegex(session_store.Conflict, "is missing"):
+            self.store.read_diff()
+
+    def test_reading_the_diff_fails_closed_above_max_bytes(self):
+        diff, metadata = self.inputs()
+        target = self.store.freeze_target(self.target(), diff, metadata)
+
+        with self.assertRaisesRegex(session_store.Conflict, "above max_bytes"):
+            self.store.read_diff(max_bytes=target["diff_bytes"] - 1)
+        self.assertEqual(
+            self.store.read_diff(max_bytes=target["diff_bytes"])["bytes"],
+            target["diff_bytes"],
+        )
+        with self.assertRaisesRegex(session_store.StoreError, "diff max_bytes"):
+            self.store.read_diff(max_bytes=0)
+
     def test_trusted_context_is_semantically_validated_and_hash_verified(self):
         content = "review from the frozen base\n"
         encoded = content.encode("utf-8")
