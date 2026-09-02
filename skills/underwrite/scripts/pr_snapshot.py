@@ -1043,13 +1043,19 @@ def capture(store, repo, number, controller_root, api=load_pr):
             "changed_files": changed_files,
         }
         _controller_at_base(controller_root, identity["base_sha"])
-        return store.freeze_target(
+        frozen = store.freeze_target(
             target,
             diff,
             metadata,
             trusted_context,
             object_bundle,
         )
+        # The page's heading. Data, not identity: a title edit on GitHub is not drift,
+        # so it lives beside the frozen target rather than in it.
+        title = first.get("title")
+        if isinstance(title, str) and title.strip():
+            store.patch_session({"title": title.strip()})
+        return frozen
 
 
 def check_controller(store, repo_root):
