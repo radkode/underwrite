@@ -351,6 +351,13 @@ new beat objects first presented by that move. Navigation cannot replace an exis
 beat; reviewer-owned state would otherwise be vulnerable to a stale snapshot.
 `cursor` remains the number of persisted beats; do not use it as the navigation position.
 
+A `next` on the last planned beat ends the walk. There is no beat to present, so apply it
+with `beats` empty and a result that says so, for example
+`{"kind":"walk","current_beat":6,"complete":true,"skipped_tiers":[]}`, acknowledge it,
+then post `done` with a one-line summary before Phase 4. The page closes the stage on
+`done`, not on the result, so an ending that skips the status leaves the reviewer looking
+at a walk that appears to be waiting.
+
 After the local effect and any required external effect are durable, acknowledge the
 exact reply before parking again:
 
