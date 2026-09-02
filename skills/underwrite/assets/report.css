@@ -10,7 +10,7 @@
   --rule-soft:   #E7EBE8;
   --ink:         #131A1D;
   --ink-2:       #4A555A;
-  --ink-3:       #77848A;
+  --ink-3:       #5C6970;
 
   --clean:       #2C6B58;
   --clean-bg:    #E7F1EC;
@@ -39,7 +39,7 @@
     --rule-soft:   #1C2528;
     --ink:         #E6ECEA;
     --ink-2:       #A3B0B3;
-    --ink-3:       #6F7E82;
+    --ink-3:       #839196;
 
     --clean:       #5FBFA0;
     --clean-bg:    #14261F;
@@ -65,7 +65,7 @@
   --rule-soft:   #1C2528;
   --ink:         #E6ECEA;
   --ink-2:       #A3B0B3;
-  --ink-3:       #6F7E82;
+  --ink-3:       #839196;
   --clean:       #5FBFA0;
   --clean-bg:    #14261F;
   --flag:        #E0A34A;
@@ -88,7 +88,7 @@
   --rule-soft:   #E7EBE8;
   --ink:         #131A1D;
   --ink-2:       #4A555A;
-  --ink-3:       #77848A;
+  --ink-3:       #5C6970;
   --clean:       #2C6B58;
   --clean-bg:    #E7F1EC;
   --flag:        #9A5B08;
@@ -196,7 +196,7 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
 }
 .count .k {
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 11px;
   letter-spacing: 0.14em;
   text-transform: uppercase;
   color: var(--ink-3);
@@ -245,7 +245,8 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
 
 .beat > summary {
   display: grid;
-  grid-template-columns: 30px 92px minmax(0, 1fr);
+  /* 112px: FOLLOW-THROUGH, the widest tier, measures 108.1px at the 11px label size. */
+  grid-template-columns: 30px 112px minmax(0, 1fr);
   gap: 4px 14px;
   align-items: baseline;
   padding: 13px 16px;
@@ -276,7 +277,7 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
 
 .b-tier {
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 11px;
   letter-spacing: 0.1em;
   text-transform: uppercase;
   color: var(--ink-3);
@@ -311,7 +312,7 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
    incomplete, so it must not read like a verdict about the code. */
 .unproven {
   font-family: var(--mono);
-  font-size: 9.5px;
+  font-size: 11px;
   letter-spacing: 0.12em;
   text-transform: uppercase;
   color: var(--flag);
@@ -344,7 +345,7 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
 /* The column gutter is the label's padding, so a row's rule can cross both. */
 .slots dt {
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 11px;
   letter-spacing: 0.13em;
   text-transform: uppercase;
   color: var(--ink-2);
@@ -424,7 +425,7 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
 }
 .call .lbl {
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 11px;
   letter-spacing: 0.13em;
   text-transform: uppercase;
   color: var(--accepted);
@@ -454,7 +455,7 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
 }
 .next-row .tag {
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 11px;
   letter-spacing: 0.12em;
   text-transform: uppercase;
   font-weight: 650;
@@ -613,7 +614,7 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
 }
 .shipped .lbl {
   font-family: var(--mono);
-  font-size: 10px;
+  font-size: 11px;
   letter-spacing: 0.13em;
   text-transform: uppercase;
   color: var(--clean);
