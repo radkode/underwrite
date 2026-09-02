@@ -658,6 +658,7 @@ def bar_html(session, beats, current, phase):
             suffix, token = STATE_STYLE.get(state, ("unver", "UNVERIFIED"))
             cls, word = f"s-{suffix}", token.lower()
         now = entry["n"] == current_n
+        current_attr = ' aria-current="step"' if now else ""
         title = " · ".join(
             part for part in (
                 f"beat {entry['n']}", entry["tier"], entry["where"], word
@@ -665,7 +666,7 @@ def bar_html(session, beats, current, phase):
         )
         marks.append(
             f'<li class="tk {cls}{" is-now" if now else ""}"'
-            f'{" aria-current=\"step\"" if now else ""} title="{attr(title)}">'
+            f'{current_attr} title="{attr(title)}">'
             f"{md(entry['n'])}</li>"
         )
     if current_n:
