@@ -591,10 +591,12 @@ def body_html(session, beats, problems_by_n, live=False):
     for beat in beats:
         counts[beat.get("state")] = counts.get(beat.get("state"), 0) + 1
 
+    # One tile per section, so the first four always sum to the last.
     tiles = [
         ("is-clean", counts.get("clean", 0) + counts.get("unverified", 0), "clean"),
         ("is-flag", counts.get("flag", 0), "needs your call"),
-        ("is-acc", counts.get("accepted", 0), "accepted"),
+        ("is-acc", counts.get("accepted", 0) + counts.get("decided", 0), "accepted"),
+        ("is-drop", counts.get("dropped", 0), "dropped"),
         ("is-mute", len(beats), "beats walked"),
     ]
     parts = [

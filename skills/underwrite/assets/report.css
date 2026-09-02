@@ -208,6 +208,7 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
 .count.is-acc      { border-top-color: var(--accepted); }
 .count.is-acc .n   { color: var(--accepted); }
 .count.is-mute .n  { color: var(--ink-2); }
+.count.is-drop .n  { color: var(--ink-2); }
 
 /* ---- section headers ---- */
 
@@ -596,6 +597,9 @@ footer {
 }
 
 @media (max-width: 620px) {
+  /* Five tiles in two columns leave one alone; the total takes the whole row. */
+  .counts { grid-template-columns: 1fr 1fr; }
+  .count:last-child { grid-column: 1 / -1; }
   .sec-head { flex-wrap: wrap; }
   .sec-head .hint { margin-left: 0; flex-basis: 100%; }
   .beat > summary { grid-template-columns: 26px minmax(0, 1fr); }
