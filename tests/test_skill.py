@@ -1,11 +1,27 @@
 #!/usr/bin/env python3
 """Contract tests for the prompt-owned parts of the underwrite workflow."""
+import json
 import unittest
 from pathlib import Path
 
 
 SKILL = Path(__file__).resolve().parent.parent / "skills" / "underwrite" / "SKILL.md"
 README = Path(__file__).resolve().parent.parent / "README.md"
+MANIFEST = Path(__file__).resolve().parent.parent / ".claude-plugin"
+
+
+class PublishedVersion(unittest.TestCase):
+    """`claude plugin update` compares version strings, so a bump that lands in one
+    manifest and not the other is a release that reaches nobody. It has happened three
+    times: DD-1602 at 0.3.1, DD-2058 at 0.4.0, DD-2359 at 0.5.0."""
+
+    def test_both_manifests_publish_the_same_version(self):
+        plugin = json.loads((MANIFEST / "plugin.json").read_text(encoding="utf-8"))
+        marketplace = json.loads((MANIFEST / "marketplace.json").read_text(encoding="utf-8"))
+        entries = [p for p in marketplace["plugins"] if p["name"] == plugin["name"]]
+        self.assertEqual(len(entries), 1, "marketplace must list this plugin exactly once")
+        self.assertEqual(entries[0]["version"], plugin["version"])
+        self.assertRegex(plugin["version"], r"^\d+\.\d+\.\d+$")
 
 
 class ReviewModeContract(unittest.TestCase):
