@@ -10,6 +10,7 @@ what happens to an anchor that does not land on one.
 import importlib.util
 import json
 import os
+import re
 import shutil
 import sqlite3
 import subprocess
@@ -367,6 +368,24 @@ class ReportOrdering(unittest.TestCase):
     def test_unverified_beats_count_as_clean_in_the_tiles(self):
         html = self.render([beat(n=1, state="clean"), beat(n=2, state="unverified")])
         self.assertRegex(html, r'<div class="count is-clean"[^>]*>\s*<span class="n">2</span>')
+
+    def test_the_tiles_partition_every_walked_beat(self):
+        """decided and dropped counted nowhere, so a walk with one recorded decision
+        read 3 + 0 + 0 of 4."""
+        html = self.render([
+            beat(n=1, state="clean"),
+            beat(n=2, state="flag", slots={"what": "x", "risk": "r", "fix": "f"}),
+            beat(n=3, state="accepted", slots={"what": "x", "proof": "p:1", "fix": "f"}),
+            beat(n=4, state="decided", slots={"what": "x", "risk": "r", "fix": "f"}),
+            beat(n=5, state="dropped", slots={"what": "x", "risk": "r", "fix": "f"}),
+            beat(n=6, state="unverified"),
+        ])
+        tiles = re.findall(r'<div class="count (is-[a-z]+)"[^>]*>\s*<span class="n">(\d+)</span>', html)
+        self.assertEqual(
+            tiles,
+            [("is-clean", "2"), ("is-flag", "1"), ("is-acc", "2"), ("is-drop", "1"), ("is-mute", "6")],
+        )
+        self.assertEqual(sum(int(n) for _cls, n in tiles[:-1]), int(tiles[-1][1]))
 
     def test_a_beat_with_an_unplaceable_state_is_shown_not_dropped(self):
         """It matched no section and rendered nowhere, while still counting in the
