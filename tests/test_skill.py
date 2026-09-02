@@ -24,6 +24,41 @@ class PublishedVersion(unittest.TestCase):
         self.assertRegex(plugin["version"], r"^\d+\.\d+\.\d+$")
 
 
+class BeforeThePageOpens(unittest.TestCase):
+    """Phase 3 serves the page, so orient and plan are terminal-only. They were the two
+    decisions with no named options, which made the reviewer guess what correcting even
+    meant at the two moments that frame the whole session."""
+
+    def skill(self):
+        """Whitespace-collapsed: these are prose assertions, and a reflow that rewraps a
+        sentence is not a behaviour change."""
+        return " ".join(SKILL.read_text(encoding="utf-8").split())
+
+    def test_ingest_reports_progress_instead_of_going_quiet(self):
+        text = self.skill()
+        self.assertIn("never invent progress", text)
+        self.assertIn("silence through it reads as a hang", text)
+
+    def test_both_pre_page_decisions_name_their_options(self):
+        text = self.skill()
+        for option in (
+            "**Confirm, and plan the walk**",
+            "**Correct the reconstruction**",
+            "**Correct the claim check**",
+            "**Walk it in this order**",
+            "**Reorder the beats**",
+            "**Skip a tier**",
+            "**Move a file to another tier**",
+        ):
+            self.assertIn(option, text)
+
+    def test_the_options_are_offered_through_a_selectable_control(self):
+        text = self.skill()
+        self.assertIn("structured question tool", text)
+        # and still works where the harness has no such tool
+        self.assertIn("where no such tool exists", text)
+
+
 class ReviewModeContract(unittest.TestCase):
     def skill(self):
         return SKILL.read_text(encoding="utf-8")

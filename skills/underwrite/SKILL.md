@@ -97,9 +97,22 @@ Exit 2 means its base, head, lifecycle, or controller moved. Stop and reconcile 
 supervised replacement session. Never refresh the target or diff inside the existing
 session. An operational failure exits 1 and also blocks resumption until it is understood.
 
-Otherwise tell the reviewer you are ingesting (it is the expensive step). For a PR,
-initialize the store and capture its exact base and head before starting any contextual
-reads:
+Otherwise say what is about to happen before it does: you are freezing the target,
+fetching its objects, and reading the context around it, and then two decisions stand
+between them and the page. It is the slow step, and silence through it reads as a hang.
+
+Report each step as it lands, with the real numbers, and never invent progress: every line
+is something that already finished.
+
+```
+frozen     base be54c51e, head 48e2ac2e, 49 files, 755 KB diff
+fetched    23 MB of objects into a bare repository
+governing  41 files from the base: AGENTS.md, CLAUDE.md, 39 ADRs
+read       20 prior commits in the touched paths, and 2 earlier PRs
+```
+
+For a PR, initialize the store and capture its exact base and head before starting any
+contextual reads:
 
 ```bash
 mkdir -p "$R"
@@ -218,8 +231,18 @@ State the execution policy separately: source PR snapshots are `no_exec` and use
 evidence only. Never describe review audience as execution trust. A linked child, if later
 authorized, is a separate session and does not change this statement.
 
-Then wait. The reviewer confirms or corrects your reconstruction, and their correction
-frames the rest of the walk.
+**Then stop and put the decision in front of them.** Use the harness's structured question
+tool, so the options are visible and selectable rather than something the reviewer has to
+infer from your last sentence; where no such tool exists, list them as a short numbered
+choice and wait. Name what each option does. "Confirm or correct" asks the reviewer to
+invent the correction themselves, which is the work you are supposed to be doing:
+
+- **Confirm, and plan the walk** the reconstruction and the claim check both hold
+- **Correct the reconstruction** the change is for something other than what you said
+- **Correct the claim check** you misread the description against what the diff does
+
+Their correction frames the rest of the walk, which is why it earns a stop of its own: it
+costs seconds here and a whole session later.
 
 ## Phase 2: plan the walk
 
@@ -237,8 +260,16 @@ directly.
   model to judge it.
 - **tests** never their own beat, always attached to the code they cover
 
-Keep the plan to one line per beat. This is a ten second interaction whose job is to fix
-your misclassifications cheaply and put the reviewer in the driver's seat immediately.
+Keep the plan to one line per beat, then present it the same way Phase 1 presented the
+reconstruction, with its own named options:
+
+- **Walk it in this order** the plan holds
+- **Reorder the beats** same beats, different sequence
+- **Skip a tier** usually follow-through, when it is not worth walking
+- **Move a file to another tier** you tiered something wrong
+
+This is a ten second interaction whose job is to fix your misclassifications cheaply and
+put the reviewer in the driver's seat immediately.
 
 ## Phase 3: walk
 
