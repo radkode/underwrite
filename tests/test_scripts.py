@@ -448,10 +448,24 @@ class TheWalk(unittest.TestCase):
         self.assertNotIn('data-n="3"', ledger)
         self.assertIn('data-n="1"', ledger)
         self.assertIn("beat 3 of 4 · core", stage)
-        # the stage row carries its own Next beat, after the note
-        self.assertRegex(
-            stage, r'<input class="note"[^>]*>\s*<button class="act" data-action="next">'
-        )
+        # the note comes first so Tab lands on the primary; Next beat closes the row
+        row = stage.split('<div class="acts"')[1].split("</div>")[0]
+        self.assertRegex(row, r'^[^>]*>\s*<input class="note"')
+        self.assertRegex(row, r'<button class="act" data-action="next">Next beat</button>\s*<span class="act-msg"')
+
+    def test_the_stage_row_says_what_the_keys_do(self):
+        decision = beat(n=3, state="flag", resolution_kind="decision",
+                        slots={"what": "x", "proof": "c.ts:3", "risk": "r", "fix": "decide"})
+        html = self.live([beat(n=1, state="clean"), decision])
+        self.assertIn("<kbd>Enter</kbd> records", html)
+        self.assertNotIn("Enter</kbd> includes", html)
+        html = self.live([beat(n=1, state="clean"),
+                          beat(n=2, state="flag", slots={"what": "x", "proof": "b:2", "risk": "r", "fix": "f"})])
+        self.assertIn("<kbd>Enter</kbd> saves a note", html)
+        self.assertIn('<kbd><span data-mod>⌘</span>Enter</kbd> implements', html)
+        self.assertIn("<kbd>n</kbd> next beat", html)
+        # only the stage row carries the hint
+        self.assertEqual(html.count('class="keys"'), 1)
 
     def test_the_ghost_of_the_next_planned_beat_is_hidden_until_between_beats(self):
         html = self.live(self.beats())
