@@ -84,6 +84,7 @@ class SnapshotCase(unittest.TestCase):
     def metadata(self, **changes):
         value = {
             "number": 7,
+            "title": "Widen the thing",
             "state": "open",
             "merged_at": None,
             "changed_files": 1,
@@ -131,6 +132,29 @@ class Capturing(SnapshotCase):
         self.assertEqual(self.store.snapshot()[0]["audience"]["mode"], "review")
         self.assertIsNone(json.loads((self.session / "pr.json").read_text())["head"]["repo"])
         self.assertEqual(api.call_count, 2)
+
+    def test_capture_records_the_title_beside_the_frozen_target(self):
+        """The renderer reads session.title for the heading, and nothing set it: a
+        session run by the book rendered "#42" and no title."""
+        metadata = self.metadata()
+        pr_snapshot.capture(
+            self.store, "acme/widget", 7, self.work,
+            api=mock.Mock(side_effect=[metadata, metadata]),
+        )
+        session = self.store.snapshot()[0]
+        self.assertEqual(session["title"], "Widen the thing")
+        self.assertNotIn("title", session["target"])
+
+    def test_a_missing_or_blank_title_does_not_block_capture(self):
+        for i, title in enumerate((None, "", "   ", 7)):
+            with self.subTest(title=title):
+                metadata = self.metadata(title=title)
+                store = session_store.SessionStore(self.root / f"session-{i}")
+                pr_snapshot.capture(
+                    store, "acme/widget", 7, self.work,
+                    api=mock.Mock(side_effect=[metadata, metadata]),
+                )
+                self.assertNotIn("title", store.snapshot()[0])
 
     def test_controller_must_be_clean_and_at_the_exact_base(self):
         metadata = self.metadata()
