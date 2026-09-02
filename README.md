@@ -40,11 +40,13 @@ point at. That last one is not padding: prior work in the same area is reliably 
 best finding comes from, because it is the context a diff cannot show you.
 
 **Orient.** A short reconstruction of what the change is for, plus a claim check comparing
-the PR description against what the diff actually does. You confirm or correct it, and
-your correction frames the rest.
+the PR description against what the diff actually does. This is the first of two decisions
+before the page opens: confirm it, or correct either half, and your correction frames the
+rest.
 
-**Plan.** Every changed file is tiered into core, enabling, follow-through, and risk. You
-reorder or skip before anything is walked.
+**Plan.** Every changed file is tiered into core, enabling, follow-through, and risk. The
+second decision: walk it in that order, reorder it, skip a tier, or move a file that got
+tiered wrong. Both decisions arrive as named options, not as a question you have to infer.
 
 **Walk.** One beat per turn, opening with a verdict token and running on fixed lines:
 
