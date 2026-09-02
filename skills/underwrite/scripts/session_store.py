@@ -3807,6 +3807,8 @@ class SessionStore:
             "seq": produced,
             "handled_seq": handled,
             "head_id": None if head is None else head["action_id"],
+            "head_kind": None if head is None else head["kind"],
+            "head_state": None if head is None else head["state"],
             "recovery": bool(recovery),
             "render_revision": revision,
         }

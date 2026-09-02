@@ -638,6 +638,17 @@ class Requests(Served):
 
         self.assertEqual(state["session_id"], self.session.snapshot()["session_id"])
 
+    def test_state_names_the_head_action_so_the_page_can_tell_it_is_between_beats(self):
+        idle = json.loads(self.get("/state")[1])
+        self.assertIsNone(idle["head_kind"])
+        self.assertIsNone(idle["head_state"])
+        self.post("/act", {"n": None, "action": "next", "note": ""})
+        queued = json.loads(self.get("/state")[1])
+        self.assertEqual((queued["head_kind"], queued["head_state"]), ("next", "produced"))
+        self.apply_navigation(1)
+        applied = json.loads(self.get("/state")[1])
+        self.assertEqual((applied["head_kind"], applied["head_state"]), ("next", "applied"))
+
     def test_an_accept_over_http_resolves_the_flag(self):
         status, body = self.post("/act", {"n": 1, "action": "accept", "note": "yes"})
         action = json.loads(body)

@@ -413,6 +413,94 @@ class ReportOrdering(unittest.TestCase):
         self.assertIn("unproven", html)
 
 
+class TheWalk(unittest.TestCase):
+    """While a walk is listening the newest beat leads the page on its own, with the
+    plan as a track above it and the ledger below; a finished walk and every final
+    render are the ledger alone."""
+
+    def session(self):
+        return {
+            "repo": "acme/widget", "number": 42,
+            "plan": [
+                {"n": 1, "tier": "enabling", "where": "a.ts:1"},
+                {"n": 2, "tier": "core", "where": "b.ts:2"},
+                {"n": 3, "tier": "core", "where": "c.ts:3"},
+                {"n": 4, "tier": "follow-through", "where": "d.ts:4"},
+            ],
+        }
+
+    def beats(self):
+        return [
+            beat(n=1, state="clean"),
+            beat(n=2, state="decided", call="leave it", tier="core",
+                 slots={"what": "x", "proof": "b.ts:2", "risk": "r", "fix": "f"}),
+            beat(n=3, state="clean", tier="core", where="c.ts:3"),
+        ]
+
+    def live(self, beats, phase="parked"):
+        return rr.render(self.session(), beats, "", {}, live=True, phase=phase)
+
+    def test_the_newest_beat_is_staged_and_left_out_of_the_ledger(self):
+        html = self.live(self.beats())
+        stage = html.split('id="stage"')[1].split("</section>")[0]
+        ledger = html.split("</section>", 1)[1]
+        self.assertIn('data-n="3"', stage)
+        self.assertNotIn('data-n="3"', ledger)
+        self.assertIn('data-n="1"', ledger)
+        self.assertIn("beat 3 of 4 · core", stage)
+        # the stage row carries its own Next beat, after the note
+        self.assertRegex(
+            stage, r'<input class="note"[^>]*>\s*<button class="act" data-action="next">'
+        )
+
+    def test_the_ghost_of_the_next_planned_beat_is_hidden_until_between_beats(self):
+        html = self.live(self.beats())
+        self.assertIn('<div class="ghost" hidden>', html)
+        self.assertIn("beat 4 of 4 · follow-through · d.ts:4", html)
+
+    def test_before_the_first_beat_the_ghost_of_beat_one_shows(self):
+        html = self.live([])
+        self.assertIn('<div class="ghost">', html)
+        self.assertIn("beat 1 of 4 · enabling · a.ts:1", html)
+        self.assertIn("nothing walked yet", html)
+        self.assertIn('aria-label="waiting for beat 1"', html)
+
+    def test_the_track_marks_every_planned_beat_with_its_state(self):
+        html = self.live(self.beats())
+        track = html.split('<ol class="track"')[1].split("</ol>")[0]
+        self.assertIn('aria-label="beat 3 of 4"', track)
+        self.assertRegex(track, r'<li class="tk s-clean"[^>]*>1</li>')
+        self.assertRegex(track, r'<li class="tk s-acc"[^>]*>2</li>')
+        self.assertRegex(track, r'<li class="tk s-clean is-now" aria-current="step"[^>]*>3</li>')
+        self.assertRegex(track, r'<li class="tk is-todo"[^>]*>4</li>')
+
+    def test_a_done_walk_has_no_stage_and_every_beat_in_the_ledger(self):
+        html = self.live(self.beats(), phase="done")
+        self.assertNotIn('id="stage"', html)
+        self.assertIn('data-n="3"', html)
+        self.assertIn('aria-label="3 of 4 walked"', html)
+
+    def test_a_final_render_has_neither_bar_nor_stage(self):
+        html = rr.render(self.session(), self.beats(), "", {})
+        self.assertNotIn('class="bar"', html)
+        self.assertNotIn('id="stage"', html)
+        self.assertNotIn('id="live"', html)
+
+    def test_the_status_line_lives_in_the_bar_once(self):
+        html = self.live(self.beats())
+        self.assertEqual(html.count('id="live"'), 1)
+        self.assertIn('id="live" class="live starting" role="status"', html)
+        self.assertNotIn('class="acts walk" data-acts="walk">', html.split('id="live-body"')[0])
+
+    def test_a_resolved_beat_folds_to_its_line_with_the_call_while_walking(self):
+        html = self.live(self.beats())
+        self.assertRegex(html, r'<details class="beat s-acc" data-n="2">')
+        self.assertIn('<span class="b-call">“leave it”</span>', html)
+        # and stays open once the walk is done, as the final report has it
+        self.assertRegex(self.live(self.beats(), phase="done"),
+                         r'<details class="beat s-acc" data-n="2" open>')
+
+
 class DelegatedActionControls(unittest.TestCase):
     def flag(self, **kw):
         return beat(

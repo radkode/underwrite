@@ -129,10 +129,13 @@ handling untrusted artifacts. Neither the gateway nor the linked implementation 
 
 ## The page drives
 
-A walk serves itself on loopback, and the page is where you actually review. Beats stream
-in as they are walked, ordered by what is owed rather than by what was walked: open flags
-expanded at the top, chosen resolutions next, clean beats collapsed to one line each that
-still carry their proof.
+A walk serves itself on loopback, and the page is where you actually review. While a walk
+is listening, the beat being read leads the page on its own, under a bar that stays in
+view: the plan as a track with the current beat marked, the agent's own sentence about
+what it is doing, and Next beat. Everything already walked sits below, ordered by what is
+owed rather than by what was walked: open flags expanded at the top, resolved beats folded
+to one line with your call on it, clean beats to one line each that still carries its
+proof. When the walk ends, that ledger is the page, and it is what the final render keeps.
 
 Decisions happen there too. Review mode uses Include in review and Drop. Report mode uses
 Include in report and Drop. Local branch and working-tree sessions retain Implement. A
