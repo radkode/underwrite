@@ -69,14 +69,34 @@ SHELL = (
 # it moves, preserving which beats the reviewer had expanded. Decisions POST back.
 LIVE_JS = """<script>
 (() => {
-  const live = document.getElementById('live');
   const body = document.getElementById('live-body');
+  const NAVIGATION = new Set(['next', 'back', 'skip']);
+  let liveClass = 'live starting', liveText = 'connecting';
+  let between = false, lastPhase = null, done = false;
   const pendingKey = 'underwrite.pending-action';
   let rev = null, known = new Set(), usable = false, connected = false, sessionId = null;
   let sending = false, pending = null;
   let desiredRev = null, swapPromise = null, swapRetry = null, resumedPending = false;
   let retryWhenIdle = false;
   let observedSeq = 0, awaitingSeq = null;
+
+  function paintLive(cls, text) {
+    if (cls !== undefined) { liveClass = cls; liveText = text; }
+    const live = document.getElementById('live');
+    if (live) { live.className = liveClass; live.textContent = liveText; }
+  }
+
+  // A Next beat that is produced but not yet applied means the walk is between beats:
+  // the stage shows the ghost of what is coming and the beat that just left folds up.
+  function paintStage() {
+    const stage = document.getElementById('stage');
+    if (!stage) return;
+    stage.classList.toggle('is-between', between);
+    const ghost = stage.querySelector('.ghost');
+    const card = stage.querySelector('.beat');
+    if (ghost && card) ghost.hidden = !between;
+    if (card && between) card.open = false;
+  }
 
   try { pending = JSON.parse(sessionStorage.getItem(pendingKey)); } catch (_) {}
   if (!pending || typeof pending.id !== 'string'
@@ -146,16 +166,31 @@ LIVE_JS = """<script>
     observedSeq = state.seq;
     if (awaitingSeq !== null && observedSeq >= awaitingSeq) awaitingSeq = null;
     if (pending && state.head_id === pending.id) remember(null);
+    // Done outranks away: a finished walk is not an unattended one, and its last
+    // word stays on the page. Beat controls stay open, since Phase 4 has the
+    // reviewer make any remaining calls off this page; only Next beat closes.
+    done = phase === 'done';
     usable = !queued && (listening ? phase === 'parked' : true);
-    live.className = 'live ' + (listening ? phase : 'away');
-    live.textContent = listening
-      ? (status.text || phase)
-      : 'no walk is listening, your call is saved for whenever one returns';
+    paintLive(
+      'live ' + (done ? 'done' : listening ? phase : 'away'),
+      done || listening
+        ? (status.text || phase)
+        : 'no walk is listening, your call is saved for whenever one returns'
+    );
+    between = queued && NAVIGATION.has(state.head_kind) && state.head_state === 'produced';
+    paintStage();
+    // Nothing in the store changes when the agent says done, so the stage would stay;
+    // one forced refetch lets the server render the ledger alone.
+    if (phase === 'done' && lastPhase !== 'done' && lastPhase !== null) {
+      rev = null;
+      requestSwap(state.rev);
+    }
+    lastPhase = phase;
     if (!sending) enable(connected && usable && awaitingSeq === null);
   }
 
   const enable = on => document.querySelectorAll('.act, .note')
-    .forEach(el => el.disabled = !on);
+    .forEach(el => el.disabled = !on || (done && el.dataset.action === 'next'));
 
   async function swap(targetRev) {
     const response = await fetch('./fragment');
@@ -188,6 +223,8 @@ LIVE_JS = """<script>
     });
     known = beatIds();
     wire();
+    paintLive();
+    paintStage();
     restorePending();
     enable(!sending && connected && usable && awaitingSeq === null);
     rev = targetRev;
@@ -269,7 +306,7 @@ LIVE_JS = """<script>
     const fresh = {
       id: crypto.randomUUID(),
       session_id: sessionId,
-      n: n === 'walk' ? null : +n,
+      n: n === 'walk' || button.dataset.action === 'next' ? null : +n,
       action: button.dataset.action,
       note: note ? note.value.trim() : '',
     };
@@ -299,8 +336,7 @@ LIVE_JS = """<script>
   stream.onerror = () => {
     connected = false;
     resumedPending = false;
-    live.className = 'live down';
-    live.textContent = 'reconnecting';
+    paintLive('live down', 'reconnecting');
     enable(false);
   };
 
@@ -475,6 +511,7 @@ def beat_html(
     mode="branch",
     replacement=False,
     untrusted_pr=False,
+    stage=False,
 ):
     suffix, token = STATE_STYLE.get(beat.get("state"), ("unver", "UNVERIFIED"))
     raw_slots = beat.get("slots")
@@ -559,10 +596,14 @@ def beat_html(
         else:
             controls = '<button class="act" data-action="note">Save note</button>'
             placeholder = "note this for the record"
+        # The stage carries its own Next beat so the whole decision happens in one row.
+        advance = (
+            '<button class="act" data-action="next">Next beat</button>' if stage else ""
+        )
         body.append(
             f'<div class="acts" data-acts="{attr(n)}">{controls}'
             f'<input class="note" aria-label="your words, beat {attr(n)}" placeholder="{placeholder}">'
-            f'<span class="act-msg"></span></div>'
+            f'{advance}<span class="act-msg" role="status"></span></div>'
         )
 
     return (
@@ -573,13 +614,115 @@ def beat_html(
         f'<span class="b-claim"><span class="state">{token}</span> &nbsp;'
         f'{md(beat.get("claim", ""))}{chip}</span>'
         f'<span class="b-path">{md(beat.get("where", ""))}</span>'
-        f"</summary>"
+        + (f'<span class="b-call">“{md(beat["call"])}”</span>' if beat.get("call") else "")
+        + f"</summary>"
         f'<div class="b-body">{"".join(body)}</div>'
         f"</details>"
     )
 
 
-def body_html(session, beats, problems_by_n, live=False):
+def walk_entries(session, beats):
+    """One entry per planned or walked beat, by n. A beat that was walked off-plan
+    still gets a mark; a planned beat not yet walked has no state."""
+    entries = {}
+    for item in session.get("plan") or []:
+        if isinstance(item, dict) and isinstance(item.get("n"), int):
+            entries[item["n"]] = {
+                "n": item["n"],
+                "tier": item.get("tier", ""),
+                "where": item.get("where", ""),
+                "state": None,
+            }
+    for beat in beats:
+        n = beat.get("n")
+        if not isinstance(n, int):
+            continue
+        entry = entries.setdefault(n, {"n": n, "tier": "", "where": "", "state": None})
+        entry["state"] = beat.get("state")
+        entry["tier"] = beat.get("tier") or entry["tier"]
+        entry["where"] = beat.get("where") or entry["where"]
+    return [entries[n] for n in sorted(entries)]
+
+
+def bar_html(session, beats, current, phase):
+    """The sticky strip: the plan as a track, the agent's status, and Next beat."""
+    entries = walk_entries(session, beats)
+    total = len(entries)
+    current_n = current.get("n") if current else None
+    marks = []
+    for entry in entries:
+        state = entry["state"]
+        if state is None:
+            cls, word = "is-todo", "not yet walked"
+        else:
+            suffix, token = STATE_STYLE.get(state, ("unver", "UNVERIFIED"))
+            cls, word = f"s-{suffix}", token.lower()
+        now = entry["n"] == current_n
+        current_attr = ' aria-current="step"' if now else ""
+        title = " · ".join(
+            part for part in (
+                f"beat {entry['n']}", entry["tier"], entry["where"], word
+            ) if part
+        )
+        marks.append(
+            f'<li class="tk {cls}{" is-now" if now else ""}"'
+            f'{current_attr} title="{attr(title)}">'
+            f"{md(entry['n'])}</li>"
+        )
+    if current_n:
+        position = f"beat {current_n} of {total}" if total else f"beat {current_n}"
+    elif phase == "done":
+        position = f"{len(beats)} of {total} walked" if total else f"{len(beats)} walked"
+    else:
+        position = "waiting for beat 1"
+    return (
+        '<div class="bar">'
+        f'<ol class="track" aria-label="{attr(position)}">{"".join(marks)}</ol>'
+        '<span id="live" class="live starting" role="status">connecting</span>'
+        '<div class="acts walk" data-acts="walk">'
+        '<button class="act" data-action="next">Next beat</button>'
+        '<span class="act-msg" role="status"></span></div>'
+        "</div>"
+    )
+
+
+def stage_html(session, beats, current, card):
+    """Where the walk is right now: the current beat, and a ghost of the next planned
+    one that the client reveals while a Next beat is queued."""
+    entries = walk_entries(session, beats)
+    total = len(entries)
+    current_n = current.get("n") if current else 0
+    upcoming = next((e for e in entries if e["n"] == current_n + 1), None)
+    if current:
+        hint = " · ".join(
+            part for part in (
+                f"beat {current_n} of {total}" if total else f"beat {current_n}",
+                current.get("tier", ""),
+            ) if part
+        )
+    else:
+        hint = "nothing walked yet"
+    ghost = ""
+    if upcoming:
+        line = " · ".join(
+            part for part in (
+                f"beat {upcoming['n']} of {total}", upcoming["tier"], upcoming["where"]
+            ) if part
+        )
+        ghost = (
+            f'<div class="ghost"{" hidden" if current else ""}>'
+            f'<span class="ghost-n">{md(upcoming["n"])}</span>'
+            f'<span class="ghost-what">{md(line)}</span>'
+            '<span class="ghost-wait">waiting on the walk</span></div>'
+        )
+    return (
+        '<section class="sec stage" id="stage">'
+        f'<div class="sec-head"><h2>Now</h2><span class="hint">{md(hint)}</span></div>'
+        f"{ghost}{card}</section>"
+    )
+
+
+def body_html(session, beats, problems_by_n, live=False, phase=None):
     """Everything below the masthead. This is what /fragment re-serves on a change."""
     mode = session_mode(session)
     replacement = replacement_required(session)
@@ -587,6 +730,28 @@ def body_html(session, beats, problems_by_n, live=False):
     untrusted_pr = (
         isinstance(target, dict) and target.get("kind") == "github_pr"
     ) or isinstance(session.get("legacy_pr"), dict)
+    # While a walk is listening, the newest beat is where the reviewer is, so it leads
+    # the page on its own; the ledger below holds what has already been walked. A
+    # finished walk, and every final render, is the ledger alone.
+    current = None
+    if live and beats and phase != "done":
+        current = max(
+            (b for b in beats if isinstance(b.get("n"), int)),
+            key=lambda b: b["n"],
+            default=None,
+        )
+    parts = []
+    if live:
+        parts.append(bar_html(session, beats, current, phase))
+        if phase != "done":
+            card = beat_html(
+                current, problems_by_n.get(current.get("n")), True,
+                live=True, mode=mode, replacement=replacement,
+                untrusted_pr=untrusted_pr, stage=True,
+            ) if current else ""
+            parts.append(stage_html(session, beats, current, card))
+    ledger = [b for b in beats if b is not current]
+
     counts = {}
     for beat in beats:
         counts[beat.get("state")] = counts.get(beat.get("state"), 0) + 1
@@ -599,7 +764,7 @@ def body_html(session, beats, problems_by_n, live=False):
         ("is-drop", counts.get("dropped", 0), "dropped"),
         ("is-mute", len(beats), "beats walked"),
     ]
-    parts = [
+    parts.append(
         '<div class="counts">'
         + "".join(
             f'<div class="count {cls}"><span class="n">{n}</span>'
@@ -607,7 +772,7 @@ def body_html(session, beats, problems_by_n, live=False):
             for cls, n, k in tiles
         )
         + "</div>"
-    ]
+    )
 
     # A state outside the five matches no section, and a beat that matches no section
     # used to render nowhere while still counting in the tiles. The page exists to say
@@ -617,11 +782,13 @@ def body_html(session, beats, problems_by_n, live=False):
 
     for heading, hint, states, expanded in sections:
         if states is None:
-            picked = [b for b in beats if b.get("state") not in placed]
+            picked = [b for b in ledger if b.get("state") not in placed]
         else:
-            picked = [b for b in beats if b.get("state") in states]
+            picked = [b for b in ledger if b.get("state") in states]
         if not picked:
             continue
+        if current and states and "accepted" in states:
+            expanded = False
         cards = "".join(
             beat_html(
                 b,
@@ -657,7 +824,7 @@ def body_html(session, beats, problems_by_n, live=False):
     return "\n".join(parts)
 
 
-def render(session, beats, css, problems_by_n, live=False):
+def render(session, beats, css, problems_by_n, live=False, phase=None):
     target = session.get("target") if isinstance(session.get("target"), dict) else {}
     number = session.get("number") or target.get("number")
     repo = session.get("repo") or target.get("repo", "")
@@ -676,8 +843,6 @@ def render(session, beats, css, problems_by_n, live=False):
     parts.append('<span class="sep">·</span><span>underwrite</span>')
     if session.get("date"):
         parts.append(f'<span class="sep">·</span><span>{md(session["date"])}</span>')
-    if live:
-        parts.append('<span id="live" class="live starting">connecting</span>')
     parts.append(
         f'</div><h1><span class="num">{html.escape(label)}</span> '
         f'{md(session.get("title", ""))}</h1>'
@@ -700,16 +865,10 @@ def render(session, beats, css, problems_by_n, live=False):
     if facts_values:
         facts = "".join(f"<span>{md(f)}</span>" for f in facts_values)
         parts.append(f'<div class="facts">{facts}</div>')
-    if live:
-        parts.append(
-            '<div class="acts walk" data-acts="walk">'
-            '<button class="act" data-action="next">Next beat</button>'
-            '<span class="act-msg"></span></div>'
-        )
     parts.append("</header>")
 
     parts.append('<div id="live-body">')
-    parts.append(body_html(session, beats, problems_by_n, live))
+    parts.append(body_html(session, beats, problems_by_n, live, phase))
     parts.append("</div>")
 
     if session.get("footer"):

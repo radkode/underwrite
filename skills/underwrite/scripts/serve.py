@@ -165,6 +165,8 @@ class Session:
             "seq": delivery["seq"],
             "handled_seq": delivery["handled_seq"],
             "head_id": delivery["head_id"],
+            "head_kind": delivery["head_kind"],
+            "head_state": delivery["head_state"],
             "recovery": delivery["recovery"],
             "status": self.status,
             "listening": self.waiting > 0,
@@ -366,12 +368,20 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/":
                 session, beats, css, problems, _ = self.session.load()
                 render = rr()
-                page = render.SHELL + render.render(session, beats, css, problems, live=True)
+                page = render.SHELL + render.render(
+                    session, beats, css, problems, live=True,
+                    phase=self.session.status.get("phase"),
+                )
                 return self.send(200, page, "text/html")
             if route == "/fragment":
                 session, beats, _css, problems, _ = self.session.load()
                 return self.send(
-                    200, rr().body_html(session, beats, problems, True), "text/html"
+                    200,
+                    rr().body_html(
+                        session, beats, problems, True,
+                        phase=self.session.status.get("phase"),
+                    ),
+                    "text/html",
                 )
             if route == "/state":
                 _s, beats, _c, _p, problems = self.session.load()
