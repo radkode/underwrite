@@ -334,9 +334,9 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
 
 /* ---- slots ----
    Six slots, two jobs. WHAT, PROOF, RISK and FIX carry the argument the reviewer
-   acts on; WHY and PRIOR qualify the slot above them, so they tuck under it and
-   drop back. Labels sit at --ink-2: --ink-3 is 3.85:1 on white and 4.10:1 on
-   --raised in dark, under the floor for 10px text. */
+   acts on; WHY and PRIOR are quieter, but only WHY tucks: it qualifies the WHAT
+   directly above it. PRIOR cites the precedent behind the beat, not the RISK it
+   happens to follow, so it stands on its own break. */
 
 .slots {
   display: grid;
@@ -359,14 +359,14 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
   text-wrap: pretty;
 }
 
-/* Close enough to belong to the slot above, quiet enough not to compete with it. */
-.slots dt.why, .slots dd.why,
-.slots dt.prior, .slots dd.prior { margin-top: 4px; }
+/* Close enough to belong to the WHAT above it, quiet enough not to compete. */
+.slots dt.why, .slots dd.why { margin-top: 4px; }
 .slots dd.why, .slots dd.prior { font-size: 13.5px; color: var(--ink-2); }
 
 /* Between the parts of the argument. */
 .slots dt.proof, .slots dd.proof,
-.slots dt.risk, .slots dd.risk { margin-top: 16px; }
+.slots dt.risk, .slots dd.risk,
+.slots dt.prior, .slots dd.prior { margin-top: 16px; }
 
 /* The one slot that earns colour. */
 .slots dt.risk, .slots dd.risk { color: var(--flag); }
@@ -729,7 +729,7 @@ footer {
   .slots dt:first-child { margin-top: 0; }
   .slots dd.why, .slots dd.proof, .slots dd.risk,
   .slots dd.prior, .slots dd.fix { margin-top: 0; }
-  .slots dt.why, .slots dt.prior { margin-top: 9px; }
+  .slots dt.why { margin-top: 9px; }
   .slots dd.fix { padding-top: 0; border-top: 0; }
   .slots dt.fix { margin-top: 16px; padding-top: 14px; }
   .next-row { grid-template-columns: minmax(0, 1fr); }
