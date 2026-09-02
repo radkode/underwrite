@@ -323,7 +323,42 @@ LIVE_JS = """<script>
     await sendAction(pending || fresh);
   }
 
-  const wire = () => document.querySelectorAll('.act').forEach(b => b.onclick = () => act(b));
+  const wire = () => {
+    document.querySelectorAll('.act').forEach(b => b.onclick = () => act(b));
+    if (!/Mac|iPhone|iPad/.test(navigator.platform)) {
+      document.querySelectorAll('[data-mod]').forEach(k => k.textContent = 'Ctrl+');
+    }
+  };
+
+  // Enter in the note saves it, or records a decision when the note is the decision;
+  // ⌘/Ctrl+Enter fires the row's primary; outside a field, n is Next beat and f goes to
+  // the first open flag. Enter never includes or implements on its own: the note field
+  // is optional there, and a keystroke that reads as "save this" must not be terminal.
+  document.addEventListener('keydown', event => {
+    const target = event.target;
+    if (target && target.classList && target.classList.contains('note')) {
+      if (event.key !== 'Enter') return;
+      const row = target.closest('.acts');
+      const primary = row.querySelector('.act.primary');
+      const modified = event.metaKey || event.ctrlKey;
+      const usePrimary = primary && (modified || primary.dataset.action === 'decide');
+      const button = usePrimary ? primary : row.querySelector('.act[data-action="note"]');
+      if (button && !button.disabled) { event.preventDefault(); act(button); }
+      return;
+    }
+    if (event.metaKey || event.ctrlKey || event.altKey) return;
+    if (target && /^(INPUT|TEXTAREA|SELECT)$/.test(target.tagName)) return;
+    if (event.key === 'n') {
+      const next = [...document.querySelectorAll('.act[data-action="next"]')].find(b => !b.disabled);
+      if (next) { event.preventDefault(); act(next); }
+    } else if (event.key === 'f') {
+      const flag = document.querySelector('.beat.s-flag');
+      if (!flag) return;
+      flag.open = true;
+      flag.scrollIntoView({ block: 'start' });
+      (flag.querySelector('.act.primary') || flag.querySelector('summary')).focus();
+    }
+  });
 
   const stream = new EventSource('./events');
   stream.onmessage = event => {
@@ -548,6 +583,7 @@ def beat_html(
         )
     if live:
         flag = beat.get("state") == "flag"
+        enter, mod = "saves a note", None
         if flag:
             decision_only = beat.get("resolution_kind") == "decision"
             report_accept_problems = []
@@ -593,17 +629,31 @@ def beat_html(
                     if decision_only
                     else "or put it in your own words"
                 )
+                verb = {"Implement": "implements", "Record decision": "records"}.get(
+                    label, "includes"
+                )
+                if decision_only:
+                    enter = "records"
+                else:
+                    mod = verb
         else:
             controls = '<button class="act" data-action="note">Save note</button>'
             placeholder = "note this for the record"
-        # The stage carries its own Next beat so the whole decision happens in one row.
-        advance = (
-            '<button class="act" data-action="next">Next beat</button>' if stage else ""
-        )
+        # The stage carries its own Next beat so the whole decision happens in one row,
+        # and says what the keys do, once, where the reviewer is acting.
+        advance = keys = ""
+        if stage:
+            advance = '<button class="act" data-action="next">Next beat</button>'
+            hints = [f"<kbd>Enter</kbd> {enter}"]
+            if mod:
+                hints.append(f'<kbd><span data-mod>⌘</span>Enter</kbd> {mod}')
+            hints.append("<kbd>n</kbd> next beat")
+            keys = f'<span class="keys">{" · ".join(hints)}</span>'
+        # The note comes first so Tab lands on the primary right after typing.
         body.append(
-            f'<div class="acts" data-acts="{attr(n)}">{controls}'
+            f'<div class="acts" data-acts="{attr(n)}">'
             f'<input class="note" aria-label="your words, beat {attr(n)}" placeholder="{placeholder}">'
-            f'{advance}<span class="act-msg" role="status"></span></div>'
+            f'{controls}{advance}<span class="act-msg" role="status"></span>{keys}</div>'
         )
 
     return (
