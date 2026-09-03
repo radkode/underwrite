@@ -515,6 +515,82 @@ class TheWalk(unittest.TestCase):
                          r'<details class="beat s-acc" data-n="2" open>')
 
 
+class WalkCoverage(unittest.TestCase):
+    """Every count on the page counts beats written, so a walk that stopped short
+    reads as one that finished unless the plan is the denominator."""
+
+    def session(self, plan=True):
+        s = {"repo": "acme/widget", "number": 42}
+        if plan:
+            s["plan"] = [
+                {"n": 1, "tier": "enabling", "what": "the helper", "where": "a.ts:1"},
+                {"n": 2, "tier": "core", "what": "the feature", "where": "b.ts:2"},
+                {"n": 3, "tier": "follow-through", "what": "call sites", "where": "c.ts:3"},
+                {"n": 4, "tier": "risk", "what": "the migration", "where": "d.sql:4"},
+            ]
+        return s
+
+    def final(self, beats, plan=True):
+        return rr.render(self.session(plan), beats, "", {})
+
+    def test_a_short_walk_names_the_count_and_every_beat_it_never_reached(self):
+        html = self.final([beat(n=1, state="clean"), beat(n=2, state="clean")])
+        self.assertIn("2 of 4 beats walked. Not walked:", html)
+        block = html.split('class="cov-left"')[1].split("</ul>")[0]
+        self.assertIn(">3</span>", block)
+        self.assertIn(">4</span>", block)
+        self.assertIn("call sites", block)
+        self.assertIn("the migration", block)
+        self.assertNotIn("the helper", block)
+
+    def test_the_risk_tier_is_marked_so_the_gap_reads_at_a_glance(self):
+        html = self.final([beat(n=1, state="clean")])
+        self.assertIn('<span class="cov-tier is-risk">risk</span>', html)
+        self.assertIn('<span class="cov-tier">core</span>', html)
+
+    def test_a_finished_walk_says_so_and_lists_nothing(self):
+        html = self.final([beat(n=n, state="clean") for n in (1, 2, 3, 4)])
+        self.assertIn('<p class="coverage is-done">4 of 4 beats walked.</p>', html)
+        self.assertNotIn("cov-left", html)
+        self.assertNotIn("Not walked", html)
+
+    def test_a_beat_walked_off_plan_still_counts_in_the_denominator(self):
+        html = self.final([beat(n=n, state="clean") for n in (1, 2, 3, 4, 9)])
+        self.assertIn("5 of 5 beats walked", html)
+
+    def test_a_session_with_no_plan_reports_what_it_walked(self):
+        html = self.final([beat(n=1, state="clean")], plan=False)
+        self.assertIn("1 of 1 beats walked", html)
+        self.assertNotIn("Not walked", html)
+
+    def test_a_session_with_nothing_at_all_renders_no_coverage_block(self):
+        self.assertNotIn("coverage", self.final([], plan=False))
+
+    def test_the_final_render_carries_it_even_though_the_plan_track_does_not(self):
+        beats = [beat(n=1, state="clean")]
+        html = self.final(beats)
+        # the track is --live only, which is how a partial walk published as complete
+        self.assertNotIn('class="track"', html)
+        self.assertIn("1 of 4 beats walked", html)
+        live = rr.render(self.session(), beats, "", {}, live=True, phase="parked")
+        self.assertIn("1 of 4 beats walked", live)
+        self.assertEqual(live.count('class="coverage'), 1)
+
+    def test_a_long_plan_entry_is_shortened_and_kept_whole_in_the_title(self):
+        session = self.session()
+        session["plan"][3]["what"] = (
+            "the lock order: 0109's revision trigger inverts it, both performDelete "
+            "paths are rewritten to match, and the real-Postgres lanes are the proof"
+        )
+        html = rr.render(session, [beat(n=1, state="clean")], "", {})
+        self.assertIn(
+            "the lock order: 0109's revision trigger inverts it, "
+            "both performDelete paths are…</span>",
+            html,
+        )
+        self.assertIn('real-Postgres lanes are the proof"><span class="cov-n">4', html)
+
+
 class DelegatedActionControls(unittest.TestCase):
     def flag(self, **kw):
         return beat(

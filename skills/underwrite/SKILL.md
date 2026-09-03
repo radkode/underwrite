@@ -647,6 +647,10 @@ $S/scripts/render-report.py $R --final
 $S/scripts/render-report.py $R
 ```
 
+Every render states what the walk covered against what it planned, and names the beats it
+never reached with their tiers. A walk the reviewer left at 6 of 9 says so on its own page.
+Do not describe a short walk as a finished review, in the terminal or in the report.
+
 Without `--final`, pending and failed delivery are valid live states and remain visibly
 unfinished. They are never shippable final states. A final render rejects either one, as
 well as every accepted branch or review delivery with no landing. In report mode,
