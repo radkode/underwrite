@@ -138,6 +138,9 @@ what it is doing, and Next beat. Everything already walked sits below, ordered b
 owed rather than by what was walked: open flags expanded at the top, resolved beats folded
 to one line with your call on it, clean beats to one line each that still carries its
 proof. When the walk ends, that ledger is the page, and it is what the final render keeps.
+Above it sits what the walk covered against what it planned, with any beat it never
+reached named and tiered, because a review that stopped at 6 of 9 should not read like one
+that finished.
 The keys do what the row under the beat says: Enter saves a note, or records a decision
 when the note is the decision; ⌘Enter or Ctrl+Enter fires the row's primary action; `n`
 is Next beat and `f` goes to the first open flag.

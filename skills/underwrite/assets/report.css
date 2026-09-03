@@ -210,6 +210,54 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
 .count.is-mute .n  { color: var(--ink-2); }
 .count.is-drop .n  { color: var(--ink-2); }
 
+/* ---- walk coverage ---- */
+
+/* Every count on the page counts beats written, so a partial walk needs the
+   denominator said out loud or it reads as a finished one. */
+/* One flex child, so #live-body's 40px gap separates the block and the 8px inside
+   keeps the count with the list it is counting. */
+.coverage {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink-2);
+  font-variant-numeric: tabular-nums;
+}
+.coverage p { margin: 0; }
+.coverage.is-done { color: var(--ink-3); }
+.cov-left {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.cov-left li {
+  display: grid;
+  grid-template-columns: 16px 124px minmax(0, 1fr);
+  gap: 0 12px;
+  align-items: baseline;
+}
+.cov-n {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-3);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.cov-tier {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.cov-tier.is-risk { color: var(--flag); }
+.cov-what { font-size: 12.5px; color: var(--ink-2); }
+
 /* ---- section headers ---- */
 
 .sec { display: flex; flex-direction: column; gap: 16px; }
@@ -726,6 +774,9 @@ footer {
   .count:last-child { grid-column: 1 / -1; }
   .sec-head { flex-wrap: wrap; }
   .sec-head .hint { margin-left: 0; flex-basis: 100%; }
+  /* The number and tier ride one row, the description wraps under both. */
+  .cov-left li { grid-template-columns: 16px minmax(0, 1fr); }
+  .cov-what { grid-column: 2; }
   .beat > summary { grid-template-columns: 26px minmax(0, 1fr); }
   .b-tier { grid-column: 2; }
   .b-claim { grid-column: 2; }

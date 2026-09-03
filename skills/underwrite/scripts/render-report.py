@@ -22,6 +22,7 @@ import json
 import re
 import sqlite3
 import sys
+import textwrap
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -722,17 +723,48 @@ def walk_entries(session, beats):
                 "n": item["n"],
                 "tier": item.get("tier", ""),
                 "where": item.get("where", ""),
+                "what": item.get("what", ""),
                 "state": None,
             }
     for beat in beats:
         n = beat.get("n")
         if not isinstance(n, int):
             continue
-        entry = entries.setdefault(n, {"n": n, "tier": "", "where": "", "state": None})
+        entry = entries.setdefault(
+            n, {"n": n, "tier": "", "where": "", "what": "", "state": None}
+        )
         entry["state"] = beat.get("state")
         entry["tier"] = beat.get("tier") or entry["tier"]
         entry["where"] = beat.get("where") or entry["where"]
     return [entries[n] for n in sorted(entries)]
+
+
+def coverage_html(session, beats):
+    """What the walk covered against what it planned to. A partial walk otherwise
+    renders as a complete one, because every count on the page counts beats written."""
+    entries = walk_entries(session, beats)
+    if not entries:
+        return ""
+    left = [e for e in entries if e["state"] is None]
+    walked = len(entries) - len(left)
+    head = f"{walked} of {len(entries)} beats walked"
+    if not left:
+        return f'<p class="coverage is-done">{md(head)}.</p>'
+    rows = []
+    for entry in left:
+        what = entry["what"] or entry["where"]
+        tier = entry["tier"] or "untiered"
+        risk = " is-risk" if entry["tier"] == "risk" else ""
+        rows.append(
+            f'<li title="{attr(what)}"><span class="cov-n">{entry["n"]}</span>'
+            f'<span class="cov-tier{risk}">{md(tier)}</span>'
+            f'<span class="cov-what">'
+            f'{md(textwrap.shorten(what, 88, placeholder="…"))}</span></li>'
+        )
+    return (
+        f'<div class="coverage"><p>{md(head)}. Not walked:</p>'
+        f'<ul class="cov-left">{"".join(rows)}</ul></div>'
+    )
 
 
 def bar_html(session, beats, current, phase):
@@ -842,6 +874,8 @@ def body_html(session, beats, problems_by_n, live=False, phase=None):
             ) if current else ""
             parts.append(stage_html(session, beats, current, card))
     ledger = [b for b in beats if b is not current]
+
+    parts.append(coverage_html(session, beats))
 
     counts = {}
     for beat in beats:
