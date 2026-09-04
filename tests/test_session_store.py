@@ -2104,6 +2104,79 @@ class ProducingAndApplying(StoreCase):
             )
 
 
+class TheBeatBudget(StoreCase):
+    """Rule 2 as a number the store enforces. It binds a beat being written now and
+    never one already on disk, so tightening it cannot unship a stored session."""
+
+    def wordy(self, words, **kw):
+        beat = {
+            "n": 3, "tier": "core", "state": "clean", "claim": "sound",
+            "where": "c.py:1",
+            "slots": {"what": " ".join(["word"] * words), "proof": "c.py:1"},
+        }
+        beat.update(kw)
+        return beat
+
+    def test_a_slot_over_budget_is_refused_with_the_fix_named(self):
+        with self.assertRaisesRegex(
+            session_store.StoreError, r"what is 26 words, over 25; split the beat or cut it"
+        ):
+            self.store.put_beat(self.wordy(26))
+        self.store.put_beat(self.wordy(25))
+        self.assertEqual(self.beat(3)["state"], "clean")
+
+    def test_a_clean_beat_may_fill_three_slots_and_no_more(self):
+        four = self.wordy(5, slots={"what": "w", "why": "y", "proof": "c.py:1", "prior": "p"})
+        with self.assertRaisesRegex(session_store.StoreError, r"fills 4 slots, over 3"):
+            self.store.put_beat(four)
+        # a flag earns the extra lines, because it has a risk and a fix to carry
+        flag = dict(four, state="flag",
+                    slots={"what": "w", "why": "y", "proof": "c.py:1",
+                           "risk": "r", "fix": "f"})
+        self.store.put_beat(flag)
+        self.assertEqual(self.beat(3)["state"], "flag")
+
+    def test_quoted_lines_stay_under_the_stated_cap(self):
+        with self.assertRaisesRegex(session_store.StoreError, r"11 quoted lines, over 10"):
+            self.store.put_beat(self.wordy(5, diff=["+ line"] * 11))
+        self.store.put_beat(self.wordy(5, diff=["+ line"] * 10))
+
+    def test_a_claim_that_runs_on_is_refused(self):
+        with self.assertRaisesRegex(session_store.StoreError, r"claim is 21 words, over 20"):
+            self.store.put_beat(self.wordy(5, claim=" ".join(["word"] * 21)))
+
+    def test_a_refusal_inside_apply_leaves_the_action_replayable(self):
+        # the hazard: apply carries new beats, so a refusal there could strand the
+        # reviewer's click at seq > handled_seq with nothing written
+        action = self.store.produce("nav-1", None, "next", "")
+        session = dict(self.store.snapshot()[0], cursor=3, current_beat=3)
+        result = {"kind": "walk", "cursor": 3, "current_beat": 3}
+
+        with self.assertRaises(session_store.StoreError):
+            self.store.apply(action["seq"], result, session=session,
+                             beats=(self.wordy(40),))
+        self.assertEqual(self.store.head()["state"], "produced")
+        self.assertNotIn(3, [b["n"] for b in self.store.snapshot()[1]])
+
+        applied = self.store.apply(action["seq"], result, session=session,
+                                   beats=(self.wordy(20),))
+        self.assertEqual(applied["state"], "applied")
+        self.assertEqual(self.beat(3)["state"], "clean")
+
+    def test_a_beat_already_on_disk_keeps_its_meaning(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / "beats").mkdir()
+        over = self.wordy(60, n=1)
+        (root / "session.json").write_text(json.dumps(SESSION), encoding="utf-8")
+        (root / "beats" / "01.json").write_text(json.dumps(over), encoding="utf-8")
+
+        stored = next(b for b in session_store.SessionStore(root).snapshot()[1])
+
+        self.assertTrue(session_store.beat_budget_problems(stored))
+        self.assertEqual(session_store.validate_beat(stored, "report"), [])
+
+
 class RecoveringAndDelivering(StoreCase):
     def test_supervised_abandon_only_moves_the_exact_head(self):
         first = self.store.produce("nav-1", None, "next", "")
