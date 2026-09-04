@@ -82,9 +82,11 @@ LIVE_JS = """<script>
   let retryWhenIdle = false;
   let observedSeq = 0, awaitingSeq = null;
 
-  // Drop is the one control with no undo, so it asks once. Anything else the
-  // reviewer does answers no: another button, Escape, or three seconds of nothing.
-  const ARM_MSG = 'click again to drop, or wait';
+  // Every resolution is a one-way door, not just Drop: the store lets accept and drop
+  // out of `flag` only, and refuses `decide` on a delivery beat, so nothing walks any
+  // of them back. They all ask once. Anything else the reviewer does answers no:
+  // another button, Escape, or three seconds of nothing.
+  const ARMS = new Set(['accept', 'drop', 'decide']);
 
   function disarm() {
     if (!armed) return;
@@ -93,17 +95,37 @@ LIVE_JS = """<script>
     armed.button.classList.remove('is-armed');
     // Only take back the prompt disarming makes untrue; a send message outranks it.
     const msg = armed.button.closest('.acts').querySelector('.act-msg');
-    if (msg && msg.textContent === ARM_MSG) msg.textContent = '';
+    if (msg && msg.textContent === armed.message) msg.textContent = '';
     armed = null;
     armTimer = null;
   }
 
+  // The label already names the effect, so the prompt is that verb again rather than
+  // a second vocabulary: Drop, Implement, Include, Record. Which beat goes in the
+  // message, not the button, so arming does not treble the button's width and shunt
+  // the rest of the row out from under the cursor that is about to click again.
   function arm(button, n) {
     disarm();
-    armed = { button, label: button.textContent };
-    button.textContent = n === 'walk' ? 'Drop?' : `Drop beat ${n}?`;
+    const label = button.textContent;
+    const verb = label.split(' ')[0];
+    const which = n === 'walk' ? '' : ` beat ${n}`;
+    armed = {
+      button,
+      label,
+      message: `click again to ${verb.toLowerCase()}${which}, or wait`,
+    };
+    button.textContent = `${verb}?`;
     button.classList.add('is-armed');
     armTimer = setTimeout(disarm, 3000);
+    return armed.message;
+  }
+
+  // A queued action disables the row, so the pill says why and how to get moving.
+  // There is no listening variant: serve.py's wait() returns early on a pending head,
+  // so a walk can only park when nothing is outstanding.
+  function held(kind) {
+    return 'holding your ' + (kind || 'call')
+      + ' until the walk picks it up, or say it in the terminal';
   }
 
   function paintLive(cls, text) {
@@ -196,12 +218,17 @@ LIVE_JS = """<script>
     // word stays on the page. Beat controls stay open, since Phase 4 has the
     // reviewer make any remaining calls off this page; only Next beat closes.
     done = phase === 'done';
-    usable = !queued && (listening ? phase === 'parked' : true);
+    // `listening` is the server's own count of who is blocked on /await, so it already
+    // proves a walk is parked. Gating on the agent also having posted phase:'parked'
+    // let a walk that forgot the POST sit waiting for a click the page refused to send.
+    usable = !queued;
     paintLive(
       'live ' + (done ? 'done' : listening ? phase : 'away'),
-      done || listening
-        ? (status.text || phase)
-        : 'no walk is listening, your call is saved for whenever one returns'
+      queued
+        ? held(state.head_kind)
+        : done || listening
+          ? (status.text || phase)
+          : 'no walk is listening, your call is saved for whenever one returns'
     );
     between = queued && NAVIGATION.has(state.head_kind) && state.head_state === 'produced';
     paintStage();
@@ -339,9 +366,15 @@ LIVE_JS = """<script>
     const msg = row.querySelector('.act-msg');
     const wasArmed = armed && armed.button === button;
     disarm();
-    if (button.dataset.action === 'drop' && !wasArmed) {
-      arm(button, n);
-      msg.textContent = ARM_MSG;
+    // Ask for the decision before asking them to confirm it, or the second click is
+    // the one that discovers the row was never sendable.
+    if (button.dataset.action === 'decide' && !(note && note.value.trim())) {
+      msg.textContent = 'enter the decision first';
+      if (note) note.focus();
+      return;
+    }
+    if (ARMS.has(button.dataset.action) && !wasArmed) {
+      msg.textContent = arm(button, n);
       return;
     }
     const fresh = {

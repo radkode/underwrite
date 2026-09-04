@@ -305,8 +305,7 @@ requests are refused. Drive its reserved execution and landing only through
 `implementationctl.py`.
 
 **Say what you are doing.** The page cannot see you work, and "busy" and "waiting on you"
-look identical on disk, so the controls stay disabled until you say you are parked. POST
-before and after anything slow:
+look identical on disk. POST before and after anything slow:
 
 ```bash
 curl -fsS -X POST $URL/status -H 'Content-Type: application/json' \
@@ -315,6 +314,10 @@ curl -fsS -X POST $URL/status -H 'Content-Type: application/json' \
 
 `phase` is `working`, `parked`, or `done`. Post `parked` immediately before you block, and
 `working` again the moment you pick an action up.
+
+This is the reviewer's window into your turn, not a gate on their controls. The server
+counts who is blocked on `/await` itself, so forgetting the POST costs them the sentence
+saying what you are doing and nothing else. It used to leave the page dead.
 
 A beat is a coherent unit of change, usually not one file. A service plus its test plus
 the type it added is one beat. A 600-line file with two unrelated changes is two.
