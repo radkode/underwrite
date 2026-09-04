@@ -41,6 +41,15 @@ RESOLVE = {"accept": "accepted", "drop": "dropped", "decide": "decided"}
 RESOLVABLE = {"accept": ("flag",), "drop": ("flag",), "decide": ("flag", "accepted")}
 OPEN_STATES = ("clean", "flag", "unverified")
 RESOLUTION_KINDS = ("delivery", "decision")
+# Rule 2's budget, in numbers. It binds what a walk writes now and never what is
+# already on disk: validate_beat stays the shippability contract for stored beats,
+# so tightening here cannot retroactively unship a session or an accepted finding.
+BEAT_BUDGET = {
+    "claim_words": 20,
+    "slot_words": 25,
+    "clean_slots": 3,
+    "diff_lines": 10,
+}
 _MISSING = object()
 _FULL_SHA = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
@@ -142,6 +151,44 @@ def _positive(value, name):
     if value == 0:
         raise StoreError(f"{name} must be a positive integer")
     return value
+
+
+def beat_budget_problems(beat):
+    """Return the ways a beat about to be written blows rule 2's budget.
+
+    Separate from validate_beat on purpose. This refuses a write while the walk can
+    still fix it; validate_beat judges what is already stored, and a beat that was
+    legal when it landed stays legal."""
+    over = []
+    n = beat.get("n", "?")
+    claim = beat.get("claim")
+    if isinstance(claim, str):
+        words = len(claim.split())
+        if words > BEAT_BUDGET["claim_words"]:
+            over.append(
+                f"beat {n}: claim is {words} words, over {BEAT_BUDGET['claim_words']}"
+            )
+    slots = beat.get("slots")
+    if isinstance(slots, dict):
+        filled = [key for key in BEAT_SLOTS if slots.get(key)]
+        for key in filled:
+            words = len(slots[key].split())
+            if words > BEAT_BUDGET["slot_words"]:
+                over.append(
+                    f"beat {n}: {key} is {words} words, over "
+                    f"{BEAT_BUDGET['slot_words']}; split the beat or cut it"
+                )
+        if beat.get("state") == "clean" and len(filled) > BEAT_BUDGET["clean_slots"]:
+            over.append(
+                f"beat {n}: clean beat fills {len(filled)} slots, over "
+                f"{BEAT_BUDGET['clean_slots']} ({', '.join(filled)})"
+            )
+    quoted = beat.get("diff")
+    if isinstance(quoted, list) and len(quoted) > BEAT_BUDGET["diff_lines"]:
+        over.append(
+            f"beat {n}: {len(quoted)} quoted lines, over {BEAT_BUDGET['diff_lines']}"
+        )
+    return over
 
 
 def validate_beat(beat, mode="branch", final=False):
@@ -1624,6 +1671,9 @@ class SessionStore:
             raise StoreError(
                 f"new beat state must be one of {', '.join(OPEN_STATES)}"
             )
+        over = beat_budget_problems(beat)
+        if over:
+            raise StoreError("; ".join(over))
         owned = [
             field
             for field in ("call", "landed", "branch", "delivery_kind", "delivery")

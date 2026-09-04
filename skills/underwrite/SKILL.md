@@ -48,6 +48,12 @@ the line, never write "none": a slot filled because it exists is the same wall o
 a costume. A clean beat is three lines. At most ten quoted lines below the slots. A prose
 paragraph inside a beat is a bug.
 
+The store holds you to it. `put-beat` refuses a beat over 25 words in a slot, 20 in a
+claim, three filled slots on a `CLEAN`, or ten quoted lines, and names what to cut. A flag
+gets the extra lines because it carries a `RISK` and a `FIX`. Being refused means the beat
+is two beats, or the sentence is carrying weight it does not need. Do not pad up to the
+budget either: the examples below are the target, and both are well under it.
+
 `PROOF` names a command you ran or a file you read this session. `inferred` is a legal
 value and an honest one. A claim with neither is not shippable.
 

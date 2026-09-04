@@ -64,6 +64,12 @@ FIX    npx --yes @arethetypeswrong/cli@0.18.5
 `PROOF` names a command run under the session's execution policy, or a file that was read.
 `inferred` is a legal value. A claim with neither does not ship.
 
+Beats stay that size because the store makes them. A slot over 25 words, a claim over 20,
+a fourth filled slot on a clean beat, or an eleventh quoted line is refused at write time,
+with the offending slot and its count named. The example above sits at nine or ten words a
+line, which is the target; the budget is the ceiling. Nothing already recorded is
+re-judged, so a session written before the budget still opens and still renders.
+
 `FIX` is the smallest concrete implementation intent, review recommendation, or decision
 owed. For local branch and working-tree targets, choosing Implement authorizes Underwrite
 to apply that intent and run verification. It does not claim that an exact patch already
