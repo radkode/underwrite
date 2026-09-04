@@ -715,6 +715,19 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
   background: var(--del-bg);
   border-color: var(--del-ink);
 }
+/* An armed primary keeps its own hue and empties out instead. The second click
+   completes the same constructive action, so borrowing the removal palette would
+   say the opposite of what the button does. */
+.act.primary.is-armed {
+  color: var(--accepted);
+  background: var(--raised);
+  border-color: var(--accepted);
+  box-shadow: inset 0 0 0 1px var(--accepted);
+}
+.act.primary.is-armed:hover:not(:disabled) {
+  filter: none;
+  background: var(--sunk);
+}
 
 .note {
   flex: 1 1 240px;
@@ -731,7 +744,12 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
 .note:focus-visible { outline: 2px solid var(--accepted); outline-offset: -1px; }
 .note:disabled { opacity: 0.45; }
 
+/* Its own line, like the key hints. Inline it competed with the note for row width,
+   so an arm prompt appearing shifted every button left, out from under the cursor
+   that is about to click again. */
 .act-msg {
+  flex-basis: 100%;
+  min-height: 1.4em;
   font-family: var(--mono);
   font-size: 11px;
   color: var(--ink-2);

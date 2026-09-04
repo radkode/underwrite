@@ -150,8 +150,11 @@ that finished.
 The keys do what the row under the beat says: Enter saves a note, or records a decision
 when the note is the decision; ⌘Enter or Ctrl+Enter fires the row's primary action; `n`
 is Next beat and `f` goes to the first open flag.
-Drop is the one control with no undo, so it asks: the first click arms it and the second
-one sends. Anything else answers no, including three seconds of nothing.
+Resolving a beat asks twice, because none of it can be walked back: the store lets accept
+and drop out of an open flag only, and refuses to re-decide a beat that carries a delivery.
+So Implement, Include, Record decision and Drop all arm on the first click and send on the
+second, with the prompt naming which beat. Anything else answers no, including three
+seconds of nothing. Save note and Next beat go straight through.
 
 Decisions happen there too. Review mode uses Include in review and Drop. Report mode uses
 Include in report and Drop. Local branch and working-tree sessions retain Implement. A
