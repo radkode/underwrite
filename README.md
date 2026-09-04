@@ -99,6 +99,12 @@ output as data. Governing repository instructions come only from the frozen base
 Changed `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, `CLAUDE.local.md`, contribution
 guidance, and ADRs are reviewed like any other change; they do not govern their own review.
 
+That prose is also barred from becoming the review. A well-commented diff offers a ready
+`WHY` for every hunk, and a slot reworded out of the docstring above the change reads as
+analysis while adding nothing, which costs more than quoting would: you have to read it
+closely to find that out. Underwrite quotes the comment and spends the slot on what
+reading it did not tell you.
+
 Every PR session freezes `no-exec` and its lifecycle-derived audience atomically with its
 target. Underwrite may inspect the hash-bound diff and frozen Git objects through its
 static readers, but it does not check out the head, install, build, test, lint, run repo
