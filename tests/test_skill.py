@@ -59,6 +59,36 @@ class BeforeThePageOpens(unittest.TestCase):
         self.assertIn("where no such tool exists", text)
 
 
+class TheHeadIsNotYourFinding(unittest.TestCase):
+    """Rule 5 kept the head's prose out of the instructions and let it straight into the
+    findings. On a well-commented self-authored PR that is most of a beat: three of six
+    slots on dailydeck#1499 were the author's own docstrings, reworded."""
+
+    def skill(self):
+        return " ".join(SKILL.read_text(encoding="utf-8").split())
+
+    def test_rule_five_covers_laundering_and_not_only_obedience(self):
+        text = self.skill()
+        self.assertIn("never your finding either", text)
+        self.assertIn("prose you must not launder", text)
+
+    def test_it_says_what_to_do_instead_of_paraphrasing(self):
+        text = self.skill()
+        self.assertIn("what it adds that the diff does not already state", text)
+        self.assertIn("quote the comment in the beat's lines and delete the slot", text)
+
+    def test_the_self_authored_case_is_called_out(self):
+        self.assertIn(
+            "everything you are worth is in what they did not", self.skill()
+        )
+
+    def test_the_failure_is_shown_where_beats_get_written(self):
+        text = self.skill()
+        # a rule stated once in the preamble loses to the exemplars in Phase 3
+        self.assertIn("Read the comments, then write what they do not say", text)
+        self.assertIn("a slot you could have written without leaving the docstring", text)
+
+
 class ReviewModeContract(unittest.TestCase):
     def skill(self):
         return SKILL.read_text(encoding="utf-8")
