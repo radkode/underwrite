@@ -20,6 +20,7 @@ from pathlib import Path
 DB_SCHEMA_VERSION = 5
 SCHEMA_VERSION = 1
 DELIVERY_VERSION = 1
+FINDINGS_FILE = "findings.md"
 EXECUTION_POLICY_VERSION = 1
 EXECUTION_MODES = ("no_exec", "gateway_attested")
 AUDIENCE_MODES = ("branch", "review", "report")
@@ -280,6 +281,58 @@ def _fsync_directory(path):
         os.fsync(fd)
     finally:
         os.close(fd)
+
+
+def _one_line(text):
+    """Agent-authored text, flattened so it can never begin a line of the document."""
+    return " ".join(str(text).split())
+
+
+def render_findings(session, beats):
+    """The accepted findings as Markdown, derived from the store.
+
+    Report mode has no external delivery, so this file is the only place a finding
+    the reviewer included is readable once the session directory's tooling is gone.
+    """
+    target = session.get("target") or {}
+    name = target.get("repo") or "session"
+    if target.get("number"):
+        name = f"{name}#{target['number']}"
+    head = str(target.get("head_sha") or "")[:7]
+
+    out = [f"# Findings: {name}"]
+    title = _one_line(session.get("title") or "")
+    if title:
+        out += ["", title]
+    if head:
+        out += ["", f"Frozen at `{head}`. Report audience, so nothing posts to GitHub."]
+    out += ["", "Derived from `session.sqlite3`. Edits here are overwritten."]
+
+    included = [beat for beat in beats if beat.get("state") == "accepted"]
+    plural = "" if len(included) == 1 else "s"
+    out += ["", f"{len(included)} finding{plural} included."]
+
+    for beat in included:
+        out += ["", "", f"## Beat {beat.get('n')}: {_one_line(beat.get('claim') or '')}"]
+        bullets = []
+        where = _one_line(beat.get("where") or "")
+        if where:
+            bullets.append(f"- **Where** `{where}`")
+        tier = _one_line(beat.get("tier") or "")
+        if tier:
+            bullets.append(f"- **Tier** {tier}")
+        slots = beat.get("slots") or {}
+        for slot in BEAT_SLOTS:
+            value = _one_line(slots.get(slot) or "")
+            if value:
+                bullets.append(f"- **{slot.upper()}** {value}")
+        if bullets:
+            out += [""] + bullets
+        call = _one_line(beat.get("call") or "")
+        if call:
+            out += ["", f"**Your call.** {call}"]
+
+    return "\n".join(out) + "\n"
 
 
 def _atomic_write(path, payload):
@@ -4067,4 +4120,15 @@ class SessionStore:
                 _atomic_write(
                     self.root / "session.json", session_payload.encode("utf-8")
                 )
-        return {"session": str(self.root / "session.json"), "beats": len(beats), "seq": handled}
+                findings = None
+                if self._audience_mode(session) == "report":
+                    findings = self.root / FINDINGS_FILE
+                    _atomic_write(
+                        findings, render_findings(session, beats).encode("utf-8")
+                    )
+        return {
+            "session": str(self.root / "session.json"),
+            "beats": len(beats),
+            "seq": handled,
+            "findings": str(findings) if findings else None,
+        }

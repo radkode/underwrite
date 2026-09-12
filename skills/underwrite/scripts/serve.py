@@ -104,7 +104,7 @@ class Session:
         self.root = root
         self.css_path = css_path
         self.store = store or SessionStore(root)
-        self.store.export_json()
+        self.findings = self.store.export_json()["findings"]
         self.cond = threading.Condition()
         self.lock = threading.Lock()
         self.subscribers = []
@@ -548,6 +548,8 @@ def main():
             json.dumps({"url": url, "pid": os.getpid()}, indent=2) + "\n", encoding="utf-8"
         )
         print(url, flush=True)
+        if Handler.session.findings:
+            print(f"findings at {Handler.session.findings}", file=sys.stderr, flush=True)
         httpd.serve_forever()
     except (KeyboardInterrupt, SystemExit):
         pass
