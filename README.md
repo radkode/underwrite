@@ -37,7 +37,9 @@ every later check to full commit IDs. The same capture freezes governing instruc
 from the base, separately from the untrusted head. It then reads the last twenty base
 commits touching those paths and the two or three earlier PRs the squash-merge subjects
 point at. That last one is not padding: prior work in the same area is reliably where the
-best finding comes from, because it is the context a diff cannot show you.
+best finding comes from, because it is the context a diff cannot show you. The frozen diff
+is read back under a one-million-byte ceiling (`--max-bytes`); a change past that size is
+refused rather than truncated.
 
 **Orient.** A short reconstruction of what the change is for, plus a claim check comparing
 the PR description against what the diff actually does. This is the first of two decisions
@@ -218,8 +220,8 @@ an operating system later reuses the same loopback port.
 ## Session state
 
 Sessions live in `~/.claude/reviews/<owner>-<repo>-pr<N>/`, outside every repo, so a review
-never shows up in `git status`. They are resumable, which matters because the large PRs
-that most need underwriting are the ones nobody finishes in one sitting.
+never shows up in `git status`. They are resumable, because a review that gets interrupted
+should not have to start over.
 
 ```
 session.sqlite3  authoritative versioned session, beats, action queue, and receipts
