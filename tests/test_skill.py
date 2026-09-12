@@ -241,6 +241,7 @@ class ReportModeContract(unittest.TestCase):
 
         self.assertIn("In `report` mode, Include in report posts `accept`", text)
         self.assertIn("the accepted beat in SQLite is the durable report outcome", text)
+        self.assertIn("every export rewrites `findings.md` from it", text)
         self.assertIn("Acknowledge the applied accept immediately", text)
         self.assertIn("Do not call `land`", text)
         self.assertIn("Acceptance freezes the agent-authored finding text", text)

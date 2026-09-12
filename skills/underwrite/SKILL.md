@@ -508,7 +508,9 @@ until Phase 4 records the URL, and the page shows Included, review pending. The 
 audience alone never changes an accepted finding to `decided`.
 
 In `report` mode, Include in report posts `accept`. The store moves the beat to `accepted`
-with delivery state `none`; the accepted beat in SQLite is the durable report outcome.
+with delivery state `none`; the accepted beat in SQLite is the durable report outcome, and
+every export rewrites `findings.md` from it so the finding is readable without the store.
+Name that absolute path in the terminal on the first accept of a session.
 Acknowledge the applied accept immediately. It is terminal and has no external delivery
 to reconcile. Do not call `land`, create a `lands[]` entry, or use `report.html` as a
 receipt. Acceptance freezes the agent-authored finding text and evidence. Refine them
@@ -832,6 +834,7 @@ pr.bundle        frozen base and head Git objects, hash-bound to the target
 trusted-context.json  frozen base instructions, hash-bound to the target
 serve.json       running server URL and pid, removed when it exits
 report.html      rendered, regenerable, throwaway
+findings.md      derived export of the accepted findings, report audience only
 implementations/<link-id>/  one source-bound implementation child
   session.sqlite3           authoritative attempt, evidence, plan, and landing state
   implementation-evidence/<attempt>/

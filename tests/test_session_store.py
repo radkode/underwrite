@@ -397,6 +397,114 @@ class FrozenTargets(unittest.TestCase):
         self.assertEqual(beat["delivery"]["state"], "none")
         self.assertFalse(restored.reconcile()["recovery"])
 
+    def _report_session(self, beat=FLAG):
+        target = dict(self.target(), state="closed", merged_at=None)
+        diff, metadata = self.inputs()
+        self.store.freeze_target(target, diff, metadata, self.context_input())
+        self.store.put_beat(beat)
+        return self.store
+
+    def test_a_report_accept_writes_the_finding_to_a_file_that_outlives_the_store(self):
+        self._report_session()
+        action = self.store.produce("accept-1", 1, "accept", "include it")
+        self.store.ack(action["seq"])
+
+        exported = self.store.export_json()
+        findings = self.root / "findings.md"
+
+        self.assertEqual(exported["findings"], str(findings))
+        text = findings.read_text(encoding="utf-8")
+        self.assertIn("# Findings: acme/widget#7", text)
+        self.assertIn("1 finding included.", text)
+        self.assertIn("## Beat 1: unpinned", text)
+        self.assertIn("- **Where** `a.py:1`", text)
+        self.assertIn("- **Tier** core", text)
+        self.assertIn("- **FIX** pin it", text)
+        self.assertIn("**Your call.** include it", text)
+
+    def test_the_findings_file_is_derived_so_a_second_export_changes_no_bytes(self):
+        self._report_session()
+        self.store.ack(self.store.produce("accept-1", 1, "accept", "include it")["seq"])
+        self.store.export_json()
+        findings = self.root / "findings.md"
+        first = findings.read_bytes()
+
+        self.store.export_json()
+
+        self.assertEqual(findings.read_bytes(), first)
+
+    def test_a_later_note_rewrites_the_call_in_place_rather_than_stacking_a_copy(self):
+        self._report_session()
+        self.store.ack(self.store.produce("accept-1", 1, "accept", "include it")["seq"])
+        self.store.ack(self.store.produce("note-1", 1, "note", "second thoughts")["seq"])
+
+        self.store.export_json()
+
+        text = (self.root / "findings.md").read_text(encoding="utf-8")
+        self.assertIn("**Your call.** second thoughts", text)
+        self.assertNotIn("include it", text)
+        self.assertEqual(text.count("## Beat 1:"), 1)
+
+    def test_agent_text_cannot_start_a_line_of_the_findings_document(self):
+        injected = dict(FLAG)
+        injected["claim"] = "### not a heading"
+        injected["slots"] = dict(FLAG["slots"], fix="pin it\n# nor this")
+        self._report_session(injected)
+        self.store.ack(self.store.produce("accept-1", 1, "accept", "include it")["seq"])
+
+        self.store.export_json()
+
+        text = (self.root / "findings.md").read_text(encoding="utf-8")
+        self.assertIn("## Beat 1: ### not a heading", text)
+        self.assertIn("- **FIX** pin it # nor this", text)
+        for line in text.splitlines():
+            self.assertFalse(line.startswith("# ") and "nor this" in line)
+
+    def test_a_report_session_with_nothing_included_still_says_so(self):
+        self._report_session()
+
+        self.store.export_json()
+
+        self.assertIn(
+            "0 findings included.",
+            (self.root / "findings.md").read_text(encoding="utf-8"),
+        )
+
+    def test_only_the_report_audience_gets_a_findings_file(self):
+        diff, metadata = self.inputs()
+        self.store.freeze_target(
+            self.target(), diff, metadata, self.context_input()
+        )
+        self.store.put_beat(FLAG)
+        self.store.produce("accept-1", 1, "accept", "ship it")
+
+        exported = self.store.export_json()
+
+        self.assertIsNone(exported["findings"])
+        self.assertFalse((self.root / "findings.md").exists())
+
+    def test_a_failed_findings_write_leaves_the_accepted_finding_durable(self):
+        self._report_session()
+        self.store.ack(self.store.produce("accept-1", 1, "accept", "include it")["seq"])
+        real = session_store._atomic_write
+
+        def refuse(path, payload):
+            if path.name == "findings.md":
+                raise OSError("no space left on device")
+            return real(path, payload)
+
+        with mock.patch.object(session_store, "_atomic_write", refuse):
+            with self.assertRaisesRegex(OSError, "no space left"):
+                self.store.export_json()
+
+        self.assertEqual(self.store.snapshot()[1][0]["state"], "accepted")
+        self.assertFalse((self.root / "findings.md").exists())
+        self.store.export_json()
+        self.assertIn(
+            "## Beat 1: unpinned",
+            (self.root / "findings.md").read_text(encoding="utf-8"),
+        )
+
     def test_invalid_accepted_report_cannot_be_reimported(self):
         target = dict(self.target(), state="closed", merged_at=None)
         diff, metadata = self.inputs()
