@@ -386,9 +386,8 @@ FIX    npx --yes @arethetypeswrong/cli@0.18.5
 **Persist the beat in the same turn you present it.** Not at the end. Send the complete
 beat object to `$S/scripts/sessionctl.py put-beat "$R" -`, then patch `cursor` through
 `patch-session`. Read an existing document only through `get-session` or `get-beat`.
-Real reviews get interrupted, and the large PRs that most need this are the ones nobody
-finishes in one sitting. The renderer reports a mismatch between `cursor` and the beats
-the store contains.
+Real reviews get interrupted, and a walk that stops should lose nothing it already found.
+The renderer reports a mismatch between `cursor` and the beats the store contains.
 
 **Waiting on the reviewer.** After presenting a beat, park on the server rather than
 ending the turn silently. Run this in the background too, so the harness wakes you when
