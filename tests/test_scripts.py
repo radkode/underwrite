@@ -921,6 +921,89 @@ class DelegatedActionControls(unittest.TestCase):
         self.assertNotIn("Review publication", failed)
 
 
+class CitedLocations(unittest.TestCase):
+    """`where` is unvalidated agent prose, so a link exists only where it resolves."""
+
+    PATHS = (
+        "apps/web/src/lib/mcp/scopes.ts",
+        "apps/web/src/lib/mcp/scopes.test.ts",
+        "packages/database/src/service.ts",
+        "apps/web/src/service.ts",
+    )
+    TARGET = {"kind": "github_pr", "repo": "acme/widget", "head_sha": "b" * 40}
+
+    def rendered(self, where, paths=None):
+        return rr.where_html(
+            where, self.PATHS if paths is None else paths, self.TARGET
+        )
+
+    def test_an_exact_path_with_a_line_links_into_the_frozen_head(self):
+        out = self.rendered("apps/web/src/lib/mcp/scopes.ts:53")
+
+        self.assertIn(
+            'href="https://github.com/acme/widget/blob/%s/'
+            'apps/web/src/lib/mcp/scopes.ts#L53"' % ("b" * 40),
+            out,
+        )
+        self.assertIn(">apps/web/src/lib/mcp/scopes.ts:53</a>", out)
+
+    def test_a_unique_suffix_resolves_because_beats_cite_the_short_name(self):
+        out = self.rendered("scopes.test.ts:15-22")
+
+        self.assertIn("/apps/web/src/lib/mcp/scopes.test.ts#L15", out)
+
+    def test_an_ambiguous_suffix_resolves_to_nothing_rather_than_a_guess(self):
+        self.assertNotIn("<a", self.rendered("service.ts"))
+
+    def test_the_locations_that_resolve_link_beside_the_ones_that_do_not(self):
+        out = self.rendered(
+            "apps/web/src/lib/mcp/scopes.ts:53 + materializeContext"
+        )
+
+        self.assertEqual(out.count("<a "), 1)
+        self.assertIn("+ materializeContext", out)
+
+    def test_a_trailing_separator_stays_outside_the_link(self):
+        out = self.rendered("apps/web/src/lib/mcp/scopes.ts:53, 328-331")
+
+        self.assertIn(">apps/web/src/lib/mcp/scopes.ts:53</a>,", out)
+        self.assertNotIn("328-331</a>", out)
+
+    def test_prose_shaped_like_a_path_is_left_alone(self):
+        for token in ("tasks:claim", "dd.fix", "tasks.title", "packages/db/**"):
+            self.assertNotIn("<a", self.rendered(token), token)
+
+    def test_a_hostile_scheme_never_reaches_an_href(self):
+        for token in (
+            "javascript:alert(1)",
+            "JaVaScRiPt:alert(document.domain)",
+            "data:text/html,<script>alert(1)</script>",
+            "vbscript:msgbox(1)",
+            "//evil.example/p",
+        ):
+            self.assertNotIn("<a", self.rendered(token), token)
+
+    def test_an_attribute_break_out_cannot_ride_in_on_a_resolving_path(self):
+        out = self.rendered('apps/web/src/lib/mcp/scopes.ts:53" onmouseover="alert(1)')
+
+        self.assertNotIn("<a", out)
+        self.assertNotIn("onmouseover=\"alert(1)\">", out)
+
+    def test_nothing_links_when_the_session_has_no_frozen_diff(self):
+        self.assertNotIn("<a", self.rendered("apps/web/src/lib/mcp/scopes.ts:53", ()))
+
+    def test_a_branch_target_offers_no_allowlist_so_the_page_keeps_plain_text(self):
+        html = rr.render(
+            {"repo": "r", "audience": {"mode": "branch"}},
+            [beat(where="apps/web/src/lib/mcp/scopes.ts:53")],
+            "",
+            {},
+        )
+
+        self.assertNotIn("<a href", html)
+        self.assertIn("apps/web/src/lib/mcp/scopes.ts:53", html)
+
+
 class Escaping(unittest.TestCase):
     """Beat content is author-controlled but quotes code from the PR under review."""
 

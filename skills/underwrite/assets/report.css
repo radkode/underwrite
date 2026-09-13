@@ -347,6 +347,22 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
   color: var(--ink-2);
   word-break: break-all;
 }
+/* A cited location links only when it resolves against the frozen diff, and several sit
+   on one line where some do and some do not. Full ink plus a hairline rule is what says
+   which without asking the reader to hover: the plain ones stay a step lighter. */
+.b-path a {
+  color: var(--ink);
+  text-decoration: underline;
+  text-decoration-color: var(--ink-3);
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+}
+.b-path a:hover { text-decoration-color: var(--ink); }
+.b-path a:focus-visible {
+  outline: 2px solid var(--flag);
+  outline-offset: 2px;
+  text-decoration-color: var(--ink);
+}
 /* The reviewer's words, on the line, so a folded beat still says what came of it. */
 .b-call {
   grid-column: 2 / -1;

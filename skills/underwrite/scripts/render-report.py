@@ -24,6 +24,7 @@ import sqlite3
 import sys
 import textwrap
 from pathlib import Path
+from urllib.parse import quote
 
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
@@ -613,6 +614,66 @@ def delivery_html(beat, mode, replacement=False, untrusted_pr=False):
     )
 
 
+LOCATION_LINE = re.compile(r"^(?P<path>.+?):(?P<line>\d+)(?:[-,]\d+)*$")
+
+
+def changed_paths(root, session):
+    """The frozen allowlist, empty when there is no PR to link into."""
+    target = session.get("target")
+    if not isinstance(target, dict) or target.get("kind") != "github_pr":
+        return ()
+    if not (target.get("repo") and target.get("head_sha")):
+        return ()
+    # A legacy session reaches the page without the store on purpose, and some of them
+    # cannot migrate into it at all. Reading the allowlist must not attempt that write.
+    if not (root / "session.sqlite3").exists():
+        return ()
+    try:
+        return tuple(SessionStore(root).changed_paths())
+    except (OSError, sqlite3.Error, StoreError, ValueError):
+        return ()
+
+
+def resolve_path(candidate, paths):
+    """Resolve a cited location against the frozen diff, exactly or by unique suffix.
+
+    A beat cites `scopes.test.ts` for a path three directories deep, so the suffix leg
+    earns its keep; an ambiguous suffix resolves to nothing rather than to a guess.
+    """
+    if not candidate or candidate in paths:
+        return candidate or None
+    tail = "/" + candidate
+    found = [path for path in paths if path.endswith(tail)]
+    return found[0] if len(found) == 1 else None
+
+
+def where_html(where, paths, target):
+    """`where` is agent prose, so every token is offered to the allowlist and only what
+    resolves becomes a link. The href carries a path from the frozen diff, never a token,
+    which is what keeps an unvalidated field out of an attribute.
+    """
+    head = str(target.get("head_sha", "")) if isinstance(target, dict) else ""
+    repo = str(target.get("repo", "")) if isinstance(target, dict) else ""
+    out = []
+    for token in str(where).split(" "):
+        bare = token.rstrip(",;+\u00b7")
+        cited = LOCATION_LINE.match(bare)
+        candidate = cited["path"] if cited else bare
+        path = resolve_path(candidate, paths) if paths else None
+        if path is None:
+            out.append(md(token))
+            continue
+        href = f"https://github.com/{quote(repo)}/blob/{quote(head)}/{quote(path)}"
+        if cited:
+            href += f"#L{cited['line']}"
+        out.append(
+            f'<a href="{attr(href)}" target="_blank" rel="noreferrer noopener"'
+            f' title="{attr(path + " at " + head[:7])}">{md(bare)}</a>'
+            + md(token[len(bare):])
+        )
+    return " ".join(out)
+
+
 def beat_html(
     beat,
     problems,
@@ -622,6 +683,8 @@ def beat_html(
     replacement=False,
     untrusted_pr=False,
     stage=False,
+    paths=(),
+    target=None,
 ):
     suffix, token = STATE_STYLE.get(beat.get("state"), ("unver", "UNVERIFIED"))
     raw_slots = beat.get("slots")
@@ -738,7 +801,8 @@ def beat_html(
         f'<span class="b-tier">{md(beat.get("tier", ""))}</span>'
         f'<span class="b-claim"><span class="state">{token}</span> &nbsp;'
         f'{md(beat.get("claim", ""))}{chip}</span>'
-        f'<span class="b-path">{md(beat.get("where", ""))}</span>'
+        f'<span class="b-path">'
+        f'{where_html(beat.get("where", ""), paths, target or {})}</span>'
         + (f'<span class="b-call">“{md(beat["call"])}”</span>' if beat.get("call") else "")
         + f"</summary>"
         f'<div class="b-body">{"".join(body)}</div>'
@@ -878,7 +942,7 @@ def stage_html(session, beats, current, card):
     )
 
 
-def body_html(session, beats, problems_by_n, live=False, phase=None):
+def body_html(session, beats, problems_by_n, live=False, phase=None, paths=()):
     """Everything below the masthead. This is what /fragment re-serves on a change."""
     mode = session_mode(session)
     replacement = replacement_required(session)
@@ -904,6 +968,7 @@ def body_html(session, beats, problems_by_n, live=False, phase=None):
                 current, problems_by_n.get(current.get("n")), True,
                 live=True, mode=mode, replacement=replacement,
                 untrusted_pr=untrusted_pr, stage=True,
+                paths=paths, target=session.get("target"),
             ) if current else ""
             parts.append(stage_html(session, beats, current, card))
     ledger = [b for b in beats if b is not current]
@@ -956,6 +1021,8 @@ def body_html(session, beats, problems_by_n, live=False, phase=None):
                 mode=mode,
                 replacement=replacement,
                 untrusted_pr=untrusted_pr,
+                paths=paths,
+                target=session.get("target"),
             )
             for b in picked
         )
@@ -982,7 +1049,7 @@ def body_html(session, beats, problems_by_n, live=False, phase=None):
     return "\n".join(parts)
 
 
-def render(session, beats, css, problems_by_n, live=False, phase=None):
+def render(session, beats, css, problems_by_n, live=False, phase=None, paths=()):
     target = session.get("target") if isinstance(session.get("target"), dict) else {}
     number = session.get("number") or target.get("number")
     repo = session.get("repo") or target.get("repo", "")
@@ -1026,7 +1093,7 @@ def render(session, beats, css, problems_by_n, live=False, phase=None):
     parts.append("</header>")
 
     parts.append('<div id="live-body">')
-    parts.append(body_html(session, beats, problems_by_n, live, phase))
+    parts.append(body_html(session, beats, problems_by_n, live, phase, paths))
     parts.append("</div>")
 
     if session.get("footer"):
@@ -1155,7 +1222,10 @@ def main():
         sys.exit(f"render-report: {err}")
 
     out = Path(args.out).expanduser() if args.out else root / "report.html"
-    page = render(session, beats, css, problems_by_n, args.live)
+    page = render(
+        session, beats, css, problems_by_n, args.live,
+        paths=changed_paths(root, session),
+    )
     out.write_text(SHELL + page if args.standalone else page, encoding="utf-8")
 
     if all_problems:
