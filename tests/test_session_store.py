@@ -1916,6 +1916,26 @@ class ProducingAndApplying(StoreCase):
                 action["seq"], result, session=dict(session, title="different")
             )
 
+    def test_navigation_apply_refuses_a_session_that_drops_a_stored_key(self):
+        """An apply replaced the body wholesale, so a document built from memory rather
+        than get-session silently erased the plan and the coverage that reads it."""
+        self.store.patch_session({"plan": [{"n": 1, "tier": "core"}], "orient_call": "confirm"})
+        action = self.store.produce("nav-1", None, "next", "")
+        stored = self.store.snapshot()[0]
+        result = {"kind": "walk", "current_beat": 2}
+        partial = {k: v for k, v in stored.items() if k not in ("plan", "orient_call")}
+
+        with self.assertRaisesRegex(
+            session_store.Conflict, "omits orient_call, plan; send the complete"
+        ):
+            self.store.apply(action["seq"], result, session=dict(partial, cursor=2))
+
+        self.assertEqual(self.store.snapshot()[0], stored)
+        self.assertEqual(self.store.head()["state"], "produced")
+        applied = self.store.apply(action["seq"], result, session=dict(stored, cursor=2))
+        self.assertEqual(applied["state"], "applied")
+        self.assertEqual(self.store.snapshot()[0]["plan"], [{"n": 1, "tier": "core"}])
+
     def test_a_navigation_fault_rolls_back_the_absolute_state_and_receipt(self):
         action = self.store.produce("nav-1", None, "next", "")
         session = dict(self.store.snapshot()[0], cursor=2, current_beat=2)
