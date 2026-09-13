@@ -3701,6 +3701,12 @@ class SessionStore:
             )
             if normalized_session is None:
                 raise StoreError("navigation apply requires the absolute session document")
+            omitted = sorted(set(current_session) - set(normalized_session))
+            if omitted:
+                raise Conflict(
+                    f"navigation apply omits {', '.join(omitted)}; "
+                    "send the complete session read through get-session"
+                )
 
             changed = False
             if normalized_session is not None:
