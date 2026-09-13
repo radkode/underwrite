@@ -234,6 +234,7 @@ pr.diff          frozen local three-dot diff, hash-bound to the target
 pr.bundle        frozen base and head Git objects, hash-bound to the target
 trusted-context.json  frozen base instructions, hash-bound to the target
 report.html      rendered, regenerable
+report.partial.html  the page as it stands, rewritten by the server on every change
 implementations/<link-id>/  one linked child, nested below the source session
   session.sqlite3           authoritative child, attempt, evidence, and landing state
   implementation-evidence/<attempt>/

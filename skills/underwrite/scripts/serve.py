@@ -42,7 +42,7 @@ RENDERER = HERE / "render-report.py"
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from session_store import ACTIONS, Conflict, SessionStore, StoreError
+from session_store import ACTIONS, Conflict, SessionStore, StoreError, _atomic_write
 
 _renderer = None
 _renderer_mtime = None
@@ -78,6 +78,7 @@ SOCKET_TIMEOUT = 60.0
 MAX_STATUS_TEXT = 2000
 HEARTBEAT = 20.0
 WATCH_INTERVAL = 0.5
+PARTIAL_PAGE = "report.partial.html"
 LOOPBACK = {"127.0.0.1", "localhost", "::1", "[::1]"}
 ACTION_FIELDS = ("id", "seq", "n", "action", "note", "state", "result")
 
@@ -149,6 +150,23 @@ class Session:
 
     def load(self):
         return rr().load(self.root, self.css_path)
+
+    def snapshot_page(self):
+        """The page as it stands, so a walk abandoned before Phase 4 still leaves one.
+
+        live=False drops the controls and the stream, which only work against a running
+        server, and this file is opened from disk long after the process is gone. Never
+        raises: a renderer bug must not take the watcher thread with it.
+        """
+        try:
+            session, beats, css, problems, _ = self.load()
+            render = rr()
+            page = render.SHELL + render.render(
+                session, beats, css, problems, live=False
+            )
+            _atomic_write(self.root / PARTIAL_PAGE, page.encode("utf-8"))
+        except Exception:
+            pass
 
     def fingerprint(self):
         return str(self.store.delivery_state()["render_revision"])
@@ -272,6 +290,7 @@ class Session:
             )
         except (OSError, sqlite3.Error, StoreError):
             last = None
+        self.snapshot_page()
         while not self.stop.wait(WATCH_INTERVAL):
             try:
                 delivery = self.store.delivery_state()
@@ -285,6 +304,7 @@ class Session:
                     with self.cond:
                         self.cond.notify_all()
                     self.publish()
+                    self.snapshot_page()
                 last = current
             except (OSError, sqlite3.Error, StoreError):
                 pass

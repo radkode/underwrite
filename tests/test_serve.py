@@ -518,6 +518,43 @@ class Watching(SessionTest):
         self.assertEqual(self.channel.get_nowait()["seq"], 1)
 
 
+class ThePartialPage(Watching):
+    """A walk that stops before Phase 4 used to leave a directory nobody could read."""
+
+    def page(self):
+        return (self.root / "report.partial.html").read_text(encoding="utf-8")
+
+    def test_serving_a_session_leaves_a_page_before_any_beat_is_resolved(self):
+        self.readings()
+
+        page = self.page()
+        self.assertTrue(page.startswith("<!doctype html>"))
+        self.assertIn('name="viewport"', page)
+
+    def test_the_page_left_behind_carries_no_control_that_needs_this_server(self):
+        self.readings()
+
+        page = self.page()
+        self.assertNotIn("<script", page)
+        self.assertNotIn('class="acts"', page)
+
+    def test_a_beat_committed_through_another_connection_reaches_the_file(self):
+        other = serve.SessionStore(self.root)
+        self.readings(lambda: other.put_beat(dict(FLAG, claim="written by the agent")))
+
+        self.assertIn("written by the agent", self.page())
+
+    def test_a_renderer_failure_neither_kills_the_watcher_nor_hides_the_change(self):
+        broken = lambda: (_ for _ in ()).throw(RuntimeError("renderer is broken"))
+        self.session.load = broken
+        other = serve.SessionStore(self.root)
+
+        self.readings(lambda: other.produce("external-action", None, "next", ""))
+
+        self.assertEqual(self.channel.get_nowait()["seq"], 1)
+        self.assertFalse((self.root / "report.partial.html").exists())
+
+
 class HotReload(SessionTest):
     """Editing the renderer mid-session used to do nothing while the CSS reloaded on
     every request, which is a confusing pair of rules to hold in your head at once."""

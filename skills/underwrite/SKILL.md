@@ -834,6 +834,7 @@ pr.bundle        frozen base and head Git objects, hash-bound to the target
 trusted-context.json  frozen base instructions, hash-bound to the target
 serve.json       running server URL and pid, removed when it exits
 report.html      rendered, regenerable, throwaway
+report.partial.html  the page as it stands, rewritten by the server on every change
 findings.md      derived export of the accepted findings, report audience only
 implementations/<link-id>/  one source-bound implementation child
   session.sqlite3           authoritative attempt, evidence, plan, and landing state
