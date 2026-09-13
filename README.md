@@ -286,7 +286,7 @@ failed` in branch mode, `Included, review pending` or `Review publication failed
 review mode. A final render uses `--final` and rejects any chosen branch or review delivery
 that has not landed. Report accepts are already terminal and require no landing. Review
 mode omits that flag only for the preview before its GitHub POST. The page still renders
-when validation fails.
+when validation fails, and each unproven card lists the checks it failed.
 `validate-anchors.py` snaps review comments to lines that exist in the diff and folds
 unsnappable ones into the body rather than dropping them.
 

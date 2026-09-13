@@ -79,6 +79,9 @@ MAX_STATUS_TEXT = 2000
 HEARTBEAT = 20.0
 WATCH_INTERVAL = 0.5
 PARTIAL_PAGE = "report.partial.html"
+# head_state is here because an apply can leave the body and every beat untouched,
+# and the page tells a stored call from one still waiting by it alone.
+WATCHED = ("session_id", "render_revision", "seq", "handled_seq", "head_state", "recovery")
 LOOPBACK = {"127.0.0.1", "localhost", "::1", "[::1]"}
 ACTION_FIELDS = ("id", "seq", "n", "action", "note", "state", "result")
 
@@ -286,9 +289,7 @@ class Session:
             delivery = self.store.delivery_state()
             last = tuple(
                 delivery[key]
-                for key in (
-                    "session_id", "render_revision", "seq", "handled_seq", "recovery"
-                )
+                for key in WATCHED
             )
         except (OSError, sqlite3.Error, StoreError):
             last = None
@@ -298,9 +299,7 @@ class Session:
                 delivery = self.store.delivery_state()
                 current = tuple(
                     delivery[key]
-                    for key in (
-                        "session_id", "render_revision", "seq", "handled_seq", "recovery"
-                    )
+                    for key in WATCHED
                 )
                 if last is not None and current != last:
                     with self.cond:

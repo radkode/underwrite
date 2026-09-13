@@ -75,6 +75,7 @@ LIVE_JS = """<script>
 (() => {
   const body = document.getElementById('live-body');
   const NAVIGATION = new Set(['next', 'back', 'skip']);
+  const LOST_AFTER_MS = 10000;
   let liveClass = 'live starting', liveText = 'connecting';
   let between = false, lastPhase = null, done = false;
   let armed = null, armTimer = null;
@@ -115,7 +116,7 @@ LIVE_JS = """<script>
     armed = {
       button,
       label,
-      message: `click again to ${verb.toLowerCase()}${which}, or wait`,
+      message: `click again to ${verb.toLowerCase()}${which} for good, or wait`,
     };
     button.textContent = `${verb}?`;
     button.classList.add('is-armed');
@@ -125,10 +126,17 @@ LIVE_JS = """<script>
 
   // A queued action disables the row, so the pill says why and how to get moving.
   // There is no listening variant: serve.py's wait() returns early on a pending head,
-  // so a walk can only park when nothing is outstanding.
-  function held(kind) {
-    return 'holding your ' + (kind || 'call')
-      + ' until the walk picks it up, or say it in the terminal';
+  // so a walk can only park when nothing is outstanding. An applied head is already
+  // stored, so it is not the reviewer's to repeat; a walk that failed or stopped still
+  // needs telling, which is the one thing the page cannot do.
+  const NOUNS = {
+    accept: 'decision', drop: 'decision', decide: 'decision', next: 'next beat',
+  };
+  function held(kind, headState) {
+    const noun = NOUNS[kind] || kind || 'call';
+    return headState === 'applied'
+      ? 'your ' + noun + ' is recorded; if the walk has stopped, tell it in the terminal'
+      : 'holding your ' + noun + ' until the walk picks it up, or say it in the terminal';
   }
 
   function paintLive(cls, text) {
@@ -162,6 +170,31 @@ LIVE_JS = """<script>
       if (value) sessionStorage.setItem(pendingKey, JSON.stringify(value));
       else sessionStorage.removeItem(pendingKey);
     } catch (_) {}
+  }
+
+  // A body swap keeps typed notes from the DOM; a reload has only this.
+  const draftKey = 'underwrite.note-drafts';
+  function storedDrafts() {
+    try {
+      const saved = JSON.parse(sessionStorage.getItem(draftKey));
+      return saved && saved.session_id === sessionId && saved.notes ? saved.notes : {};
+    } catch (_) { return {}; }
+  }
+  function keepDraft(key, value) {
+    if (!sessionId) return;
+    const notes = storedDrafts();
+    if (value) notes[key] = value; else delete notes[key];
+    try {
+      sessionStorage.setItem(draftKey, JSON.stringify({ session_id: sessionId, notes }));
+    } catch (_) {}
+  }
+  function restoreDrafts() {
+    const notes = storedDrafts();
+    document.querySelectorAll('.acts').forEach(row => {
+      const note = row.querySelector('.note');
+      const saved = notes[row.dataset.acts];
+      if (note && !note.value && saved) note.value = saved;
+    });
   }
 
   const beatIds = () => new Set([...document.querySelectorAll('.beat')].map(d => d.dataset.n));
@@ -216,7 +249,10 @@ LIVE_JS = """<script>
     const queued = state.seq !== state.handled_seq;
     observedSeq = state.seq;
     if (awaitingSeq !== null && observedSeq >= awaitingSeq) awaitingSeq = null;
-    if (pending && state.head_id === pending.id) remember(null);
+    if (pending && state.head_id === pending.id) {
+      keepDraft(rowKey(pending), '');
+      remember(null);
+    }
     // Done outranks away: a finished walk is not an unattended one, and its last
     // word stays on the page. Beat controls stay open, since Phase 4 has the
     // reviewer make any remaining calls off this page; only Next beat closes.
@@ -228,10 +264,10 @@ LIVE_JS = """<script>
     paintLive(
       'live ' + (done ? 'done' : listening ? phase : 'away'),
       queued
-        ? held(state.head_kind)
+        ? held(state.head_kind, state.head_state)
         : done || listening
           ? (status.text || phase)
-          : 'no walk is listening, your call is saved for whenever one returns'
+          : 'no walk is listening; a call made now is saved for when one returns'
     );
     between = queued && NAVIGATION.has(state.head_kind) && state.head_state === 'produced';
     paintStage();
@@ -282,6 +318,7 @@ LIVE_JS = """<script>
     wire();
     paintLive();
     paintStage();
+    restoreDrafts();
     restorePending();
     enable(!sending && connected && usable && awaitingSeq === null);
     rev = targetRev;
@@ -302,7 +339,7 @@ LIVE_JS = """<script>
       });
   }
 
-  async function sendAction(payload) {
+  async function sendAction(payload, row) {
     if (sending || !connected || !usable || awaitingSeq !== null
         || payload.session_id !== sessionId) return false;
     remember(payload);
@@ -326,6 +363,7 @@ LIVE_JS = """<script>
       awaitingSeq = Number.isInteger(receipt.seq) && receipt.seq > observedSeq
         ? receipt.seq : null;
       remember(null);
+      if (row !== undefined) keepDraft(row, '');
       showMessage(payload, payload.action === 'next' ? owedNote() : '');
     } catch (err) {
       showMessage(
@@ -397,7 +435,7 @@ LIVE_JS = """<script>
       restorePending();
       return;
     }
-    await sendAction(pending || fresh);
+    await sendAction(pending || fresh, n);
   }
 
   const wire = () => {
@@ -411,6 +449,13 @@ LIVE_JS = """<script>
   // ⌘/Ctrl+Enter fires the row's primary; outside a field, n is Next beat and f goes to
   // the first open flag. Enter never includes or implements on its own: the note field
   // is optional there, and a keystroke that reads as "save this" must not be terminal.
+  document.addEventListener('input', event => {
+    const target = event.target;
+    if (target && target.classList && target.classList.contains('note')) {
+      keepDraft(target.closest('.acts').dataset.acts, target.value);
+    }
+  });
+
   document.addEventListener('keydown', event => {
     const target = event.target;
     if (event.key === 'Escape') { disarm(); return; }
@@ -438,9 +483,16 @@ LIVE_JS = """<script>
     }
   });
 
+  // A restarted server takes a new port, so this tab can retry forever and never reach
+  // it. After a while, say where the walk will be instead.
+  const LOST = 'lost the server; if the walk serves again, open the new URL it gives you';
+  let lostTimer = null, lost = false;
   const stream = new EventSource('./events');
   stream.onmessage = event => {
     connected = true;
+    clearTimeout(lostTimer);
+    lostTimer = null;
+    lost = false;
     const state = JSON.parse(event.data);
     applyState(state);
     resumePending();
@@ -449,8 +501,15 @@ LIVE_JS = """<script>
   stream.onerror = () => {
     connected = false;
     resumedPending = false;
-    paintLive('live down', 'reconnecting');
+    // Every retry errors again, so the lost message has to survive the next repaint.
+    paintLive('live down', lost ? LOST : 'reconnecting');
     enable(false);
+    if (!lostTimer) {
+      lostTimer = setTimeout(() => {
+        lost = true;
+        paintLive('live down', LOST);
+      }, LOST_AFTER_MS);
+    }
   };
 
   known = beatIds();
@@ -703,6 +762,17 @@ def beat_html(
         rows.append(f"<dt{cls}>{key}</dt><dd{cls}>{md(value)}</dd>")
 
     body = [f'<dl class="slots">{"".join(rows)}</dl>']
+    if problems:
+        prefix = f"beat {n}: "
+        reasons = "".join(
+            f"<li>{md(p[len(prefix):] if p.startswith(prefix) else p)}</li>"
+            for p in problems
+        )
+        body.insert(
+            0,
+            '<div class="unproven-why"><span class="lbl">Unproven</span>'
+            f"<ul>{reasons}</ul></div>",
+        )
     if beat.get("diff"):
         body.append(diff_html(beat["diff"]))
     if beat.get("call"):

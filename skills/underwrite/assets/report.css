@@ -691,6 +691,26 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
 /* The beat that just left folds up under the ghost until the ledger takes it. */
 .stage.is-between .beat { opacity: 0.55; }
 
+/* Why the chip is there, in the same place a reviewer reads the beat: the renderer's own
+   checks, so it must not read like a verdict about the code. */
+.unproven-why {
+  background: var(--flag-bg);
+  padding: 9px 14px;
+  border-radius: 3px;
+  font-size: 13px;
+  color: var(--ink);
+}
+.unproven-why .lbl {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--flag);
+  display: block;
+  margin-bottom: 2px;
+}
+.unproven-why ul { margin: 0; padding-left: 18px; }
+
 /* Named .shipped, not .landed: .next-row.landed already exists in What lands,
    and a bare .landed rule silently overrode that section's grid. */
 .shipped {
