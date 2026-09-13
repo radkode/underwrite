@@ -412,6 +412,20 @@ class ReportOrdering(unittest.TestCase):
         html = rr.render({"repo": "r"}, [beat(n=1)], "", {1: ["beat 1: no what"]})
         self.assertIn("unproven", html)
 
+    def test_the_card_says_why_a_beat_is_unproven(self):
+        html = rr.render(
+            {"repo": "r"}, [beat(n=1)], "",
+            {1: ["beat 1: no what", "beat 1: proof names no command or path:line"]},
+        )
+        why = html.split('<div class="unproven-why">')[1].split("</div>")[0]
+        self.assertIn("<li>no what</li>", why)
+        self.assertIn("<li>proof names no command or path:line</li>", why)
+        self.assertNotIn("beat 1:", why)
+
+    def test_a_proven_beat_has_no_reasons_block(self):
+        html = rr.render({"repo": "r"}, [beat(n=1)], "", {})
+        self.assertNotIn("unproven-why", html)
+
 
 class TheWalk(unittest.TestCase):
     """While a walk is listening the newest beat leads the page on its own, with the
@@ -1645,6 +1659,27 @@ class RenderCli(unittest.TestCase):
         self.assertIn("body: JSON.stringify(payload)", page)
         response_guard = page.index("if (!sent.ok)")
         self.assertGreater(page.index("remember(null)", response_guard), response_guard)
+
+    def test_the_page_names_why_each_held_or_lost_state_is_held(self):
+        """DD-2362: the page went quiet or said the wrong thing in states it could name.
+        Behaviour is driven in a browser; these pin the strings that behaviour reads."""
+        self.put(beat(n=1))
+        self.run_cli("--live")
+
+        page = self.page()
+        # an applied head is stored; only a produced one needs saying again
+        self.assertIn("held(state.head_kind, state.head_state)", page)
+        # a stored call is not the reviewer's to repeat, but a stopped walk still needs telling
+        self.assertIn("is recorded; if the walk has stopped, tell it in the terminal", page)
+        # a restarted server is on a new port, so the tab says where to look
+        self.assertIn("open the new URL it gives you", page)
+        self.assertIn("clearTimeout(lostTimer)", page)
+        # a resolution is one-way, and the confirm says so
+        self.assertIn("for good, or wait", page)
+        # a typed note outlives a reload, and a sent one does not come back
+        self.assertIn("sessionStorage.setItem(draftKey", page)
+        self.assertIn("if (row !== undefined) keepDraft(row, '')", page)
+        self.assertLess(page.index("restoreDrafts();"), page.index("restorePending();\n"))
 
     def test_live_first_sync_and_content_swaps_preserve_drafts(self):
         self.put(beat(n=1))

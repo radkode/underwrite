@@ -517,6 +517,16 @@ class Watching(SessionTest):
         self.readings(lambda: other.produce("external-action", None, "next", ""))
         self.assertEqual(self.channel.get_nowait()["seq"], 1)
 
+    def test_an_apply_that_changes_nothing_else_still_reaches_the_page(self):
+        """A navigation apply can leave the body and every beat alone, so the only thing
+        that moves is the head's state, and the held pill reads it."""
+        other = serve.SessionStore(self.root)
+        action = other.produce("external-next", None, "next", "")
+        session = other.snapshot()[0]
+        result = {"kind": "walk", "current_beat": 1}
+        self.readings(lambda: other.apply(action["seq"], result, session=session))
+        self.assertEqual(self.channel.get_nowait()["head_state"], "applied")
+
 
 class ThePartialPage(Watching):
     """A walk that stops before Phase 4 used to leave a directory nobody could read."""
