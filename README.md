@@ -49,6 +49,8 @@ rest.
 **Plan.** Every changed file is tiered into core, enabling, follow-through, and risk. The
 second decision: walk it in that order, reorder it, skip a tier, or move a file that got
 tiered wrong. Both decisions arrive as named options, not as a question you have to infer.
+Your answers are kept in your words beside the reconstruction and claim check: the
+finished page opens on them, and a live walk folds them to one line above the facts.
 
 **Walk.** One beat per turn, opening with a verdict token and running on fixed lines:
 

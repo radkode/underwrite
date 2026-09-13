@@ -52,6 +52,12 @@ class BeforeThePageOpens(unittest.TestCase):
         ):
             self.assertIn(option, text)
 
+    def test_both_answers_are_recorded_with_what_they_answered(self):
+        text = self.skill()
+        for key in ("`reconstruction`", "`claim_check`", "`orient_call`", "`plan_call`"):
+            self.assertIn(key, text)
+        self.assertIn("with the reviewer's answer in their own words", text)
+
     def test_the_options_are_offered_through_a_selectable_control(self):
         text = self.skill()
         self.assertIn("structured question tool", text)

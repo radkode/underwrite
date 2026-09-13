@@ -1004,6 +1004,48 @@ class CitedLocations(unittest.TestCase):
         self.assertIn("apps/web/src/lib/mcp/scopes.ts:53", html)
 
 
+class TheFrame(unittest.TestCase):
+    """Orient and plan happen before the page exists, so the page is where they survive."""
+
+    SESSION = {
+        "repo": "acme/widget", "number": 42, "title": "t",
+        "facts": ["merged, 3 files"],
+        "reconstruction": "closes the hole `S0` left",
+        "claim_check": "the body holds up",
+        "orient_call": "confirm",
+        "plan_call": "Walk it in this order",
+    }
+
+    def test_a_session_without_one_renders_none_of_it(self):
+        html = rr.render({"repo": "r", "facts": ["x"]}, [], "", {})
+        self.assertNotIn('class="frame"', html)
+
+    def test_a_final_page_opens_on_it_between_the_title_and_the_facts(self):
+        html = rr.render(self.SESSION, [], "", {})
+        order = [
+            html.index(marker)
+            for marker in ("</h1>", '<details class="frame" open>', 'class="facts"', 'id="live-body"')
+        ]
+        self.assertEqual(order, sorted(order))
+        self.assertIn("<dd>closes the hole <code>S0</code> left</dd>", html)
+        self.assertIn("<dd>the body holds up</dd>", html)
+
+    def test_a_live_walk_folds_it_to_the_reviewers_answers(self):
+        html = rr.render(self.SESSION, [], "", {}, live=True, phase="parked")
+        summary = html.split('<details class="frame"><summary>')[1].split("</summary>")[0]
+        self.assertIn("<q>confirm</q>", summary)
+        self.assertIn("<q>Walk it in this order</q>", summary)
+
+    def test_prose_with_no_recorded_answer_is_still_labelled(self):
+        html = rr.render({"repo": "r", "reconstruction": "what it is for"}, [], "", {})
+        self.assertIn('<summary><span class="frame-k">Orient</span></summary>', html)
+
+    def test_the_reviewers_words_cannot_carry_markup(self):
+        session = dict(self.SESSION, orient_call="<img src=x onerror=alert(1)>")
+        html = rr.render(session, [], "", {})
+        self.assertNotIn("<img", html)
+
+
 class Escaping(unittest.TestCase):
     """Beat content is author-controlled but quotes code from the PR under review."""
 

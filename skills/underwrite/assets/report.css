@@ -167,6 +167,34 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
 }
 .facts b { color: var(--ink); font-weight: 600; }
 
+/* ---- frame ----
+   The reviewer's two answers stay on the summary line, so the folded live frame still
+   says what the walk was agreed to be. */
+.frame summary {
+  cursor: pointer;
+  width: fit-content;
+  font-size: 14px;
+  color: var(--ink);
+}
+.frame summary::marker { color: var(--ink-3); }
+.frame summary:hover::marker { color: var(--ink); }
+.frame summary:focus-visible { outline: 2px solid var(--flag); outline-offset: 2px; }
+.frame .frame-k,
+.frame dt {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.frame .frame-k { margin: 0 8px 0 4px; }
+.frame .sep { color: var(--rule); margin: 0 10px; }
+.frame q { font-style: normal; }
+.frame dl { margin: 12px 0 0; max-width: 68ch; }
+.frame dd { margin: 2px 0 16px; }
+.frame dd:last-child { margin-bottom: 0; }
+.frame[open] { padding-bottom: 12px; }
+
 /* ---- count strip ---- */
 
 .counts {
@@ -443,7 +471,7 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
 .slots dd.fix { padding-top: 14px; font-weight: 560; }
 .slots dt.fix { padding-top: 19px; }
 
-.slots dd code, .b-claim code, .facts code, .next code {
+.slots dd code, .b-claim code, .facts code, .next code, .frame code {
   font-family: var(--mono);
   font-size: 0.87em;
   background: var(--sunk);
