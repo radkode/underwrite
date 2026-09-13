@@ -158,6 +158,13 @@ class ActionDeliveryContract(unittest.TestCase):
         self.assertNotIn("start at `seq`", rule)
         self.assertNotIn("returned `handled_seq`", rule)
 
+    def test_the_ack_comes_before_anything_the_reviewer_reads(self):
+        """A walk that narrated its beat and then acked left the page holding every
+        control in between, which on dailydeck#1499 read as a page that had died."""
+        rule = " ".join(self.waiting_rule().split())
+        self.assertIn("before you write anything the reviewer will read", rule)
+        self.assertNotIn("acknowledge the exact reply before parking again", rule)
+
     def test_http_failures_are_visible(self):
         text = self.skill()
         self.assertNotIn("curl -s ", text)

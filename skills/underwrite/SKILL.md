@@ -434,18 +434,21 @@ then post `done` with a one-line summary before Phase 4. The page closes the sta
 at a walk that appears to be waiting.
 
 After the local effect and any required external effect are durable, acknowledge the
-exact reply before parking again:
+exact reply, and do it before you write anything the reviewer will read. Until the ack the
+page holds every control for that action, so a beat narrated first leaves the reviewer
+facing a page that died one click after they used it. For a navigation reply the order is
+apply, ack, present the beat, then park. The terminal message is the part that can wait:
 
 ```bash
 $S/scripts/sessionctl.py ack "$R" <seq>
 ```
 
 If the same `seq` returns after a restart with `state: applied`, its stored absolute
-`result` is the receipt. Present from the authoritative session without moving again,
-then inspect `reconcile` before any external effect. If a pending or failed delivery is
-marked `blocked`, do not execute it; start a supervised replacement. Finish only an
-unblocked external delivery still owed, then acknowledge it. Repeating `apply`, `land`,
-or `ack` with the same absolute inputs is safe; conflicting inputs are refused.
+`result` is the receipt. Do not move again; inspect `reconcile` before any external
+effect. If a pending or failed delivery is marked `blocked`, do not execute it; start a
+supervised replacement. Finish only an unblocked external delivery still owed, acknowledge
+the seq, and present from the authoritative session after the ack. Repeating `apply`,
+`land`, or `ack` with the same absolute inputs is safe; conflicting inputs are refused.
 
 **Resolving a flag.** The reviewer chooses the named action or drops the flag in the same
 beat, from the page or in words. In branch mode, Implement authorizes applying the stated
@@ -517,9 +520,9 @@ audience alone never changes an accepted finding to `decided`.
 In `report` mode, Include in report posts `accept`. The store moves the beat to `accepted`
 with delivery state `none`; the accepted beat in SQLite is the durable report outcome, and
 every export rewrites `findings.md` from it so the finding is readable without the store.
-Name that absolute path in the terminal on the first accept of a session.
 Acknowledge the applied accept immediately. It is terminal and has no external delivery
-to reconcile. Do not call `land`, create a `lands[]` entry, or use `report.html` as a
+to reconcile. Then name that absolute path in the terminal on the first accept of a
+session. Do not call `land`, create a `lands[]` entry, or use `report.html` as a
 receipt. Acceptance freezes the agent-authored finding text and evidence. Refine them
 before presenting the beat, not after the reviewer includes it.
 
