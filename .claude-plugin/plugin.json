@@ -1,7 +1,7 @@
 {
   "name": "underwrite",
   "description": "Interactive PR review, one beat at a time. Reconstructs what a change is for, walks it in causal order while the reviewer steers, and ends the way the target calls for: commits on a branch, one GitHub review, or a recorded report.",
-  "version": "0.6.2",
+  "version": "0.6.3",
   "author": {
     "name": "Jacek Radko",
     "email": "jacekradko@gmail.com"
