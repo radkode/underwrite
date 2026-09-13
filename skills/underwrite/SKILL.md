@@ -258,6 +258,12 @@ invent the correction themselves, which is the work you are supposed to be doing
 Their correction frames the rest of the walk, which is why it earns a stop of its own: it
 costs seconds here and a whole session later.
 
+**Record the frame once they answer.** Through `patch-session`, store `reconstruction` and
+`claim_check` as they stand after the answer, and `orient_call` with the reviewer's answer
+in their own words. The page opens on these, so write plain sentences: Markdown emphasis
+and lists arrive literally. A supervised replacement asks again, because an answer given
+against another snapshot is not this session's call.
+
 ## Phase 2: plan the walk
 
 Tier every changed file, show the plan, and let the reviewer reorder or skip before you
@@ -283,7 +289,8 @@ reconstruction, with its own named options:
 - **Move a file to another tier** you tiered something wrong
 
 This is a ten second interaction whose job is to fix your misclassifications cheaply and
-put the reviewer in the driver's seat immediately.
+put the reviewer in the driver's seat immediately. Once they answer, patch `plan_call`
+with their answer in their own words, and `plan` again if it changed.
 
 ## Phase 3: walk
 

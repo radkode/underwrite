@@ -59,6 +59,8 @@ SECTIONS = (
 )
 
 LANDS_TAG = {"landed": "Landed", "ready": "Ready", "open": "Your call"}
+FRAME_PROSE = (("reconstruction", "Reconstruction"), ("claim_check", "Claim check"))
+FRAME_CALLS = (("orient_call", "Orient"), ("plan_call", "Plan"))
 
 # Only for --standalone. The viewport tag is load-bearing: report.css has a
 # 620px breakpoint that never fires without it.
@@ -1049,6 +1051,25 @@ def body_html(session, beats, problems_by_n, live=False, phase=None, paths=()):
     return "\n".join(parts)
 
 
+def frame_html(session, live):
+    """The pre-walk decisions. Folded while a walk is live, since the reviewer just read
+    them; open for anyone reading the page afterwards, who never saw the terminal."""
+    prose = [(label, session.get(key)) for key, label in FRAME_PROSE if session.get(key)]
+    calls = [(label, session.get(key)) for key, label in FRAME_CALLS if session.get(key)]
+    if not prose and not calls:
+        return ""
+    summary = '<span class="sep">·</span>'.join(
+        f'<span class="frame-k">{label}</span><q>{md(text)}</q>' for label, text in calls
+    ) or '<span class="frame-k">Orient</span>'
+    body = "".join(f"<dt>{label}</dt><dd>{md(text)}</dd>" for label, text in prose)
+    if body:
+        body = f"<dl>{body}</dl>"
+    return (
+        f'<details class="frame"{"" if live else " open"}>'
+        f"<summary>{summary}</summary>{body}</details>"
+    )
+
+
 def render(session, beats, css, problems_by_n, live=False, phase=None, paths=()):
     target = session.get("target") if isinstance(session.get("target"), dict) else {}
     number = session.get("number") or target.get("number")
@@ -1072,6 +1093,9 @@ def render(session, beats, css, problems_by_n, live=False, phase=None, paths=())
         f'</div><h1><span class="num">{html.escape(label)}</span> '
         f'{md(session.get("title", ""))}</h1>'
     )
+    frame = frame_html(session, live)
+    if frame:
+        parts.append(frame)
     facts_values = list(session.get("facts") or [])
     if session_mode(session) == "report":
         facts_values.append("Outcome: report only")
