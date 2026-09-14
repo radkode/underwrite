@@ -1143,6 +1143,71 @@ class TheMastheadReference(unittest.TestCase):
                 self.assertNotIn("<a href", self.eyebrow({"target": target}))
 
 
+class TheFrozenHead(unittest.TestCase):
+    """What was read. Before this the page named the PR and never the commit."""
+
+    TARGET = {
+        "kind": "github_pr", "repo": "acme/widget", "number": 42, "head_sha": "b" * 40,
+    }
+    PATHS = ("src/app.py",)
+
+    def facts(self, session, paths=None):
+        html = rr.render(
+            session, [], "", {}, paths=self.PATHS if paths is None else paths
+        )
+        return html.split('class="facts"')[1].split("</header>")[0] if 'class="facts"' in html else ""
+
+    def test_the_strip_opens_on_the_short_sha_and_it_opens_the_commit(self):
+        out = self.facts({"target": self.TARGET, "facts": ["merged, 2 files"]})
+
+        self.assertIn(
+            'Head: <a href="https://github.com/acme/widget/commit/' + "b" * 40
+            + '" target="_blank" rel="noreferrer noopener">bbbbbbb</a>',
+            out,
+        )
+        self.assertLess(out.index("Head:"), out.index("merged, 2 files"))
+
+    def test_it_is_the_whole_strip_when_the_walk_recorded_no_facts(self):
+        self.assertIn("bbbbbbb", self.facts({"target": self.TARGET}))
+
+    def test_no_frozen_diff_means_no_sha_at_all(self):
+        """An unproven target is one the store never wrote, so the page states nothing."""
+        self.assertNotIn("Head:", self.facts({"target": self.TARGET}, paths=()))
+
+    def test_a_branch_session_names_no_commit(self):
+        out = self.facts({"repo": "acme/widget", "head": "c" * 40, "facts": ["2 files"]})
+
+        self.assertNotIn("Head:", out)
+
+    def test_a_free_form_repo_over_a_frozen_target_names_no_commit(self):
+        out = self.facts({"target": self.TARGET, "repo": "acme/decoy"})
+
+        self.assertNotIn("Head:", out)
+
+    def test_a_target_that_is_not_a_pr_names_no_commit(self):
+        out = self.facts({"target": dict(self.TARGET, kind="branch")})
+
+        self.assertNotIn("Head:", out)
+
+    def test_a_free_form_head_over_a_frozen_target_names_no_commit(self):
+        """The h1 falls back to that head, so the page would show two shas as one walk."""
+        out = self.facts({"target": self.TARGET, "head": "c" * 40})
+
+        self.assertNotIn("Head:", out)
+
+    def test_a_free_form_number_over_a_frozen_target_names_no_commit(self):
+        out = self.facts({"target": self.TARGET, "number": 7})
+
+        self.assertNotIn("Head:", out)
+
+    def test_a_sha_that_is_not_a_sha_never_reaches_the_href(self):
+        for head in ("../../evil", "B" * 40, "b" * 39, "", None):
+            with self.subTest(head=head):
+                target = dict(self.TARGET, head_sha=head)
+
+                self.assertNotIn("Head:", self.facts({"target": target}))
+
+
 class Escaping(unittest.TestCase):
     """Beat content is author-controlled but quotes code from the PR under review."""
 
@@ -1400,12 +1465,12 @@ class RenderCli(unittest.TestCase):
         (self.root / "beats" / ("%02d.json" % b["n"])).write_text(
             json.dumps(b), encoding="utf-8")
 
-    def frozen_store(self, state="closed", merged_at=None):
+    def frozen_store(self, state="closed", merged_at=None, diff="diff\n"):
         (self.root / "session.json").unlink()
         source = self.root / "capture.diff"
         metadata = self.root / "capture.json"
         context = self.root / "trusted-context.json"
-        source.write_text("diff\n", encoding="utf-8")
+        source.write_text(diff, encoding="utf-8")
         metadata.write_text("{}\n", encoding="utf-8")
         context.write_text(
             json.dumps({
@@ -1429,6 +1494,26 @@ class RenderCli(unittest.TestCase):
 
     def page(self, name="report.html"):
         return (self.root / name).read_text(encoding="utf-8")
+
+    def test_the_masthead_links_the_pr_and_its_head_through_the_real_entry_point(self):
+        """The allowlist the links are gated on is built by the store, not by a caller."""
+        store = self.frozen_store(diff="diff --git a/src/app.py b/src/app.py\n")
+        store.put_beat(beat(n=1))
+
+        done = self.run_cli()
+
+        self.assertEqual(done.returncode, 0)
+        self.assertIn('href="https://github.com/acme/widget/pull/42"', self.page())
+        self.assertIn(
+            'href="https://github.com/acme/widget/commit/' + "b" * 40 + '"', self.page()
+        )
+
+    def test_a_frozen_pr_with_nothing_in_its_diff_links_nothing(self):
+        store = self.frozen_store()
+        store.put_beat(beat(n=1))
+
+        self.assertEqual(self.run_cli().returncode, 0)
+        self.assertNotIn("https://github.com/acme/widget", self.page())
 
     def test_a_clean_session_exits_0_and_writes_the_page(self):
         self.put(beat(n=1))
