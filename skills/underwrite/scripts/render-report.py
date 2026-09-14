@@ -678,6 +678,7 @@ def delivery_html(beat, mode, replacement=False, untrusted_pr=False):
 LOCATION_LINE = re.compile(r"^(?P<path>.+?):(?P<line>\d+)(?:[-,]\d+)*$")
 # owner/name as GitHub spells it. A dot-led segment is one a browser resolves away.
 PULL_REPO = re.compile(r"(?!\.)[A-Za-z0-9_.-]+/(?!\.)[A-Za-z0-9_.-]+")
+FULL_SHA = re.compile(r"[0-9a-f]{40}")
 
 
 def changed_paths(root, session):
@@ -1142,20 +1143,36 @@ def frame_html(session, live):
     )
 
 
-def pull_href(target, repo, number, paths):
-    """The masthead link. The frozen diff is what proves the store is behind the target,
-    the way it does for a cited path, and the link is offered only when the identity the
-    page displays is that target's, so the destination cannot differ from the label."""
+def linked_repo(target, repo, number, head, paths):
+    """The repo the masthead's links may name: the frozen target's, and only when every
+    piece of identity the page displays is that target's too, so a link can never send
+    the reviewer somewhere the page did not say. A non-empty frozen diff is what proves
+    the store is behind the target at all, exactly as it does for a cited path."""
     if not paths or target.get("kind") != "github_pr":
+        return None
+    if target.get("repo") != repo or not PULL_REPO.fullmatch(str(repo)):
         return None
     frozen = target.get("number")
     if any(isinstance(n, bool) or not isinstance(n, int) for n in (frozen, number)):
         return None
-    if frozen != number:
+    if frozen != number or target.get("head_sha") != head:
         return None
-    if target.get("repo") != repo or not PULL_REPO.fullmatch(str(repo)):
+    if not isinstance(head, str) or not FULL_SHA.fullmatch(head):
         return None
-    return f"https://github.com/{quote(repo)}/pull/{frozen}"
+    return quote(repo)
+
+
+def head_html(linked, head):
+    """The head the walk is frozen against, which the page never named before. Shown only
+    where it can be linked, so the strip states no sha the store does not stand behind:
+    everything else on that line is the walk's own prose."""
+    if linked is None:
+        return None
+    href = f"https://github.com/{linked}/commit/{head}"
+    return (
+        f'<span>Head: <a href="{attr(href)}" target="_blank" rel="noreferrer noopener">'
+        f"{html.escape(head[:7])}</a></span>"
+    )
 
 
 def render(session, beats, css, problems_by_n, live=False, phase=None, paths=()):
@@ -1164,6 +1181,7 @@ def render(session, beats, css, problems_by_n, live=False, phase=None, paths=())
     repo = session.get("repo") or target.get("repo", "")
     head = session.get("head") or target.get("head_sha", "")
     label = f"#{number}" if number else head[:7]
+    linked = linked_repo(target, repo, number, head, paths)
 
     parts = [
         f'<title>{html.escape(label)} underwrite · {html.escape(repo)}</title>',
@@ -1174,8 +1192,8 @@ def render(session, beats, css, problems_by_n, live=False, phase=None, paths=())
     ]
     if number:
         ref = f"pull/{md(number)}"
-        href = pull_href(target, repo, number, paths)
-        if href:
+        if linked:
+            href = f"https://github.com/{linked}/pull/{number}"
             ref = (
                 f'<a href="{attr(href)}" target="_blank" rel="noreferrer noopener">'
                 f"{ref}</a>"
@@ -1206,9 +1224,12 @@ def render(session, beats, css, problems_by_n, live=False, phase=None, paths=())
     elif execution == "no_exec":
         facts_values.append("Execution: No-exec, legacy PR")
         facts_values.append("Trust: untrusted PR head")
-    if facts_values:
-        facts = "".join(f"<span>{md(f)}</span>" for f in facts_values)
-        parts.append(f'<div class="facts">{facts}</div>')
+    facts = [f"<span>{md(f)}</span>" for f in facts_values]
+    frozen_head = head_html(linked, head)
+    if frozen_head:
+        facts.insert(0, frozen_head)
+    if facts:
+        parts.append(f'<div class="facts">{"".join(facts)}</div>')
     parts.append("</header>")
 
     parts.append('<div id="live-body">')
