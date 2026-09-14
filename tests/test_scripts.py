@@ -1060,6 +1060,89 @@ class TheFrame(unittest.TestCase):
         self.assertNotIn("<img", html)
 
 
+class TheMastheadReference(unittest.TestCase):
+    """The PR the walk is about. The number is the store's, so it can be a link."""
+
+    TARGET = {
+        "kind": "github_pr", "repo": "acme/widget", "number": 42, "head_sha": "b" * 40,
+    }
+    PATHS = ("src/app.py",)
+
+    def eyebrow(self, session, paths=None):
+        html = rr.render(
+            session, [], "", {}, paths=self.PATHS if paths is None else paths
+        )
+        return html.split('class="eyebrow"')[1].split("</h1>")[0]
+
+    def test_a_frozen_pr_opens_on_github(self):
+        out = self.eyebrow({"target": self.TARGET})
+
+        self.assertIn(
+            '<a href="https://github.com/acme/widget/pull/42"'
+            ' target="_blank" rel="noreferrer noopener">pull/42</a>',
+            out,
+        )
+
+    def test_nothing_links_when_the_session_has_no_frozen_diff(self):
+        """No allowlist means no store behind the target, so the identity is unchecked."""
+        out = self.eyebrow({"target": self.TARGET}, paths=())
+
+        self.assertNotIn("<a href", out)
+        self.assertIn("pull/42", out)
+
+    def test_a_target_with_no_number_shows_no_reference_at_all(self):
+        out = self.eyebrow({"target": dict(self.TARGET, number=None)})
+
+        self.assertNotIn("pull/", out)
+
+    def test_a_branch_session_keeps_the_plain_line(self):
+        out = self.eyebrow({"repo": "acme/widget", "head": "c" * 40})
+
+        self.assertNotIn("pull/", out)
+        self.assertIn("acme/widget", out)
+
+    def test_a_legacy_pr_carries_its_number_in_free_form_keys_so_it_stays_text(self):
+        out = self.eyebrow({"repo": "acme/widget", "number": 42})
+
+        self.assertNotIn("<a href", out)
+        self.assertIn("pull/42", out)
+
+    def test_a_free_form_number_over_a_frozen_target_links_to_neither(self):
+        """The href would name one PR while the page names another."""
+        out = self.eyebrow({"target": self.TARGET, "number": 7})
+
+        self.assertNotIn("<a href", out)
+        self.assertIn("pull/7", out)
+
+    def test_a_free_form_repo_over_a_frozen_target_links_to_neither(self):
+        out = self.eyebrow({"target": self.TARGET, "repo": "acme/decoy"})
+
+        self.assertNotIn("<a href", out)
+        self.assertIn("acme/decoy", out)
+
+    def test_a_number_that_only_compares_equal_is_not_the_same_reference(self):
+        """42.0 renders as "pull/42.0" and would link to /pull/42."""
+        out = self.eyebrow({"target": self.TARGET, "number": 42.0})
+
+        self.assertNotIn("<a href", out)
+        self.assertIn("pull/42.0", out)
+
+    def test_a_hostile_number_cannot_reach_the_href(self):
+        out = self.eyebrow(
+            {"target": self.TARGET, "number": '42" onmouseover="alert(1)'}
+        )
+
+        self.assertNotIn("<a href", out)
+        self.assertNotIn('onmouseover="alert(1)"', out)
+
+    def test_a_repo_that_is_not_owner_slash_name_stays_text(self):
+        for repo in ("javascript:alert(1)", "../acme/widget", "../widget", "acme/."):
+            with self.subTest(repo=repo):
+                target = dict(self.TARGET, repo=repo)
+
+                self.assertNotIn("<a href", self.eyebrow({"target": target}))
+
+
 class Escaping(unittest.TestCase):
     """Beat content is author-controlled but quotes code from the PR under review."""
 
