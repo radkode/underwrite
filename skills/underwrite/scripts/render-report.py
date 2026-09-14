@@ -681,6 +681,13 @@ PULL_REPO = re.compile(r"(?!\.)[A-Za-z0-9_.-]+/(?!\.)[A-Za-z0-9_.-]+")
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
 
 
+def stored(root):
+    """Whether the page is rendering a document the store validated. A legacy session
+    reaches the page as raw JSON on purpose, and some of them cannot migrate into the
+    store at all, so nothing in such a body has been checked by anything."""
+    return (root / "session.sqlite3").exists()
+
+
 def changed_paths(root, session):
     """The frozen allowlist, empty when there is no PR to link into."""
     target = session.get("target")
@@ -688,9 +695,8 @@ def changed_paths(root, session):
         return ()
     if not (target.get("repo") and target.get("head_sha")):
         return ()
-    # A legacy session reaches the page without the store on purpose, and some of them
-    # cannot migrate into it at all. Reading the allowlist must not attempt that write.
-    if not (root / "session.sqlite3").exists():
+    # Reading the allowlist must not attempt the migration write a legacy session needs.
+    if not stored(root):
         return ()
     try:
         return tuple(SessionStore(root).changed_paths())
@@ -1143,30 +1149,39 @@ def frame_html(session, live):
     )
 
 
-def linked_repo(target, repo, number, head, paths):
-    """The repo the masthead's links may name: the frozen target's, and only when every
-    piece of identity the page displays is that target's too, so a link can never send
-    the reviewer somewhere the page did not say. A non-empty frozen diff is what proves
-    the store is behind the target at all, exactly as it does for a cited path."""
-    if not paths or target.get("kind") != "github_pr":
+def frozen_identity(session):
+    """What the store says the session is about. A frozen target, or the legacy PR marker
+    for a session that predates targets: both are guarded and immutable once written,
+    where the repo and number beside them in the body are free-form."""
+    target = session.get("target")
+    if isinstance(target, dict) and target.get("kind") == "github_pr":
+        return target
+    legacy = session.get("legacy_pr")
+    return legacy if isinstance(legacy, dict) else None
+
+
+def linked_repo(identity, repo, number, is_stored):
+    """The repo the masthead's links may name: the frozen one, and only when the identity
+    the page displays is that same one, so a link can never send the reviewer somewhere
+    the page did not say. Nothing links off the store, where nothing was ever checked."""
+    if not is_stored or identity is None:
         return None
-    if target.get("repo") != repo or not PULL_REPO.fullmatch(str(repo)):
+    if identity.get("repo") != repo or not PULL_REPO.fullmatch(str(repo)):
         return None
-    frozen = target.get("number")
+    frozen = identity.get("number")
     if any(isinstance(n, bool) or not isinstance(n, int) for n in (frozen, number)):
         return None
-    if frozen != number or target.get("head_sha") != head:
-        return None
-    if not isinstance(head, str) or not FULL_SHA.fullmatch(head):
+    if frozen != number:
         return None
     return quote(repo)
 
 
-def head_html(linked, head):
-    """The head the walk is frozen against, which the page never named before. Shown only
-    where it can be linked, so the strip states no sha the store does not stand behind:
-    everything else on that line is the walk's own prose."""
-    if linked is None:
+def head_html(linked, identity):
+    """The head the walk is frozen against, which the page never named before. A legacy
+    PR session has none: it froze an identity and never a commit, so it says nothing
+    here rather than naming the tip of a branch that has moved since."""
+    head = identity.get("head_sha") if identity else None
+    if linked is None or not isinstance(head, str) or not FULL_SHA.fullmatch(head):
         return None
     href = f"https://github.com/{linked}/commit/{head}"
     return (
@@ -1175,13 +1190,17 @@ def head_html(linked, head):
     )
 
 
-def render(session, beats, css, problems_by_n, live=False, phase=None, paths=()):
+def render(
+    session, beats, css, problems_by_n, live=False, phase=None, paths=(),
+    is_stored=False,
+):
     target = session.get("target") if isinstance(session.get("target"), dict) else {}
     number = session.get("number") or target.get("number")
     repo = session.get("repo") or target.get("repo", "")
     head = session.get("head") or target.get("head_sha", "")
     label = f"#{number}" if number else head[:7]
-    linked = linked_repo(target, repo, number, head, paths)
+    identity = frozen_identity(session)
+    linked = linked_repo(identity, repo, number, is_stored)
 
     parts = [
         f'<title>{html.escape(label)} underwrite · {html.escape(repo)}</title>',
@@ -1225,7 +1244,7 @@ def render(session, beats, css, problems_by_n, live=False, phase=None, paths=())
         facts_values.append("Execution: No-exec, legacy PR")
         facts_values.append("Trust: untrusted PR head")
     facts = [f"<span>{md(f)}</span>" for f in facts_values]
-    frozen_head = head_html(linked, head)
+    frozen_head = head_html(linked, identity)
     if frozen_head:
         facts.insert(0, frozen_head)
     if facts:
@@ -1364,7 +1383,7 @@ def main():
     out = Path(args.out).expanduser() if args.out else root / "report.html"
     page = render(
         session, beats, css, problems_by_n, args.live,
-        paths=changed_paths(root, session),
+        paths=changed_paths(root, session), is_stored=stored(root),
     )
     out.write_text(SHELL + page if args.standalone else page, encoding="utf-8")
 

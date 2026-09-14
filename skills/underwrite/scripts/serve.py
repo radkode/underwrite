@@ -111,6 +111,8 @@ class Session:
         self.findings = self.store.export_json()["findings"]
         # The frozen diff never moves, so its allowlist is read once per session.
         self.paths = rr().changed_paths(root, self.store.snapshot()[0])
+        # Constructing the store above migrates a legacy directory into one.
+        self.stored = rr().stored(root)
         self.cond = threading.Condition()
         self.lock = threading.Lock()
         self.subscribers = []
@@ -167,7 +169,8 @@ class Session:
             session, beats, css, problems, _ = self.load()
             render = rr()
             page = render.SHELL + render.render(
-                session, beats, css, problems, live=False, paths=self.paths
+                session, beats, css, problems, live=False, paths=self.paths,
+                is_stored=self.stored,
             )
             _atomic_write(self.root / PARTIAL_PAGE, page.encode("utf-8"))
         except Exception:
@@ -392,7 +395,7 @@ class Handler(BaseHTTPRequestHandler):
                 page = render.SHELL + render.render(
                     session, beats, css, problems, live=True,
                     phase=self.session.status.get("phase"),
-                    paths=self.session.paths,
+                    paths=self.session.paths, is_stored=self.session.stored,
                 )
                 return self.send(200, page, "text/html")
             if route == "/fragment":
