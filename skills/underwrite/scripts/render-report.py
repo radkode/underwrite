@@ -676,6 +676,8 @@ def delivery_html(beat, mode, replacement=False, untrusted_pr=False):
 
 
 LOCATION_LINE = re.compile(r"^(?P<path>.+?):(?P<line>\d+)(?:[-,]\d+)*$")
+# owner/name as GitHub spells it. A dot-led segment is one a browser resolves away.
+PULL_REPO = re.compile(r"(?!\.)[A-Za-z0-9_.-]+/(?!\.)[A-Za-z0-9_.-]+")
 
 
 def changed_paths(root, session):
@@ -1140,6 +1142,22 @@ def frame_html(session, live):
     )
 
 
+def pull_href(target, repo, number, paths):
+    """The masthead link. The frozen diff is what proves the store is behind the target,
+    the way it does for a cited path, and the link is offered only when the identity the
+    page displays is that target's, so the destination cannot differ from the label."""
+    if not paths or target.get("kind") != "github_pr":
+        return None
+    frozen = target.get("number")
+    if any(isinstance(n, bool) or not isinstance(n, int) for n in (frozen, number)):
+        return None
+    if frozen != number:
+        return None
+    if target.get("repo") != repo or not PULL_REPO.fullmatch(str(repo)):
+        return None
+    return f"https://github.com/{quote(repo)}/pull/{frozen}"
+
+
 def render(session, beats, css, problems_by_n, live=False, phase=None, paths=()):
     target = session.get("target") if isinstance(session.get("target"), dict) else {}
     number = session.get("number") or target.get("number")
@@ -1155,7 +1173,14 @@ def render(session, beats, css, problems_by_n, live=False, phase=None, paths=())
         f'<span>{md(repo)}</span>',
     ]
     if number:
-        parts.append(f'<span class="sep">/</span><span>pull/{md(number)}</span>')
+        ref = f"pull/{md(number)}"
+        href = pull_href(target, repo, number, paths)
+        if href:
+            ref = (
+                f'<a href="{attr(href)}" target="_blank" rel="noreferrer noopener">'
+                f"{ref}</a>"
+            )
+        parts.append(f'<span class="sep">/</span><span>{ref}</span>')
     parts.append('<span class="sep">·</span><span>underwrite</span>')
     if session.get("date"):
         parts.append(f'<span class="sep">·</span><span>{md(session["date"])}</span>')

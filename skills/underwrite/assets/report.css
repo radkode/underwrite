@@ -145,6 +145,20 @@ body {
   align-items: center;
 }
 .eyebrow .sep { color: var(--rule); }
+/* The PR reference is the one live thing on this line, and the underline is the whole
+   signal: a second ink here would compete with the title and say nothing more. The
+   padding is hit area, and the margin gives it back to the line. */
+.eyebrow a {
+  color: var(--ink-3);
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 3px;
+  padding: 6px 2px;
+  margin: -6px -2px;
+}
+.eyebrow a:hover,
+.eyebrow a:focus-visible { color: var(--ink); }
+.eyebrow a:focus-visible { outline: 2px solid var(--flag); outline-offset: 2px; }
 
 h1 {
   font-size: clamp(28px, 4.5vw, 40px);
