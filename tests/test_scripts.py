@@ -1066,12 +1066,10 @@ class TheMastheadReference(unittest.TestCase):
     TARGET = {
         "kind": "github_pr", "repo": "acme/widget", "number": 42, "head_sha": "b" * 40,
     }
-    PATHS = ("src/app.py",)
+    LEGACY = {"repo": "acme/widget", "number": 42}
 
-    def eyebrow(self, session, paths=None):
-        html = rr.render(
-            session, [], "", {}, paths=self.PATHS if paths is None else paths
-        )
+    def eyebrow(self, session, is_stored=True):
+        html = rr.render(session, [], "", {}, is_stored=is_stored)
         return html.split('class="eyebrow"')[1].split("</h1>")[0]
 
     def test_a_frozen_pr_opens_on_github(self):
@@ -1083,12 +1081,28 @@ class TheMastheadReference(unittest.TestCase):
             out,
         )
 
-    def test_nothing_links_when_the_session_has_no_frozen_diff(self):
-        """No allowlist means no store behind the target, so the identity is unchecked."""
-        out = self.eyebrow({"target": self.TARGET}, paths=())
+    def test_nothing_links_off_the_store(self):
+        """A legacy directory reaches the page as raw JSON that nothing ever checked."""
+        out = self.eyebrow({"target": self.TARGET}, is_stored=False)
 
         self.assertNotIn("<a href", out)
         self.assertIn("pull/42", out)
+
+    def test_a_legacy_pr_session_links_from_its_guarded_marker(self):
+        """It froze an identity and never a target, and the store guards that identity."""
+        out = self.eyebrow(
+            {"legacy_pr": self.LEGACY, "repo": "acme/widget", "number": 42}
+        )
+
+        self.assertIn('href="https://github.com/acme/widget/pull/42"', out)
+
+    def test_a_legacy_pr_session_that_drifted_off_its_marker_links_nothing(self):
+        out = self.eyebrow(
+            {"legacy_pr": self.LEGACY, "repo": "acme/widget", "number": 7}
+        )
+
+        self.assertNotIn("<a href", out)
+        self.assertIn("pull/7", out)
 
     def test_a_target_with_no_number_shows_no_reference_at_all(self):
         out = self.eyebrow({"target": dict(self.TARGET, number=None)})
@@ -1149,13 +1163,11 @@ class TheFrozenHead(unittest.TestCase):
     TARGET = {
         "kind": "github_pr", "repo": "acme/widget", "number": 42, "head_sha": "b" * 40,
     }
-    PATHS = ("src/app.py",)
-
-    def facts(self, session, paths=None):
-        html = rr.render(
-            session, [], "", {}, paths=self.PATHS if paths is None else paths
-        )
-        return html.split('class="facts"')[1].split("</header>")[0] if 'class="facts"' in html else ""
+    def facts(self, session, is_stored=True):
+        html = rr.render(session, [], "", {}, is_stored=is_stored)
+        if 'class="facts"' not in html:
+            return ""
+        return html.split('class="facts"')[1].split("</header>")[0]
 
     def test_the_strip_opens_on_the_short_sha_and_it_opens_the_commit(self):
         out = self.facts({"target": self.TARGET, "facts": ["merged, 2 files"]})
@@ -1170,9 +1182,17 @@ class TheFrozenHead(unittest.TestCase):
     def test_it_is_the_whole_strip_when_the_walk_recorded_no_facts(self):
         self.assertIn("bbbbbbb", self.facts({"target": self.TARGET}))
 
-    def test_no_frozen_diff_means_no_sha_at_all(self):
-        """An unproven target is one the store never wrote, so the page states nothing."""
-        self.assertNotIn("Head:", self.facts({"target": self.TARGET}, paths=()))
+    def test_off_the_store_there_is_no_sha_at_all(self):
+        """A target the store never wrote is one nothing has checked."""
+        self.assertNotIn("Head:", self.facts({"target": self.TARGET}, is_stored=False))
+
+    def test_a_legacy_pr_session_names_no_head_because_it_froze_none(self):
+        session = {
+            "legacy_pr": {"repo": "acme/widget", "number": 42},
+            "repo": "acme/widget", "number": 42, "facts": ["merged, 2 files"],
+        }
+
+        self.assertNotIn("Head:", self.facts(session))
 
     def test_a_branch_session_names_no_commit(self):
         out = self.facts({"repo": "acme/widget", "head": "c" * 40, "facts": ["2 files"]})
@@ -1189,11 +1209,12 @@ class TheFrozenHead(unittest.TestCase):
 
         self.assertNotIn("Head:", out)
 
-    def test_a_free_form_head_over_a_frozen_target_names_no_commit(self):
-        """The h1 falls back to that head, so the page would show two shas as one walk."""
+    def test_a_free_form_head_beside_a_frozen_target_is_not_the_one_named(self):
+        """The strip states the store's sha, never the one the walk typed beside it."""
         out = self.facts({"target": self.TARGET, "head": "c" * 40})
 
-        self.assertNotIn("Head:", out)
+        self.assertIn("bbbbbbb", out)
+        self.assertNotIn("ccccccc", out)
 
     def test_a_free_form_number_over_a_frozen_target_names_no_commit(self):
         out = self.facts({"target": self.TARGET, "number": 7})
@@ -1508,12 +1529,26 @@ class RenderCli(unittest.TestCase):
             'href="https://github.com/acme/widget/commit/' + "b" * 40 + '"', self.page()
         )
 
-    def test_a_frozen_pr_with_nothing_in_its_diff_links_nothing(self):
+    def test_a_frozen_pr_links_even_when_its_diff_names_no_file(self):
+        """The store is what the links rest on, not the contents of the diff."""
         store = self.frozen_store()
         store.put_beat(beat(n=1))
 
         self.assertEqual(self.run_cli().returncode, 0)
-        self.assertNotIn("https://github.com/acme/widget", self.page())
+        self.assertIn('href="https://github.com/acme/widget/pull/42"', self.page())
+
+    def test_a_target_that_never_reached_the_store_links_nothing(self):
+        """A session.json target is JSON a walk wrote, and the page cannot tell whose."""
+        self.session({
+            "repo": "acme/widget", "number": 42,
+            "target": dict(pr_target(), repo="attacker/lure"),
+        })
+        self.put(beat(n=1))
+
+        done = self.run_cli()
+
+        self.assertIn("wrote", done.stderr)
+        self.assertNotIn("<a href", self.page())
 
     def test_a_clean_session_exits_0_and_writes_the_page(self):
         self.put(beat(n=1))
