@@ -337,7 +337,7 @@ def render_findings(session, beats):
         tier = _one_line(beat.get("tier") or "")
         if tier:
             bullets.append(f"- **Tier** {tier}")
-        slots = beat.get("slots") or {}
+        slots = canonical_slots(beat.get("slots") or {})
         for slot in BEAT_SLOTS:
             value = _one_line(slots.get(slot) or "")
             if value:
@@ -526,6 +526,7 @@ class SessionStore:
                 raise StoreError("handled_override is only valid during legacy migration")
             self._upgrade_schema()
             self._verify_version()
+            self._refresh_findings()
             _fsync_directory(self.root)
 
     # ---- connection and schema ---------------------------------------
@@ -927,6 +928,23 @@ class SessionStore:
                 "UPDATE session SET render_revision = render_revision + 1 "
                 "WHERE singleton = 1"
             )
+
+    def _refresh_findings(self):
+        """A beat an authorization pinned keeps the spelling it was signed with, so no
+        repair and no later write would ever bring its prose to the one file that carries
+        a finding off the store."""
+        with self._read() as db:
+            session = json.loads(self._session_row(db)["body_json"])
+            if self._audience_mode(session) != "report":
+                return
+            beats = [
+                json.loads(row["body_json"])
+                for row in db.execute("SELECT * FROM beats ORDER BY n")
+            ]
+        path = self.root / FINDINGS_FILE
+        payload = render_findings(session, beats).encode("utf-8")
+        if not path.exists() or path.read_bytes() != payload:
+            _atomic_write(path, payload)
 
     def _verify_version(self):
         db = self._connect()
@@ -3424,6 +3442,10 @@ class SessionStore:
             beats = []
             for row in db.execute("SELECT * FROM beats ORDER BY n"):
                 beat = json.loads(row["body_json"])
+                # An authorization pins a beat's bytes, so the repair passes it over and
+                # the spelling a pre-SQLite walk used survives here and nowhere else.
+                if isinstance(beat.get("slots"), dict):
+                    beat["slots"] = canonical_slots(beat["slots"])
                 delivery = (
                     json.loads(row["delivery_json"])
                     if row["delivery_json"]
