@@ -1667,7 +1667,8 @@ class RenderCli(unittest.TestCase):
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
             db.execute("PRAGMA user_version = 5")
         findings = self.root / "findings.md"
-        self.assertNotIn("- **WHAT**", findings.read_text(encoding="utf-8"))
+        # What a build that could not read these keys left on disk.
+        findings.write_text("# Findings: acme/widget#42\n", encoding="utf-8")
 
         done = self.run_cli()
 
