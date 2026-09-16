@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-DB_SCHEMA_VERSION = 5
+DB_SCHEMA_VERSION = 6
 SCHEMA_VERSION = 1
 DELIVERY_VERSION = 1
 FINDINGS_FILE = "findings.md"
@@ -110,6 +110,22 @@ class Conflict(StoreError):
 
 class MigrationError(StoreError):
     pass
+
+
+def canonical_slots(slots):
+    """Slot keys as the contract spells them. A pre-SQLite walk wrote WHAT and WHY, and
+    every reader since iterates BEAT_SLOTS, so that prose sits on disk and renders as an
+    empty beat. Anything that is not a slot is left alone for validate_beat to report."""
+    if not isinstance(slots, dict):
+        return slots
+    canonical = {}
+    for key, value in slots.items():
+        name = key.lower() if isinstance(key, str) else key
+        name = name if name in BEAT_SLOTS else key
+        if name in canonical:
+            return slots
+        canonical[name] = value
+    return canonical
 
 
 def _now():
@@ -669,7 +685,7 @@ class SessionStore:
             version = db.execute("PRAGMA user_version").fetchone()[0]
             if version == DB_SCHEMA_VERSION:
                 return
-            if version not in (1, 2, 3, 4):
+            if version not in range(1, DB_SCHEMA_VERSION):
                 raise StoreError(f"unsupported session database version {version}")
             db.execute("BEGIN IMMEDIATE")
             row = db.execute(
@@ -699,6 +715,8 @@ class SessionStore:
                     "CREATE UNIQUE INDEX IF NOT EXISTS session_identity "
                     "ON session(session_id)"
                 )
+            # Before the repairs below, which all read the six lowercase keys.
+            self._canonical_slot_keys(db)
             if version in (1, 2):
                 self._restore_failed_fix_intents(db)
             if version in (1, 2, 3):
@@ -858,6 +876,41 @@ class SessionStore:
                     beat.pop("slots", None)
             else:
                 continue
+            db.execute(
+                "UPDATE beats SET revision = revision + 1, body_json = ? WHERE n = ?",
+                (_dump(beat), row["n"]),
+            )
+            changed = True
+        if changed:
+            db.execute(
+                "UPDATE session SET render_revision = render_revision + 1 "
+                "WHERE singleton = 1"
+            )
+
+    def _canonical_slot_keys(self, db):
+        """Repair beats a pre-SQLite walk wrote in upper case. The renderer reads six
+        lowercase keys, so until this runs the page shows the claim and no prose.
+
+        A beat an implementation link froze is left alone: that authorization pins these
+        exact bytes, and rewriting them would refuse the child it was signed for."""
+        changed = False
+        pinned = ()
+        if db.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+            "AND name = 'implementation_links'"
+        ).fetchone():
+            pinned = {
+                row["source_beat"]
+                for row in db.execute("SELECT source_beat FROM implementation_links")
+            }
+        for row in db.execute("SELECT n, body_json FROM beats").fetchall():
+            if row["n"] in pinned:
+                continue
+            beat = json.loads(row["body_json"])
+            slots = canonical_slots(beat.get("slots"))
+            if slots == beat.get("slots"):
+                continue
+            beat["slots"] = slots
             db.execute(
                 "UPDATE beats SET revision = revision + 1, body_json = ? WHERE n = ?",
                 (_dump(beat), row["n"]),
@@ -1493,6 +1546,8 @@ class SessionStore:
             raise StoreError("beat must be an object")
         beat = _copy(document)
         _positive(beat.get("n"), "beat n")
+        if isinstance(beat.get("slots"), dict):
+            beat["slots"] = canonical_slots(beat["slots"])
         if (
             "resolution_kind" in beat
             and beat["resolution_kind"] not in RESOLUTION_KINDS
@@ -1507,6 +1562,10 @@ class SessionStore:
         canonical = _copy(beat)
         if canonical.get("state") == "flag":
             canonical.setdefault("resolution_kind", "delivery")
+        # An action snapshot keeps the spelling it was written with, so a replay after
+        # the upgrade compares a repaired beat against an unrepaired copy of itself.
+        if isinstance(canonical.get("slots"), dict):
+            canonical["slots"] = canonical_slots(canonical["slots"])
         return canonical
 
     def _audience_mode(self, session):

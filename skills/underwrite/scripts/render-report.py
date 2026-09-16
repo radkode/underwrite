@@ -35,6 +35,7 @@ from session_store import (
     BEAT_SLOTS as SLOTS,
     SessionStore,
     StoreError,
+    canonical_slots,
     validate_beat,
 )
 
@@ -1272,10 +1273,16 @@ def load(root, css_path, final=False):
             session, beats = SessionStore(root).presentation_snapshot()
             legacy = False
         else:
-            beats = [
-                json.loads(p.read_text(encoding="utf-8"))
-                for p in sorted((root / "beats").glob("*.json"))
-            ]
+            # The store canonicalizes these keys on the way in. A legacy session
+            # never went through it, and an unread slot renders as an empty beat.
+            beats = []
+            for path in sorted((root / "beats").glob("*.json")):
+                stored_beat = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(stored_beat, dict) and isinstance(
+                    stored_beat.get("slots"), dict
+                ):
+                    stored_beat["slots"] = canonical_slots(stored_beat["slots"])
+                beats.append(stored_beat)
     else:
         session, beats = SessionStore(root).presentation_snapshot()
     css = css_path.read_text(encoding="utf-8")

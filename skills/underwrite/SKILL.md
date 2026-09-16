@@ -899,7 +899,8 @@ reviewer answers. `accepted` is the durable state behind Implement, Include in r
 Include in report; `decided` is the outcome behind Record decision. Set top-level
 `resolution_kind` to `decision` only when the answer itself completes the work. New
 ordinary flags persist `delivery`; imported legacy beats may omit it. `slots` accepts only
-the six keys from rule 2. `diff` is a list of raw lines, classified on the first character.
+the six keys from rule 2, spelled lower case: `what`, `why`, `proof`, `risk`, `prior`,
+`fix`. Rule 2 shows how the page labels them, not how the store spells them. `diff` is a list of raw lines, classified on the first character.
 `lands[]` entries are `{state: landed|ready|open, what, where}`.
 
 `landed` names what an accepted beat became: a commit SHA in `branch` mode, the review URL

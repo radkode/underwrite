@@ -1492,7 +1492,7 @@ class CreatingAndMigrating(StoreCase):
 
     def test_the_database_and_export_format_are_versioned(self):
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
             self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "delete")
         db = self.store._connect()
         try:
@@ -1512,7 +1512,7 @@ class CreatingAndMigrating(StoreCase):
 
         self.assertNotIn("execution_policy", upgraded.snapshot()[0])
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
 
     def test_the_session_identity_survives_restart_but_not_recreation(self):
         first = self.store.delivery_state()["session_id"]
@@ -1537,7 +1537,7 @@ class CreatingAndMigrating(StoreCase):
         self.assertEqual(upgraded.head()["action_id"], action["action_id"])
         self.assertTrue(upgraded.delivery_state()["session_id"])
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
             columns = {row[1] for row in db.execute("PRAGMA table_info(session)")}
         self.assertIn("session_id", columns)
 
@@ -1559,7 +1559,33 @@ class CreatingAndMigrating(StoreCase):
         failed = upgraded.presentation_snapshot()[1][0]["delivery"]
         self.assertEqual(failed["owed"], "retry with the fixture")
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
+
+    def test_a_v2_upgrade_strips_a_failure_injected_fix_written_in_upper_case(self):
+        """The restore reads the six lowercase keys, so the slot repair has to run before
+        it or the delivery error is what the beat ends up presenting as its fix."""
+        beat = self.beat(1)
+        beat["slots"].pop("fix")
+        self.store.put_beat(beat)
+        action = self.store.produce("click-1", 1, "accept", "yes")
+        self.store.fail(action["seq"], "tests failed", "retry with the fixture")
+        beat = self.beat(1)
+        beat["slots"] = {key.upper(): value for key, value in beat["slots"].items()}
+        beat["slots"]["FIX"] = "retry with the fixture"
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            db.execute(
+                "UPDATE beats SET body_json = ? WHERE n = 1",
+                (json.dumps(beat),),
+            )
+            db.execute("PRAGMA user_version = 2")
+
+        upgraded = session_store.SessionStore(self.root)
+
+        slots = upgraded.snapshot()[1][0]["slots"]
+
+        self.assertNotIn("fix", slots)
+        self.assertNotIn("FIX", slots)
+        self.assertEqual(slots["what"], beat["slots"]["WHAT"])
 
     def test_a_v2_upgrade_removes_a_failure_injected_fix(self):
         beat = self.beat(1)
@@ -1637,17 +1663,101 @@ class CreatingAndMigrating(StoreCase):
         self.assertEqual(errors, [])
         self.assertEqual(len(calls), 1)
 
+    def test_an_action_applied_before_the_repair_still_replays_after_it(self):
+        """The action snapshot keeps the spelling it was written with, and a replay of
+        an interrupted effect is the documented recovery."""
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            row = db.execute("SELECT body_json FROM beats WHERE n = 1").fetchone()
+            beat = json.loads(row[0])
+            beat["slots"] = {"WHAT": "does a thing", "RISK": "r", "FIX": "f"}
+            db.execute(
+                "UPDATE beats SET body_json = ? WHERE n = 1", (json.dumps(beat),)
+            )
+        produced = self.store.produce("nav-1", None, "next", "")
+        session, beats = self.store.snapshot()
+        applied = self.store.apply(
+            produced["seq"], {"kind": "walk", "cursor": 2}, session=session, beats=beats
+        )
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            db.execute("PRAGMA user_version = 5")
+
+        upgraded = session_store.SessionStore(self.root)
+        replayed = upgraded.apply(
+            produced["seq"], {"kind": "walk", "cursor": 2}, session=session, beats=beats
+        )
+
+        self.assertEqual(replayed["state"], applied["state"])
+        self.assertEqual(upgraded.snapshot()[1][0]["slots"]["what"], "does a thing")
+
+    def test_a_v5_upgrade_reads_the_slots_a_pre_sqlite_walk_wrote_in_upper_case(self):
+        """The prose was never lost, only unread: every reader iterates BEAT_SLOTS."""
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            row = db.execute("SELECT body_json FROM beats WHERE n = 1").fetchone()
+            beat = json.loads(row[0])
+            beat["slots"] = {"WHAT": "does a thing", "PROOF": "a.ts:1"}
+            db.execute(
+                "UPDATE beats SET body_json = ? WHERE n = 1", (json.dumps(beat),)
+            )
+            db.execute("PRAGMA user_version = 5")
+
+        upgraded = session_store.SessionStore(self.root)
+
+        self.assertEqual(
+            upgraded.snapshot()[1][0]["slots"],
+            {"what": "does a thing", "proof": "a.ts:1"},
+        )
+
+    def test_the_upgrade_leaves_a_beat_whose_keys_would_collide(self):
+        """Folding one onto the other would drop a slot, which is the bug, not the fix."""
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            row = db.execute("SELECT body_json FROM beats WHERE n = 1").fetchone()
+            beat = json.loads(row[0])
+            beat["slots"] = {"what": "lower", "WHAT": "upper"}
+            db.execute(
+                "UPDATE beats SET body_json = ? WHERE n = 1", (json.dumps(beat),)
+            )
+            db.execute("PRAGMA user_version = 5")
+
+        upgraded = session_store.SessionStore(self.root)
+
+        self.assertEqual(
+            upgraded.snapshot()[1][0]["slots"], {"what": "lower", "WHAT": "upper"}
+        )
+
+    def test_a_beat_written_in_upper_case_is_stored_as_the_contract_spells_it(self):
+        self.store.put_beat(
+            {"n": 2, "state": "clean", "claim": "c",
+             "slots": {"WHAT": "does a thing", "PROOF": "a.ts:1"}}
+        )
+
+        stored = next(b for b in self.store.snapshot()[1] if b["n"] == 2)
+
+        self.assertEqual(stored["slots"], {"what": "does a thing", "proof": "a.ts:1"})
+
+    def test_a_key_that_is_no_slot_at_all_is_left_for_validation_to_report(self):
+        self.store.put_beat(
+            {"n": 2, "state": "clean", "claim": "c",
+             "slots": {"WHAT": "does a thing", "BANANA": "x"}}
+        )
+
+        stored = next(b for b in self.store.snapshot()[1] if b["n"] == 2)
+
+        self.assertEqual(sorted(stored["slots"]), ["BANANA", "what"])
+        self.assertIn(
+            "beat 2: unknown slot 'BANANA'", session_store.validate_beat(stored)
+        )
+
     def test_a_future_database_is_refused_without_changing_its_journal_mode(self):
         (self.root / "session.sqlite3").unlink()
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
             self.assertEqual(db.execute("PRAGMA journal_mode = WAL").fetchone()[0], "wal")
-            db.execute("PRAGMA user_version = 6")
+            db.execute("PRAGMA user_version = 7")
 
         with self.assertRaisesRegex(session_store.StoreError, "newer than supported"):
             session_store.SessionStore(self.root)
 
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 7)
             self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
 
     def test_legacy_actions_without_an_ack_migrate_as_handled(self):
@@ -2991,6 +3101,31 @@ class LinkedImplementations(unittest.TestCase):
         with self.assertRaisesRegex(session_store.Conflict, "verified output"):
             child.prepare_implementation_land(1, 1, base)
 
+    def test_the_slot_repair_leaves_a_beat_an_authorization_froze(self):
+        """The link pins these exact bytes, so repairing them would refuse its child."""
+        link = self.authorize()
+        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+            row = db.execute("SELECT body_json FROM beats WHERE n = 1").fetchone()
+            beat = json.loads(row[0])
+            beat["slots"] = {"WHAT": "does a thing", "FIX": "pin it"}
+            body = json.dumps(beat)
+            db.execute("UPDATE beats SET body_json = ? WHERE n = 1", (body,))
+            db.execute(
+                "UPDATE implementation_links SET source_beat_json = ?, "
+                "source_beat_sha256 = ?",
+                (body, hashlib.sha256(body.encode("utf-8")).hexdigest()),
+            )
+            db.execute("PRAGMA user_version = 5")
+
+        upgraded = session_store.SessionStore(self.source_root)
+
+        self.assertEqual(
+            sorted(upgraded.snapshot()[1][0]["slots"]), ["FIX", "WHAT"]
+        )
+        created = upgraded.create_linked_implementation(link["link_id"])
+
+        self.assertTrue(created["child_session_id"])
+
     def test_v4_upgrade_adds_authority_tables_without_changing_session_state(self):
         before = self.source.snapshot()
         with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
@@ -3008,7 +3143,7 @@ class LinkedImplementations(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
             }
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
         self.assertIn("implementation_links", names)
         self.assertIn("implementation_attempts", names)
 

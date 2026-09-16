@@ -1550,6 +1550,24 @@ class RenderCli(unittest.TestCase):
         self.assertIn("wrote", done.stderr)
         self.assertNotIn("<a href", self.page())
 
+    def test_a_legacy_beat_written_in_upper_case_still_renders_its_prose(self):
+        """Its page was the claim and an empty body, and exit 2 blamed the missing slots."""
+        self.put({
+            "n": 1, "state": "flag", "claim": "the comment promises too much",
+            "slots": {
+                "WHAT": "one concurrency group", "WHY": "applies exactly once",
+                "PROOF": "migrate.yml:25", "RISK": "read as an ordering guarantee",
+                "FIX": "correct the comment",
+            },
+        })
+
+        done = self.run_cli()
+
+        self.assertEqual(done.returncode, 0)
+        self.assertNotIn("unknown slot", done.stderr)
+        self.assertIn("one concurrency group", self.page())
+        self.assertIn("correct the comment", self.page())
+
     def test_a_clean_session_exits_0_and_writes_the_page(self):
         self.put(beat(n=1))
         done = self.run_cli()
