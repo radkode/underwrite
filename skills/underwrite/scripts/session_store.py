@@ -2479,6 +2479,10 @@ class SessionStore:
             child_beat.pop(name, None)
         child_beat["state"] = "accepted"
         child_beat["call"] = link["approval"]
+        # The child is born at the current version, so no later repair can reach it. A
+        # link frozen before the slot keys were canonical is the one source that carries
+        # them, and the seed is the only write into beats outside this builder.
+        child_beat = child._beat_document(child_beat)
         timestamp = _now()
         with child._write() as db:
             row = child._session_row(db)

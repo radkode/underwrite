@@ -3123,8 +3123,12 @@ class LinkedImplementations(unittest.TestCase):
             sorted(upgraded.snapshot()[1][0]["slots"]), ["FIX", "WHAT"]
         )
         created = upgraded.create_linked_implementation(link["link_id"])
+        child = session_store.SessionStore(Path(created["child_root"]))
 
         self.assertTrue(created["child_session_id"])
+        self.assertEqual(
+            child.snapshot()[1][0]["slots"], {"what": "does a thing", "fix": "pin it"}
+        )
 
     def test_v4_upgrade_adds_authority_tables_without_changing_session_state(self):
         before = self.source.snapshot()
