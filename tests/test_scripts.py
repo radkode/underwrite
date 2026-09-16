@@ -1644,6 +1644,36 @@ class RenderCli(unittest.TestCase):
         self.assertIn("Outcome: report only", self.page())
         self.assertNotIn("<h2>What lands</h2>", self.page())
 
+    def test_rendering_a_repaired_report_rewrites_its_findings_file(self):
+        """Report mode has no delivery, so findings.md is where an accepted finding is
+        readable once the session directory's tooling is gone."""
+        store = self.frozen_store()
+        store.put_beat(beat(
+            n=1,
+            state="flag",
+            slots={"what": "x", "proof": "a.ts:1", "risk": "r", "fix": "f"},
+        ))
+        store.ack(store.produce("accept-1", 1, "accept", "include it")["seq"])
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            row = db.execute("SELECT body_json FROM beats WHERE n = 1").fetchone()
+            finding = json.loads(row[0])
+            finding["slots"] = {
+                key.upper(): value for key, value in finding["slots"].items()
+            }
+            db.execute(
+                "UPDATE beats SET body_json = ? WHERE n = 1", (json.dumps(finding),)
+            )
+        store.export_json()
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            db.execute("PRAGMA user_version = 5")
+        findings = self.root / "findings.md"
+        self.assertNotIn("- **WHAT**", findings.read_text(encoding="utf-8"))
+
+        done = self.run_cli()
+
+        self.assertEqual(done.returncode, 0)
+        self.assertIn("- **WHAT** x", findings.read_text(encoding="utf-8"))
+
     def test_a_report_with_zero_accepts_has_an_explicit_outcome(self):
         store = self.frozen_store()
         store.put_beat(beat(n=1, state="clean"))
