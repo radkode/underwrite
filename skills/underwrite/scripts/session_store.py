@@ -688,6 +688,8 @@ class SessionStore:
             if version not in range(1, DB_SCHEMA_VERSION):
                 raise StoreError(f"unsupported session database version {version}")
             db.execute("BEGIN IMMEDIATE")
+            # Nothing between here and the gate below writes a row but the repairs.
+            before = db.total_changes
             row = db.execute(
                 "SELECT format_version FROM session WHERE singleton = 1"
             ).fetchone()
@@ -722,6 +724,10 @@ class SessionStore:
             if version in (1, 2, 3):
                 self._default_legacy_execution_policy(db)
             self._create_implementation_tables(db)
+            if db.total_changes != before:
+                # Derived from rows a repair just rewrote, and before the commit, so a
+                # failed write takes the repair with it and the next open retries both.
+                self._export_locked(db)
             db.execute(f"PRAGMA user_version = {DB_SCHEMA_VERSION}")
             db.execute("COMMIT")
         except Exception:
@@ -4156,67 +4162,70 @@ class SessionStore:
     def export_json(self):
         with self._session_lock():
             with self._read() as db:
-                session_row = self._session_row(db)
-                session = json.loads(session_row["body_json"])
-                session["schema_version"] = session_row["format_version"]
-                beats = [
-                    json.loads(row["body_json"])
-                    for row in db.execute("SELECT * FROM beats ORDER BY n")
-                ]
-                actions = list(db.execute("SELECT * FROM actions ORDER BY seq"))
-                handled = self._handled_seq(db)
+                return self._export_locked(db)
 
-                beat_dir = self.root / "beats"
-                beat_dir.mkdir(parents=True, exist_ok=True)
-                expected = set()
-                for beat in beats:
-                    path = beat_dir / f"{beat['n']:02d}.json"
-                    expected.add(path.name)
-                    payload = json.dumps(beat, indent=2, ensure_ascii=False) + "\n"
-                    _atomic_write(path, payload.encode("utf-8"))
-                for path in beat_dir.glob("*.json"):
-                    if path.name not in expected:
-                        path.unlink()
-                _fsync_directory(beat_dir)
+    def _export_locked(self, db):
+        session_row = self._session_row(db)
+        session = json.loads(session_row["body_json"])
+        session["schema_version"] = session_row["format_version"]
+        beats = [
+            json.loads(row["body_json"])
+            for row in db.execute("SELECT * FROM beats ORDER BY n")
+        ]
+        actions = list(db.execute("SELECT * FROM actions ORDER BY seq"))
+        handled = self._handled_seq(db)
 
-                records = "".join(
-                    json.dumps(
-                        {
-                            "seq": row["seq"],
-                            "action_id": row["action_id"],
-                            "n": row["beat_n"],
-                            "action": row["kind"],
-                            "note": row["note"],
-                            "delivery_version": DELIVERY_VERSION,
-                        },
-                        ensure_ascii=False,
-                        separators=(",", ":"),
-                    ) + "\n"
-                    for row in actions
+        beat_dir = self.root / "beats"
+        beat_dir.mkdir(parents=True, exist_ok=True)
+        expected = set()
+        for beat in beats:
+            path = beat_dir / f"{beat['n']:02d}.json"
+            expected.add(path.name)
+            payload = json.dumps(beat, indent=2, ensure_ascii=False) + "\n"
+            _atomic_write(path, payload.encode("utf-8"))
+        for path in beat_dir.glob("*.json"):
+            if path.name not in expected:
+                path.unlink()
+        _fsync_directory(beat_dir)
+
+        records = "".join(
+            json.dumps(
+                {
+                    "seq": row["seq"],
+                    "action_id": row["action_id"],
+                    "n": row["beat_n"],
+                    "action": row["kind"],
+                    "note": row["note"],
+                    "delivery_version": DELIVERY_VERSION,
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ) + "\n"
+            for row in actions
+        )
+        _atomic_write(self.root / "decisions.jsonl", records.encode("utf-8"))
+        _atomic_write(
+            self.root / "ack.json",
+            (
+                json.dumps(
+                    {"version": DELIVERY_VERSION, "handled_seq": handled},
+                    indent=2,
                 )
-                _atomic_write(self.root / "decisions.jsonl", records.encode("utf-8"))
-                _atomic_write(
-                    self.root / "ack.json",
-                    (
-                        json.dumps(
-                            {"version": DELIVERY_VERSION, "handled_seq": handled},
-                            indent=2,
-                        )
-                        + "\n"
-                    ).encode(),
-                )
-                session_payload = json.dumps(
-                    session, indent=2, ensure_ascii=False
-                ) + "\n"
-                _atomic_write(
-                    self.root / "session.json", session_payload.encode("utf-8")
-                )
-                findings = None
-                if self._audience_mode(session) == "report":
-                    findings = self.root / FINDINGS_FILE
-                    _atomic_write(
-                        findings, render_findings(session, beats).encode("utf-8")
-                    )
+                + "\n"
+            ).encode(),
+        )
+        session_payload = json.dumps(
+            session, indent=2, ensure_ascii=False
+        ) + "\n"
+        _atomic_write(
+            self.root / "session.json", session_payload.encode("utf-8")
+        )
+        findings = None
+        if self._audience_mode(session) == "report":
+            findings = self.root / FINDINGS_FILE
+            _atomic_write(
+                findings, render_findings(session, beats).encode("utf-8")
+            )
         return {
             "session": str(self.root / "session.json"),
             "beats": len(beats),

@@ -505,6 +505,69 @@ class FrozenTargets(unittest.TestCase):
             (self.root / "findings.md").read_text(encoding="utf-8"),
         )
 
+    def test_a_repair_rewrites_the_findings_it_could_not_read_before(self):
+        """findings.md is the only copy of the prose off the store, and the repair that
+        makes the slots readable is what leaves it holding the unreadable version."""
+        self._report_session()
+        self.store.ack(self.store.produce("accept-1", 1, "accept", "include it")["seq"])
+        self.shout_slots(1)
+        self.store.export_json()
+        self.assertNotIn(
+            "- **WHAT**", (self.root / "findings.md").read_text(encoding="utf-8")
+        )
+
+        upgraded = session_store.SessionStore(self.root)
+
+        self.assertEqual(upgraded.snapshot()[1][0]["slots"], FLAG["slots"])
+        self.assertIn(
+            "- **WHAT** x", (self.root / "findings.md").read_text(encoding="utf-8")
+        )
+        exported = json.loads(
+            (self.root / "beats" / "01.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(exported["slots"], FLAG["slots"])
+
+    def test_a_failed_export_leaves_the_repair_for_the_next_open(self):
+        """The export runs before the version bump commits, so the one signal that the
+        exports are stale is not spent on a write that did not land."""
+        self._report_session()
+        self.store.ack(self.store.produce("accept-1", 1, "accept", "include it")["seq"])
+        self.shout_slots(1)
+        self.store.export_json()
+        real = session_store._atomic_write
+
+        def refuse(path, payload):
+            if path.name == "session.json":
+                raise OSError("no space left on device")
+            return real(path, payload)
+
+        with mock.patch.object(session_store, "_atomic_write", refuse):
+            with self.assertRaisesRegex(OSError, "no space left"):
+                session_store.SessionStore(self.root)
+
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
+        retried = session_store.SessionStore(self.root)
+        self.assertEqual(retried.snapshot()[1][0]["slots"], FLAG["slots"])
+        self.assertIn(
+            "- **WHAT** x", (self.root / "findings.md").read_text(encoding="utf-8")
+        )
+
+    def shout_slots(self, n):
+        """Put a beat back the way a pre-SQLite walk wrote it, on a database to match."""
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            row = db.execute(
+                "SELECT body_json FROM beats WHERE n = ?", (n,)
+            ).fetchone()
+            beat = json.loads(row[0])
+            beat["slots"] = {
+                key.upper(): value for key, value in beat["slots"].items()
+            }
+            db.execute(
+                "UPDATE beats SET body_json = ? WHERE n = ?", (json.dumps(beat), n)
+            )
+            db.execute("PRAGMA user_version = 5")
+
     def test_invalid_accepted_report_cannot_be_reimported(self):
         target = dict(self.target(), state="closed", merged_at=None)
         diff, metadata = self.inputs()
@@ -1706,6 +1769,35 @@ class CreatingAndMigrating(StoreCase):
             upgraded.snapshot()[1][0]["slots"],
             {"what": "does a thing", "proof": "a.ts:1"},
         )
+
+    def test_an_upgrade_with_nothing_to_repair_leaves_the_exports_untouched(self):
+        """Every session in the wild is one version behind, and almost none of them need
+        repairing. Rewriting their exports for nothing is churn under a reader."""
+        self.store.export_json()
+        derived = sorted(
+            [self.root / "session.json", self.root / "decisions.jsonl"]
+            + list((self.root / "beats").glob("*.json"))
+        )
+        before = {path: path.stat().st_mtime_ns for path in derived}
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            db.execute("PRAGMA user_version = 5")
+
+        session_store.SessionStore(self.root)
+
+        self.assertEqual({path: path.stat().st_mtime_ns for path in derived}, before)
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
+
+    def test_a_current_session_opens_in_a_directory_it_cannot_write(self):
+        """Reading a published review out of a directory someone locked down."""
+        self.addCleanup(os.chmod, self.root, 0o755)
+        os.chmod(self.root / "beats", 0o555)
+        self.addCleanup(os.chmod, self.root / "beats", 0o755)
+        os.chmod(self.root, 0o555)
+
+        opened = session_store.SessionStore(self.root)
+
+        self.assertEqual(len(opened.snapshot()[1]), 2)
 
     def test_the_upgrade_leaves_a_beat_whose_keys_would_collide(self):
         """Folding one onto the other would drop a slot, which is the bug, not the fix."""
