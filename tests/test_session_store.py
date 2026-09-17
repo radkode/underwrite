@@ -3147,7 +3147,7 @@ class LinkedImplementations(unittest.TestCase):
                 (json.dumps(beat, separators=(",", ":"), sort_keys=True),),
             )
 
-        with self.assertRaisesRegex(session_store.Conflict, "revision moved"):
+        with self.assertRaisesRegex(session_store.Conflict, "content moved"):
             self.source.create_linked_implementation(link["link_id"])
         self.assertFalse((self.source_root / link["child_path"] / "session.sqlite3").exists())
 
@@ -3258,7 +3258,8 @@ class LinkedImplementations(unittest.TestCase):
             child.prepare_implementation_land(1, 1, base)
 
     def test_the_slot_repair_leaves_a_beat_an_authorization_froze(self):
-        """The link pins these exact bytes, so repairing them would refuse its child."""
+        """The repair passes over a beat an authorization froze, and the child it seeds
+        gets the canonical spelling either way."""
         link = self.authorize()
         with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
             row = db.execute("SELECT body_json FROM beats WHERE n = 1").fetchone()
@@ -3355,6 +3356,72 @@ class LinkedImplementations(unittest.TestCase):
 
         self.assertEqual(self.frozen_row(), (2, slots))
         self.assertTrue(store.create_linked_implementation(link["link_id"]))
+
+    def test_delivering_the_review_still_resumes_the_authorized_child(self):
+        """link seeds the child and can still die before it completes, and the review it
+        leaves behind is a live session: the reviewer says more, the comment goes out."""
+        link = self.authorize()
+        created = self.source.create_linked_implementation(link["link_id"])
+        store = session_store.SessionStore(self.source_root)
+        store.produce("note-1", 1, "note", "worth doing first")
+        store.land(self.source_action, 1, "review-url", "review")
+
+        resumed = store.authorize_implementation(
+            self.source_action, 1, "reviewer", "implement this finding"
+        )
+        again = store.create_linked_implementation(link["link_id"])
+        ready = store.complete_implementation_link(
+            link["link_id"], again["child_session_id"]
+        )
+
+        self.assertEqual(resumed, link)
+        self.assertEqual(again["child_session_id"], created["child_session_id"])
+        self.assertEqual(ready["state"], "ready")
+        child = session_store.SessionStore(Path(again["child_root"]))
+        self.assertEqual(child.snapshot()[1][0]["slots"], FLAG["slots"])
+        self.assertNotIn("landed", child.snapshot()[1][0])
+
+    def test_a_note_still_resumes_a_child_authorized_in_the_old_spelling(self):
+        """A link signed before the slot keys were canonical is the one place the two
+        spellings meet, and the first write rewrites the beat under it."""
+        link = self.authorize()
+        self.shout_pinned_slots()
+        store = session_store.SessionStore(self.source_root)
+
+        store.produce("note-1", 1, "note", "worth doing first")
+
+        self.assertEqual(self.frozen_row(), (3, FLAG["slots"]))
+        resumed = store.authorize_implementation(
+            self.source_action, 1, "reviewer", "implement this finding"
+        )
+        self.assertEqual(resumed["link_id"], link["link_id"])
+        self.assertTrue(store.create_linked_implementation(link["link_id"]))
+
+    def test_a_reworded_finding_refuses_the_child_it_was_not_approved_for(self):
+        """The authorization is over the finding, so the finding is what it still guards."""
+        link = self.authorize()
+        store = session_store.SessionStore(self.source_root)
+        beat = store.snapshot()[1][0]
+        beat["slots"] = dict(beat["slots"], what="something else entirely")
+
+        store.put_beat(beat)
+
+        with self.assertRaisesRegex(session_store.Conflict, "different implementation"):
+            store.authorize_implementation(
+                self.source_action, 1, "reviewer", "implement this finding"
+            )
+        with self.assertRaisesRegex(session_store.Conflict, "content moved"):
+            store.create_linked_implementation(link["link_id"])
+        self.assertFalse((self.source_root / link["child_path"]).exists())
+
+    def test_a_built_child_leaves_the_source_delivery_alone(self):
+        """Nothing about an authorization may stand between a review and its PR."""
+        _child, link, _created = self.create_child()
+
+        landed = self.source.land(self.source_action, 1, "review-url", "review")
+
+        self.assertEqual(landed["state"], "landed")
+        self.assertEqual(self.source.implementation_link(link["link_id"])["state"], "ready")
 
     def test_v4_upgrade_adds_authority_tables_without_changing_session_state(self):
         before = self.source.snapshot()

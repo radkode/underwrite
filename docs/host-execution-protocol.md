@@ -716,7 +716,7 @@ a link.
 A source PR session retains its frozen `review` or `report` audience and `no_exec` policy.
 Accepting a source finding delivers it only to that audience. It does not authorize
 implementation. A separate authorization MUST bind an approving actor and approval text to
-one acknowledged source accept, exact beat revision, and frozen target before Underwrite
+one acknowledged source accept, the finding it accepted, and frozen target before Underwrite
 creates a child session. That child contains one finding, uses branch audience, and has the
 distinct `gateway_attested` execution policy. The trusted controller is responsible for
 authenticating the approver and establishing their authority; the reference session store

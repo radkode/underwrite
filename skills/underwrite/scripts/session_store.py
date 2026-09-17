@@ -42,6 +42,7 @@ RESOLVE = {"accept": "accepted", "drop": "dropped", "decide": "decided"}
 RESOLVABLE = {"accept": ("flag",), "drop": ("flag",), "decide": ("flag", "accepted")}
 OPEN_STATES = ("clean", "flag", "unverified")
 RESOLUTION_KINDS = ("delivery", "decision")
+STORE_OWNED_FIELDS = ("call", "landed", "branch", "delivery_kind", "delivery")
 # Rule 2's budget, in numbers. It binds what a walk writes now and never what is
 # already on disk: validate_beat stays the shippability contract for stored beats,
 # so tightening here cannot retroactively unship a session or an accepted finding.
@@ -898,8 +899,8 @@ class SessionStore:
         """Repair beats a pre-SQLite walk wrote in upper case. The renderer reads six
         lowercase keys, so until this runs the page shows the claim and no prose.
 
-        A beat an implementation link froze is left alone: that authorization pins these
-        exact bytes, and rewriting them would refuse the child it was signed for."""
+        A beat an implementation link froze is left alone: a repair is not the place to
+        rewrite a finding a human approved."""
         changed = False
         pinned = ()
         if db.execute(
@@ -1592,6 +1593,17 @@ class SessionStore:
             canonical["slots"] = canonical_slots(canonical["slots"])
         return canonical
 
+    def _pinned_beat(self, beat):
+        """The finding an implementation authorization is signed over. The source session
+        goes on writing the fields the store owns, and the child drops them, so a note or a
+        landed review is not a change to what the reviewer approved."""
+        finding = _copy(beat)
+        for name in STORE_OWNED_FIELDS:
+            finding.pop(name, None)
+        if isinstance(finding.get("slots"), dict):
+            finding["slots"] = canonical_slots(finding["slots"])
+        return _dump(finding)
+
     def _audience_mode(self, session):
         audience = session.get("audience")
         if not isinstance(audience, dict):
@@ -1815,11 +1827,7 @@ class SessionStore:
         over = beat_budget_problems(beat)
         if over:
             raise StoreError("; ".join(over))
-        owned = [
-            field
-            for field in ("call", "landed", "branch", "delivery_kind", "delivery")
-            if field in beat
-        ]
+        owned = [field for field in STORE_OWNED_FIELDS if field in beat]
         if owned:
             raise StoreError(
                 f"new beat cannot set store-owned field {', '.join(owned)}"
@@ -2284,16 +2292,14 @@ class SessionStore:
             ).fetchone()
             if existing is not None:
                 expected = (
-                    link_id, action["action_id"], source_beat, beat_row["revision"],
-                    beat_json, beat_sha256, target_sha256, actor, approval,
-                    child_path, branch,
+                    action["action_id"], source_beat, target_sha256, actor, approval,
+                    self._pinned_beat(beat),
                 )
                 actual = (
-                    existing["link_id"], existing["source_action_id"],
-                    existing["source_beat"], existing["source_beat_revision"],
-                    existing["source_beat_json"], existing["source_beat_sha256"],
+                    existing["source_action_id"], existing["source_beat"],
                     existing["target_sha256"], existing["actor"],
-                    existing["approval"], existing["child_path"], existing["branch"],
+                    existing["approval"],
+                    self._pinned_beat(json.loads(existing["source_beat_json"])),
                 )
                 if actual != expected:
                     raise Conflict(
@@ -2611,12 +2617,14 @@ class SessionStore:
                 raise Conflict("implementation source accept is no longer acknowledged")
             if action["beat_n"] != live["source_beat"]:
                 raise Conflict("implementation source action no longer matches its beat")
-            if beat["revision"] != live["source_beat_revision"]:
-                raise Conflict("implementation source beat revision moved")
-            if beat["body_json"] != live["source_beat_json"]:
-                raise Conflict("implementation source beat content moved")
-            if hashlib.sha256(beat["body_json"].encode("utf-8")).hexdigest() != live["source_beat_sha256"]:
+            # Both columns are this row's, so this is the row against itself: the child
+            # copies the digest into its own provenance and never re-derives it.
+            if hashlib.sha256(live["source_beat_json"].encode("utf-8")).hexdigest() != live["source_beat_sha256"]:
                 raise Conflict("implementation source beat digest does not match")
+            if self._pinned_beat(json.loads(beat["body_json"])) != self._pinned_beat(
+                json.loads(live["source_beat_json"])
+            ):
+                raise Conflict("implementation source beat content moved")
             if hashlib.sha256(_dump(target).encode("utf-8")).hexdigest() != live["target_sha256"]:
                 raise Conflict("implementation source target moved")
             link = self._implementation_link_document(live)
