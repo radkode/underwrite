@@ -505,6 +505,119 @@ class FrozenTargets(unittest.TestCase):
             (self.root / "findings.md").read_text(encoding="utf-8"),
         )
 
+    def test_a_repair_rewrites_the_findings_it_could_not_read_before(self):
+        """findings.md is the only copy of the prose off the store, and a build that
+        could not read these keys is what left the copy on disk without it."""
+        self._report_session()
+        self.store.ack(self.store.produce("accept-1", 1, "accept", "include it")["seq"])
+        self.shout_slots(1)
+        self.store.export_json()
+        (self.root / "findings.md").write_text(
+            "# Findings: acme/widget#7\n\n## Beat 1: unpinned\n", encoding="utf-8"
+        )
+
+        upgraded = session_store.SessionStore(self.root)
+
+        self.assertEqual(upgraded.snapshot()[1][0]["slots"], FLAG["slots"])
+        self.assertIn(
+            "- **WHAT** x", (self.root / "findings.md").read_text(encoding="utf-8")
+        )
+        exported = json.loads(
+            (self.root / "beats" / "01.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(exported["slots"], FLAG["slots"])
+
+    def test_a_failed_export_leaves_the_repair_for_the_next_open(self):
+        """The export runs before the version bump commits, so the one signal that the
+        exports are stale is not spent on a write that did not land."""
+        self._report_session()
+        self.store.ack(self.store.produce("accept-1", 1, "accept", "include it")["seq"])
+        self.shout_slots(1)
+        self.store.export_json()
+        real = session_store._atomic_write
+
+        def refuse(path, payload):
+            if path.name == "session.json":
+                raise OSError("no space left on device")
+            return real(path, payload)
+
+        with mock.patch.object(session_store, "_atomic_write", refuse):
+            with self.assertRaisesRegex(OSError, "no space left"):
+                session_store.SessionStore(self.root)
+
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
+        retried = session_store.SessionStore(self.root)
+        self.assertEqual(retried.snapshot()[1][0]["slots"], FLAG["slots"])
+        self.assertIn(
+            "- **WHAT** x", (self.root / "findings.md").read_text(encoding="utf-8")
+        )
+
+    def shout_slots(self, n, downgrade=True):
+        """Put a beat back the way a pre-SQLite walk wrote it, on a database to match."""
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            row = db.execute(
+                "SELECT body_json FROM beats WHERE n = ?", (n,)
+            ).fetchone()
+            beat = json.loads(row[0])
+            beat["slots"] = {
+                key.upper(): value for key, value in beat["slots"].items()
+            }
+            db.execute(
+                "UPDATE beats SET body_json = ? WHERE n = ?", (json.dumps(beat), n)
+            )
+            if downgrade:
+                db.execute("PRAGMA user_version = 5")
+
+    def test_the_findings_read_a_beat_the_repair_had_to_leave_alone(self):
+        """An authorization pins a beat's bytes, so upper case outlives the repair there.
+        The prose is still what the reviewer included, and this file is where it lives."""
+        self._report_session()
+        self.store.ack(self.store.produce("accept-1", 1, "accept", "include it")["seq"])
+        self.shout_slots(1, downgrade=False)
+
+        self.store.export_json()
+
+        self.assertIn(
+            "- **WHAT** x", (self.root / "findings.md").read_text(encoding="utf-8")
+        )
+        stored = json.loads(
+            (self.root / "beats" / "01.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(sorted(stored["slots"]), ["FIX", "PROOF", "RISK", "WHAT"])
+
+    def test_opening_a_report_session_repairs_findings_that_drifted(self):
+        """A delivered session has no next mutation to rewrite this file, and the page
+        would otherwise say one thing while the only copy off the store says another."""
+        self._report_session()
+        self.store.ack(self.store.produce("accept-1", 1, "accept", "include it")["seq"])
+        self.store.export_json()
+        findings = self.root / "findings.md"
+        findings.write_text("# Findings: acme/widget#7\n", encoding="utf-8")
+
+        session_store.SessionStore(self.root)
+
+        self.assertIn("- **WHAT** x", findings.read_text(encoding="utf-8"))
+        stamp = findings.stat().st_mtime_ns
+        session_store.SessionStore(self.root)
+        self.assertEqual(findings.stat().st_mtime_ns, stamp)
+
+    def test_a_report_beat_may_be_written_back_but_still_not_changed(self):
+        """Upper case survives where an authorization pinned it, and the frozen-field
+        rule has to read the two spellings as the same slots."""
+        self._report_session()
+        self.store.ack(self.store.produce("accept-1", 1, "accept", "include it")["seq"])
+        self.shout_slots(1, downgrade=False)
+        store = session_store.SessionStore(self.root)
+        read_back = store.snapshot()[1][0]
+
+        store.put_beat(read_back)
+
+        self.assertEqual(sorted(store.snapshot()[1][0]["slots"]), sorted(read_back["slots"]))
+        edited = dict(read_back, slots=dict(read_back["slots"], RISK="a different risk"))
+        with self.assertRaisesRegex(session_store.Conflict, "cannot change slots"):
+            store.put_beat(edited)
+
     def test_invalid_accepted_report_cannot_be_reimported(self):
         target = dict(self.target(), state="closed", merged_at=None)
         diff, metadata = self.inputs()
@@ -1707,6 +1820,35 @@ class CreatingAndMigrating(StoreCase):
             {"what": "does a thing", "proof": "a.ts:1"},
         )
 
+    def test_an_upgrade_with_nothing_to_repair_leaves_the_exports_untouched(self):
+        """Every session in the wild is one version behind, and almost none of them need
+        repairing. Rewriting their exports for nothing is churn under a reader."""
+        self.store.export_json()
+        derived = sorted(
+            [self.root / "session.json", self.root / "decisions.jsonl"]
+            + list((self.root / "beats").glob("*.json"))
+        )
+        before = {path: path.stat().st_mtime_ns for path in derived}
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            db.execute("PRAGMA user_version = 5")
+
+        session_store.SessionStore(self.root)
+
+        self.assertEqual({path: path.stat().st_mtime_ns for path in derived}, before)
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
+
+    def test_a_current_session_opens_in_a_directory_it_cannot_write(self):
+        """Reading a published review out of a directory someone locked down."""
+        self.addCleanup(os.chmod, self.root, 0o755)
+        os.chmod(self.root / "beats", 0o555)
+        self.addCleanup(os.chmod, self.root / "beats", 0o755)
+        os.chmod(self.root, 0o555)
+
+        opened = session_store.SessionStore(self.root)
+
+        self.assertEqual(len(opened.snapshot()[1]), 2)
+
     def test_the_upgrade_leaves_a_beat_whose_keys_would_collide(self):
         """Folding one onto the other would drop a slot, which is the bug, not the fix."""
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
@@ -2557,6 +2699,20 @@ class RecoveringAndDelivering(StoreCase):
         presented = self.store.presentation_snapshot()[1][0]
         self.assertEqual(presented["delivery"]["owed"], "fix the fixture")
 
+    def test_a_fix_cannot_be_written_under_a_second_spelling(self):
+        """The fix on an accepted beat is the store's to set, and two spellings of one
+        key are exactly what the canonical form leaves alone."""
+        action = self.store.produce("click-1", 1, "accept", "yes")
+        self.store.land(action["seq"], 1, "abc1234", "commit", branch="jacek/fix")
+        self.store.ack(action["seq"])
+        stale = self.beat(1)
+        stale["slots"] = dict(stale["slots"], FIX="injected", fix="injected")
+
+        updated = self.store.put_beat(stale)
+
+        self.assertEqual(updated["slots"]["fix"], "pin it")
+        self.assertNotIn("FIX", updated["slots"])
+
     def test_presentation_snapshot_projects_delivery_without_persisting_it(self):
         raw_session, raw_beats = self.store.snapshot()
         presented_session, presented_beats = self.store.presentation_snapshot()
@@ -3129,6 +3285,76 @@ class LinkedImplementations(unittest.TestCase):
         self.assertEqual(
             child.snapshot()[1][0]["slots"], {"what": "does a thing", "fix": "pin it"}
         )
+
+    def test_the_page_reads_the_beat_the_authorization_froze(self):
+        """Only the reading changes: the bytes stay as the link signed them, and it
+        still creates the child it was signed for."""
+        link = self.authorize()
+        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+            row = db.execute("SELECT body_json FROM beats WHERE n = 1").fetchone()
+            beat = json.loads(row[0])
+            beat["slots"] = {"WHAT": "does a thing", "FIX": "pin it"}
+            body = json.dumps(beat)
+            db.execute("UPDATE beats SET body_json = ? WHERE n = 1", (body,))
+            db.execute(
+                "UPDATE implementation_links SET source_beat_json = ?, "
+                "source_beat_sha256 = ?",
+                (body, hashlib.sha256(body.encode("utf-8")).hexdigest()),
+            )
+        store = session_store.SessionStore(self.source_root)
+
+        shown = store.presentation_snapshot()[1][0]
+
+        self.assertEqual(shown["slots"], {"what": "does a thing", "fix": "pin it"})
+        self.assertEqual(sorted(store.snapshot()[1][0]["slots"]), ["FIX", "WHAT"])
+        created = store.create_linked_implementation(link["link_id"])
+        self.assertTrue(created["child_session_id"])
+
+    def shout_pinned_slots(self):
+        """The beat as a pre-SQLite walk wrote it, with the link signed on those bytes."""
+        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+            row = db.execute("SELECT body_json FROM beats WHERE n = 1").fetchone()
+            beat = json.loads(row[0])
+            beat["slots"] = {key.upper(): value for key, value in beat["slots"].items()}
+            body = json.dumps(beat)
+            db.execute("UPDATE beats SET body_json = ? WHERE n = 1", (body,))
+            db.execute(
+                "UPDATE implementation_links SET source_beat_json = ?, "
+                "source_beat_sha256 = ?",
+                (body, hashlib.sha256(body.encode("utf-8")).hexdigest()),
+            )
+        return beat["slots"]
+
+    def frozen_row(self):
+        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+            row = db.execute(
+                "SELECT revision, body_json FROM beats WHERE n = 1"
+            ).fetchone()
+        return row[0], json.loads(row[1])["slots"]
+
+    def test_writing_back_the_beat_it_read_leaves_the_authorization_alone(self):
+        """SKILL.md sends an agent through get-beat and put-beat with the whole object,
+        and the store canonicalizes on the way in, so the bytes have to survive it."""
+        link = self.authorize()
+        slots = self.shout_pinned_slots()
+        store = session_store.SessionStore(self.source_root)
+
+        store.put_beat(store.snapshot()[1][0])
+
+        self.assertEqual(self.frozen_row(), (2, slots))
+        self.assertTrue(store.create_linked_implementation(link["link_id"]))
+
+    def test_a_note_that_changes_nothing_leaves_the_authorization_alone(self):
+        """produce writes the beat back as well, and its note is the only thing it has
+        to say, so repeating one cannot be what breaks the link."""
+        link = self.authorize()
+        slots = self.shout_pinned_slots()
+        store = session_store.SessionStore(self.source_root)
+
+        store.produce("note-1", 1, "note", "approved finding")
+
+        self.assertEqual(self.frozen_row(), (2, slots))
+        self.assertTrue(store.create_linked_implementation(link["link_id"]))
 
     def test_v4_upgrade_adds_authority_tables_without_changing_session_state(self):
         before = self.source.snapshot()

@@ -861,7 +861,8 @@ All mutations go through `sessionctl.py` or the server's `/act` endpoint. All re
 for a later mutation go through `get-session` or `get-beat`. `session.json`, `beats/`,
 `decisions.jsonl`, and `ack.json` are compatibility exports. The renderer reads SQLite
 whenever it exists, and a later `$S/scripts/sessionctl.py export "$R"` repairs missing or
-corrupt compatibility exports.
+corrupt compatibility exports. A schema upgrade that repairs stored beats rewrites them
+itself, so the prose it recovers reaches `findings.md` without a second command.
 `check-pr` verifies the frozen diff and the current PR identity; an exact `snapshot-pr`
 replay can repair `pr.diff` only while GitHub still names the same frozen target.
 `trusted-context` verifies the captured base manifest against its frozen digest before
