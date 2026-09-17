@@ -546,13 +546,14 @@ $S/scripts/implementationctl.py link "$R" "$PWD" \
   --actor '<approving identity>' --approval '<explicit implementation approval>'
 ```
 
-`link` rechecks the live PR, binds the source session, accept action, exact beat revision,
+`link` rechecks the live PR, binds the source session, accept action, accepted finding,
 frozen target, actor, and approval, then creates
 `$R/implementations/<link-id>/`. Call that child directory `$C`. It contains exactly the
 one approved finding, branch audience, `gateway_attested` execution, and a generated
 `underwrite/implementation-<id>` local branch seeded from the frozen head. The source
 review or report delivery remains independent. Repeating the same authorization resumes
-the same child; changing it for the same source action is a conflict. `link` records the
+the same child, including after the source beat has taken a note or landed its review;
+changing the accepted finding for the same source action is a conflict. `link` records the
 actor label but does not authenticate it. Establish the approver's identity and authority
 through the trusted controller before calling the command.
 
