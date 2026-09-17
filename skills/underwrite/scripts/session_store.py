@@ -1783,8 +1783,13 @@ class SessionStore:
             else:
                 beat.pop("branch", None)
         encoded, encoded_detail = _dump(beat), self._optional_dump(detail)
+        stored = json.loads(row["body_json"])
+        if isinstance(stored.get("slots"), dict):
+            # Bytes an authorization pinned keep the spelling they were signed with, and
+            # writing back what the store canonicalized on the way out is no change.
+            stored["slots"] = canonical_slots(stored["slots"])
         if (
-            row["body_json"] == encoded
+            _dump(stored) == encoded
             and row["delivery_state"] == state
             and row["delivery_json"] == encoded_detail
         ):
@@ -3382,6 +3387,9 @@ class SessionStore:
                 self._validate_new_beat(beat)
             if row is not None:
                 current = json.loads(row["body_json"])
+                if isinstance(current.get("slots"), dict):
+                    # The incoming beat was canonicalized on the way in.
+                    current["slots"] = canonical_slots(current["slots"])
                 for field in ("state", "call", "landed", "branch", "delivery_kind"):
                     if field in current:
                         beat[field] = current[field]
@@ -3411,13 +3419,20 @@ class SessionStore:
                     incoming_slots = beat.get("slots")
                     if incoming_slots is not None and not isinstance(incoming_slots, dict):
                         raise StoreError(f"beat {beat['n']} slots must be an object")
+                    if isinstance(incoming_slots, dict):
+                        # Two spellings of one key survive canonical_slots, and this slot
+                        # is the store's to set, under whichever one the caller sent.
+                        for key in [
+                            name
+                            for name in incoming_slots
+                            if isinstance(name, str) and name.lower() == "fix"
+                        ]:
+                            incoming_slots.pop(key)
                     if isinstance(current_slots, dict) and "fix" in current_slots:
                         slots = beat.setdefault("slots", {})
                         if not isinstance(slots, dict):
                             raise StoreError(f"beat {beat['n']} slots must be an object")
                         slots["fix"] = current_slots["fix"]
-                    elif isinstance(incoming_slots, dict):
-                        incoming_slots.pop("fix", None)
             changed, _revision, _state, _detail = self._save_beat(db, beat)
             if changed:
                 self._bump_render(db)
