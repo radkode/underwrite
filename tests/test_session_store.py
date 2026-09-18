@@ -1889,6 +1889,74 @@ class CreatingAndMigrating(StoreCase):
             "beat 2: unknown slot 'BANANA'", session_store.validate_beat(stored)
         )
 
+    def test_a_slot_spelled_two_ways_is_refused_while_the_walk_can_retype_it(self):
+        """The canonical form keeps both keys rather than drop one, and then every reader
+        takes the canonical spelling and the other one's prose reaches nothing."""
+        colliding = {
+            "n": 3, "state": "clean", "claim": "c",
+            "slots": {"WHAT": "the real finding", "what": "x", "proof": "b.py:1"},
+        }
+
+        with self.assertRaisesRegex(
+            session_store.StoreError, "beat 3 spells slot what as WHAT and what"
+        ):
+            self.store.put_beat(colliding)
+        self.assertEqual([beat["n"] for beat in self.store.snapshot()[1]], [1, 2])
+
+        colliding["slots"] = {"what": "the real finding", "proof": "b.py:1"}
+        self.assertEqual(
+            self.store.put_beat(colliding)["slots"],
+            {"what": "the real finding", "proof": "b.py:1"},
+        )
+
+    def test_a_navigation_replay_cannot_open_a_beat_that_spells_one_slot_twice(self):
+        """apply creates a beat it has never seen, with the same gate and no other."""
+        produced = self.store.produce("nav-1", None, "next", "")
+        session, beats = self.store.snapshot()
+        colliding = {
+            "n": 3, "state": "clean", "claim": "c",
+            "slots": {"PROOF": "c.py:1", "proof": "d.py:2", "what": "x"},
+        }
+
+        with self.assertRaisesRegex(
+            session_store.StoreError, "beat 3 spells slot proof as PROOF and proof"
+        ):
+            self.store.apply(
+                produced["seq"], {"kind": "walk", "cursor": 3},
+                session=session, beats=list(beats) + [colliding],
+            )
+
+        self.assertEqual([beat["n"] for beat in self.store.snapshot()[1]], [1, 2])
+
+    def test_a_slot_spelled_two_ways_is_refused_on_a_beat_that_already_exists(self):
+        stored = self.beat(1)
+        stored["slots"] = dict(stored["slots"], WHY="a second why", why="a third")
+
+        with self.assertRaisesRegex(
+            session_store.StoreError, "beat 1 spells slot why as WHY and why"
+        ):
+            self.store.put_beat(stored)
+
+        self.assertEqual(self.beat(1), FLAG)
+
+    def test_a_legacy_session_that_already_spells_one_slot_twice_still_migrates(self):
+        """The refusal is on what a walk sends, never on what is already on disk, or an
+        old session carrying the collision could never be opened to repair it."""
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / "beats").mkdir()
+        (root / "session.json").write_text(json.dumps(SESSION), encoding="utf-8")
+        (root / "beats" / "01.json").write_text(
+            json.dumps(dict(FLAG, slots={"WHAT": "does a thing", "what": "x"})),
+            encoding="utf-8",
+        )
+
+        store = session_store.SessionStore(root)
+
+        self.assertEqual(sorted(store.snapshot()[1][0]["slots"]), ["WHAT", "what"])
+        with self.assertRaisesRegex(session_store.StoreError, "spells slot what"):
+            store.put_beat(store.snapshot()[1][0])
+
     def test_a_future_database_is_refused_without_changing_its_journal_mode(self):
         (self.root / "session.sqlite3").unlink()
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
@@ -2700,18 +2768,21 @@ class RecoveringAndDelivering(StoreCase):
         self.assertEqual(presented["delivery"]["owed"], "fix the fixture")
 
     def test_a_fix_cannot_be_written_under_a_second_spelling(self):
-        """The fix on an accepted beat is the store's to set, and two spellings of one
-        key are exactly what the canonical form leaves alone."""
+        """The fix on an accepted beat is the store's to set, and the second spelling is
+        the one shape the canonical form has to leave alone."""
         action = self.store.produce("click-1", 1, "accept", "yes")
         self.store.land(action["seq"], 1, "abc1234", "commit", branch="jacek/fix")
         self.store.ack(action["seq"])
         stale = self.beat(1)
         stale["slots"] = dict(stale["slots"], FIX="injected", fix="injected")
 
-        updated = self.store.put_beat(stale)
+        with self.assertRaisesRegex(
+            session_store.StoreError, "spells slot fix as FIX and fix"
+        ):
+            self.store.put_beat(stale)
 
-        self.assertEqual(updated["slots"]["fix"], "pin it")
-        self.assertNotIn("FIX", updated["slots"])
+        self.assertEqual(self.beat(1)["slots"]["fix"], "pin it")
+        self.assertNotIn("FIX", self.beat(1)["slots"])
 
     def test_presentation_snapshot_projects_delivery_without_persisting_it(self):
         raw_session, raw_beats = self.store.snapshot()
