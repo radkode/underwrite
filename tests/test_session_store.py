@@ -69,7 +69,7 @@ class FrozenTargets(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.root, True)
-        self.store = session_store.SessionStore(self.root)
+        self.store = session_store.SessionStore(self.root, create=True)
 
     def target(self, suffix="1"):
         return {
@@ -193,7 +193,7 @@ class FrozenTargets(unittest.TestCase):
         for index, (state, merged_at) in enumerate(cases, 1):
             with self.subTest(state=state, merged_at=merged_at):
                 root = self.root / f"case-{index}"
-                store = session_store.SessionStore(root)
+                store = session_store.SessionStore(root, create=True)
                 target = dict(
                     self.target(), state=state, merged_at=merged_at
                 )
@@ -2889,7 +2889,7 @@ class LinkedImplementations(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.root, True)
         self.source_root = self.root / "source"
-        self.source = session_store.SessionStore(self.source_root)
+        self.source = session_store.SessionStore(self.source_root, create=True)
         self.target = {
             "version": 1,
             "kind": "github_pr",
@@ -3068,7 +3068,7 @@ class LinkedImplementations(unittest.TestCase):
     def test_foreign_child_session_is_rejected_before_projection_replacement(self):
         link = self.authorize()
         child_root = self.source_root / link["child_path"]
-        foreign = session_store.SessionStore(child_root)
+        foreign = session_store.SessionStore(child_root, create=True)
         foreign.patch_session({"title": "foreign session"})
         marker = child_root / "pr.diff"
         marker.write_bytes(b"foreign projection\n")
@@ -3110,7 +3110,7 @@ class LinkedImplementations(unittest.TestCase):
     def test_hard_linked_foreign_database_is_never_opened_as_a_child(self):
         link = self.authorize()
         foreign_root = self.root / "foreign"
-        foreign = session_store.SessionStore(foreign_root)
+        foreign = session_store.SessionStore(foreign_root, create=True)
         foreign.patch_session({"title": "foreign session"})
         database = foreign_root / "session.sqlite3"
         before = database.read_bytes()
