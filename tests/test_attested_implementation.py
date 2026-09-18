@@ -944,6 +944,92 @@ class AttestedImplementationCase(unittest.TestCase):
         with self.assertRaisesRegex(bridge.ImplementationError, "exact file set"):
             bridge._evidence_directory(directory)
 
+    def test_links_names_a_reservation_a_failed_link_left_behind(self):
+        """A link that dies before its child leaves a row and an id nothing else prints."""
+        self.assertEqual(self.source.implementation_links(), [])
+
+        authorization = self.source.authorize_implementation(
+            self.action_seq, 1, "reviewer", "implement the accepted fix"
+        )
+        reserved = self.source.implementation_links()
+
+        self.assertEqual(reserved, [authorization])
+        self.assertEqual(reserved[0]["state"], "reserved")
+        self.assertIsNone(reserved[0]["child_session_id"])
+        self.assertIsNone(reserved[0]["ready_at"])
+        self.assertEqual(reserved[0]["actor"], "reviewer")
+        self.assertEqual(reserved[0]["approval"], "implement the accepted fix")
+
+    def test_links_shows_a_reservation_and_refuses_the_child_it_has_not_made(self):
+        """The listing prints a child_path, so the listing must not be what creates one:
+        an empty session there is enough to refuse the link that would fill it."""
+        self.source.authorize_implementation(
+            self.action_seq, 1, "reviewer", "implement the accepted fix"
+        )
+
+        listed = json.loads(
+            self.command(sys.executable, SCRIPTS / "implementationctl.py",
+                         "links", self.source_root)
+        )["links"]
+        child_root = Path(self.source_root) / listed[0]["child_path"]
+
+        self.assertEqual(listed[0]["state"], "reserved")
+        self.assertIsNone(listed[0]["child_session_id"])
+        self.assertFalse(child_root.exists())
+
+        refused = subprocess.run(
+            [sys.executable, str(SCRIPTS / "implementationctl.py"), "links", str(child_root)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=False,
+        )
+
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("no session at", refused.stderr.decode())
+        self.assertFalse(child_root.exists())
+        self.assertEqual(self.link()["link"]["state"], "ready")
+
+    def test_links_are_listed_in_beat_order_whatever_order_they_were_approved(self):
+        """A session can hold one authorization per accepted finding, and the operator's
+        question is which beat is spoken for."""
+        self.source.put_beat({
+            "n": 2, "tier": "core", "state": "flag", "claim": "second",
+            "where": "b.py:2",
+            "slots": {"what": "y", "proof": "b.py:2", "risk": "r", "fix": "do it"},
+        })
+        second = self.source.produce("accept-2", 2, "accept", "include it too")
+        self.source.ack(second["seq"])
+
+        self.source.authorize_implementation(
+            second["seq"], 2, "reviewer", "implement the second"
+        )
+        self.source.authorize_implementation(
+            self.action_seq, 1, "reviewer", "implement the accepted fix"
+        )
+
+        self.assertEqual(
+            [(link["source_beat"], link["source_action_seq"])
+             for link in self.source.implementation_links()],
+            [(1, 1), (2, 2)],
+        )
+
+    def test_links_cli_lists_a_ready_link_and_says_nothing_of_its_child(self):
+        ready, child_root, _child = self.linked()
+
+        listed = json.loads(
+            self.command(sys.executable, SCRIPTS / "implementationctl.py",
+                         "links", self.source_root)
+        )["links"]
+
+        self.assertEqual(listed, [ready["link"]])
+        self.assertEqual(listed[0]["state"], "ready")
+        self.assertEqual(listed[0]["child_session_id"], ready["child_session_id"])
+        self.assertEqual(
+            json.loads(
+                self.command(sys.executable, SCRIPTS / "implementationctl.py",
+                             "links", child_root)
+            )["links"],
+            [],
+        )
+
     def test_consume_cli_returns_json_after_persisting_verified_evidence(self):
         _linked, child_root, _child = self.linked()
         self.now = datetime.now(timezone.utc)
