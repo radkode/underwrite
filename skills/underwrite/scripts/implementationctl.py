@@ -20,6 +20,7 @@ from attested_implementation import (  # noqa: E402
     fail,
     land,
     link,
+    links,
     request,
 )
 from execution_receipt import ReceiptError  # noqa: E402
@@ -47,6 +48,9 @@ def parser():
     create.add_argument("--beat", type=int, required=True)
     create.add_argument("--actor", required=True)
     create.add_argument("--approval", required=True)
+
+    listing = commands.add_parser("links")
+    listing.add_argument("source")
 
     reserve = commands.add_parser("request")
     reserve.add_argument("child")
@@ -85,6 +89,8 @@ def run(args):
             actor=args.actor,
             approval=args.approval,
         )
+    if args.command == "links":
+        return links(args.source)
     if args.command == "request":
         return request(args.child, args.source, args.profile)
     if args.command == "consume":

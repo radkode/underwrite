@@ -3533,6 +3533,7 @@ class LinkedImplementations(unittest.TestCase):
         upgraded = session_store.SessionStore(self.source_root)
 
         self.assertEqual(upgraded.snapshot(), before)
+        self.assertEqual(upgraded.implementation_links(), [])
         with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
             names = {
                 row[0]

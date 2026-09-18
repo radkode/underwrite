@@ -559,6 +559,15 @@ acknowledgement and its own approval. `link` records the actor label but does no
 authenticate it. Establish the approver's identity and authority through the trusted
 controller before calling the command.
 
+```bash
+$S/scripts/implementationctl.py links "$R"
+```
+
+Every authorization this source session holds, with the actor and approval behind each one.
+A `ready` link owns the child named by its `child_path`; a `reserved` one is a `link` that
+died before it finished. Never point this command at a `child_path` a `reserved` link names:
+that child does not exist yet, and the `link` that would create it is the only thing that may.
+
 The host operator supplies a trusted profile `$P` outside the repository, session, and
 gateway result. It contains exactly `version`, `keyId`, `signerId`, `executorId`, `job`,
 `sandbox`, and `exitCode`. The operator also supplies an absolute pinned P-256 public key

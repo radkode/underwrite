@@ -2250,6 +2250,18 @@ class SessionStore:
         with self._read() as db:
             return self._implementation_link_document(self._link_row(db, link_id))
 
+    def implementation_links(self):
+        with self._read() as db:
+            return [
+                self._implementation_link_document(row)
+                for row in db.execute(
+                    "SELECT links.*, session.session_id AS source_session_id "
+                    "FROM implementation_links AS links "
+                    "JOIN session ON session.singleton = 1 "
+                    "ORDER BY links.source_beat, links.source_action_seq"
+                )
+            ]
+
     def authorize_implementation(self, source_action_seq, source_beat, actor, approval):
         _positive(source_action_seq, "source action seq")
         _positive(source_beat, "source beat")
