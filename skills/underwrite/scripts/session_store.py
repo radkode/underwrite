@@ -2303,7 +2303,8 @@ class SessionStore:
                 )
                 if actual != expected:
                     raise Conflict(
-                        f"action {source_action_seq} already has a different implementation authorization"
+                        f"action {source_action_seq} already has a different "
+                        f"implementation authorization {existing['link_id']}"
                     )
                 return self._implementation_link_document(existing)
             db.execute(
@@ -3441,10 +3442,28 @@ class SessionStore:
                         if not isinstance(slots, dict):
                             raise StoreError(f"beat {beat['n']} slots must be an object")
                         slots["fix"] = current_slots["fix"]
+                self._hold_authorized_finding(db, beat, current)
             changed, _revision, _state, _detail = self._save_beat(db, beat)
             if changed:
                 self._bump_render(db)
         return next(item for item in self.snapshot()[1] if item["n"] == beat["n"])
+
+    def _hold_authorized_finding(self, db, beat, current):
+        """An approval names a finding, and the store has nothing that authenticates a
+        second one, so the words it was given have to stay the words it stands on."""
+        pinned = self._pinned_beat(beat)
+        if pinned == self._pinned_beat(current):
+            return
+        for link in db.execute(
+            "SELECT link_id, source_beat_json FROM implementation_links "
+            "WHERE source_beat = ?",
+            (beat["n"],),
+        ):
+            if pinned != self._pinned_beat(json.loads(link["source_beat_json"])):
+                raise Conflict(
+                    f"beat {beat['n']} is the finding implementation authorization "
+                    f"{link['link_id']} was approved for"
+                )
 
     def snapshot(self):
         with self._read() as db:

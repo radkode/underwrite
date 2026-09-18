@@ -552,10 +552,12 @@ frozen target, actor, and approval, then creates
 one approved finding, branch audience, `gateway_attested` execution, and a generated
 `underwrite/implementation-<id>` local branch seeded from the frozen head. The source
 review or report delivery remains independent. Repeating the same authorization resumes
-the same child, including after the source beat has taken a note or landed its review;
-changing the accepted finding for the same source action is a conflict. `link` records the
-actor label but does not authenticate it. Establish the approver's identity and authority
-through the trusted controller before calling the command.
+the same child, including after the source beat has taken a note or landed its review.
+The accepted finding itself cannot change while the authorization stands: `put-beat`
+refuses it, and different prose is a different finding, needing its own accept, its own
+acknowledgement and its own approval. `link` records the actor label but does not
+authenticate it. Establish the approver's identity and authority through the trusted
+controller before calling the command.
 
 The host operator supplies a trusted profile `$P` outside the repository, session, and
 gateway result. It contains exactly `version`, `keyId`, `signerId`, `executorId`, `job`,

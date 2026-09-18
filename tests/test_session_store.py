@@ -3397,22 +3397,51 @@ class LinkedImplementations(unittest.TestCase):
         self.assertEqual(resumed["link_id"], link["link_id"])
         self.assertTrue(store.create_linked_implementation(link["link_id"]))
 
-    def test_a_reworded_finding_refuses_the_child_it_was_not_approved_for(self):
-        """The authorization is over the finding, so the finding is what it still guards."""
+    def test_a_reworded_finding_is_refused_at_the_write(self):
+        """The approval names a finding, and nothing here can take a second one, so the
+        words it was given are the words it goes on standing on."""
         link = self.authorize()
         store = session_store.SessionStore(self.source_root)
         beat = store.snapshot()[1][0]
         beat["slots"] = dict(beat["slots"], what="something else entirely")
 
-        store.put_beat(beat)
+        with self.assertRaisesRegex(session_store.Conflict, "was approved for"):
+            store.put_beat(beat)
 
-        with self.assertRaisesRegex(session_store.Conflict, "different implementation"):
+        self.assertEqual(store.snapshot()[1][0]["slots"], FLAG["slots"])
+        self.assertTrue(store.create_linked_implementation(link["link_id"]))
+
+    def test_a_finding_that_drifted_is_written_back_to_the_one_approved(self):
+        """A store an older build let drift is still readable, and the one write it takes
+        is the one that puts the approved finding back."""
+        link = self.authorize()
+        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+            beat = json.loads(
+                db.execute("SELECT body_json FROM beats WHERE n = 1").fetchone()[0]
+            )
+            beat["slots"]["what"] = "something else entirely"
+            db.execute(
+                "UPDATE beats SET revision = revision + 1, body_json = ? WHERE n = 1",
+                (json.dumps(beat, separators=(",", ":"), sort_keys=True),),
+            )
+        store = session_store.SessionStore(self.source_root)
+        with self.assertRaisesRegex(
+            session_store.Conflict,
+            f"different implementation authorization {link['link_id']}",
+        ):
             store.authorize_implementation(
                 self.source_action, 1, "reviewer", "implement this finding"
             )
         with self.assertRaisesRegex(session_store.Conflict, "content moved"):
             store.create_linked_implementation(link["link_id"])
         self.assertFalse((self.source_root / link["child_path"]).exists())
+
+        drifted = store.snapshot()[1][0]
+        store.put_beat(drifted)
+        store.put_beat(dict(drifted, slots=dict(drifted["slots"], what=FLAG["slots"]["what"])))
+
+        self.assertEqual(store.snapshot()[1][0]["slots"], FLAG["slots"])
+        self.assertTrue(store.create_linked_implementation(link["link_id"]))
 
     def test_a_built_child_leaves_the_source_delivery_alone(self):
         """Nothing about an authorization may stand between a review and its PR."""
