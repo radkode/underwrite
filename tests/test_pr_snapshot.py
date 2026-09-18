@@ -69,7 +69,7 @@ class SnapshotCase(unittest.TestCase):
         self.git("-C", self.work, "commit", "-m", "base")
         self.base = self.rev("HEAD")
         self.git("-C", self.work, "push", "origin", "main")
-        self.store = session_store.SessionStore(self.session)
+        self.store = session_store.SessionStore(self.session, create=True)
 
     def git(self, *args):
         done = subprocess.run(
@@ -149,7 +149,7 @@ class Capturing(SnapshotCase):
         for i, title in enumerate((None, "", "   ", 7)):
             with self.subTest(title=title):
                 metadata = self.metadata(title=title)
-                store = session_store.SessionStore(self.root / f"session-{i}")
+                store = session_store.SessionStore(self.root / f"session-{i}", create=True)
                 pr_snapshot.capture(
                     store, "acme/widget", 7, self.work,
                     api=mock.Mock(side_effect=[metadata, metadata]),
@@ -643,7 +643,7 @@ class Capturing(SnapshotCase):
         self.assertEqual(target["trusted_context_sha256"], hashlib.sha256(raw).hexdigest())
 
         other_session = self.root / "other-session"
-        other_store = session_store.SessionStore(other_session)
+        other_store = session_store.SessionStore(other_session, create=True)
         pr_snapshot.capture(
             other_store,
             "acme/widget",

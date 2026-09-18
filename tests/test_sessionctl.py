@@ -65,6 +65,36 @@ class SessionCtlCase(unittest.TestCase):
         return session_store.SessionStore(self.root)
 
 
+class OpeningASession(SessionCtlCase):
+    def test_a_read_refuses_a_path_that_is_no_session_and_makes_none(self):
+        """Answering from a session the read just built is worse than refusing: the
+        emptiness reads as a fact about the session the operator meant."""
+        missing = self.root / "typo"
+
+        completed = self.invoke("get-session", missing)
+
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn(f"no session at {missing}", completed.stderr)
+        self.assertFalse(missing.exists())
+
+    def test_a_legacy_directory_is_a_session_and_its_first_read_migrates_it(self):
+        """The migration runs on the first open, so session.json has to count as a
+        session or a read would refuse the very thing it exists to convert."""
+        self.assertFalse((self.root / "session.sqlite3").exists())
+
+        document = self.success("get-session", self.root)
+
+        self.assertEqual(document["repo"], SESSION["repo"])
+        self.assertTrue((self.root / "session.sqlite3").exists())
+
+    def test_init_still_makes_a_session_where_there_was_none(self):
+        fresh = self.root / "fresh"
+
+        self.success("init", fresh)
+
+        self.assertTrue((fresh / "session.sqlite3").exists())
+
+
 class InitializingAndDocuments(SessionCtlCase):
     def test_init_can_supervise_a_legacy_cursor_and_exports_it(self):
         (self.root / "decisions.jsonl").write_text(

@@ -206,7 +206,9 @@ def parser():
 
 def run(args):
     if args.command == "init":
-        store = SessionStore(args.session, handled_override=args.handled_seq)
+        store = SessionStore(
+            args.session, handled_override=args.handled_seq, create=True
+        )
         store.export_json()
         return store.reconcile()
 

@@ -534,8 +534,15 @@ def _bounded_file_bytes(path, expected_size, label):
 class SessionStore:
     """The sole mutable authority for one session directory."""
 
-    def __init__(self, root, handled_override=None):
+    def __init__(self, root, handled_override=None, *, create=False):
         self.root = Path(root).expanduser()
+        # A legacy directory is a session before it has a database, and its first open is
+        # the migration, so session.json has to count.
+        if not create and not (
+            (self.root / "session.sqlite3").exists()
+            or (self.root / "session.json").exists()
+        ):
+            raise StoreError(f"no session at {self.root}")
         self.root.mkdir(parents=True, exist_ok=True)
         self.path = self.root / "session.sqlite3"
         self.lock_path = self.root / ".session.lock"
@@ -2696,7 +2703,7 @@ class SessionStore:
             )
             try:
                 self._copy_linked_projections(staging, target)
-                staged_child = SessionStore(staging)
+                staged_child = SessionStore(staging, create=True)
                 self._initialize_linked_child(staged_child, link, target)
                 staged_child.verify_target_files()
                 _fsync_directory(staging)

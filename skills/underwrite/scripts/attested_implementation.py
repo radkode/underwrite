@@ -556,11 +556,7 @@ def link(source_root, repo_root, *, seq, beat, actor, approval, api=None):
 
 
 def links(source_root):
-    # This read prints child_path, so it must never be what creates one.
-    root = Path(source_root)
-    if not (root / "session.sqlite3").exists():
-        raise ImplementationError(f"no session at {root}")
-    return {"links": SessionStore(root).implementation_links()}
+    return {"links": SessionStore(source_root).implementation_links()}
 
 
 def request(child_root, source_root, profile_source, *, api=None):

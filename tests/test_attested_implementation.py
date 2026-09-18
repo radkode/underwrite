@@ -92,7 +92,7 @@ class AttestedImplementationCase(unittest.TestCase):
                 "repo": {"id": 123, "full_name": "acme/widget"},
             },
         }
-        self.source = SessionStore(self.source_root)
+        self.source = SessionStore(self.source_root, create=True)
         capture(
             self.source,
             "acme/widget",
@@ -986,6 +986,23 @@ class AttestedImplementationCase(unittest.TestCase):
         self.assertIn("no session at", refused.stderr.decode())
         self.assertFalse(child_root.exists())
         self.assertEqual(self.link()["link"]["state"], "ready")
+
+    def test_links_reads_a_legacy_source_directory_by_migrating_it(self):
+        """A session is a session before it has a database, and refusing one here would
+        refuse the only thing that converts it."""
+        legacy = Path(self.root) / "legacy-source"
+        (legacy / "beats").mkdir(parents=True)
+        (legacy / "session.json").write_text(
+            json.dumps({"version": 1, "repo": "acme/widget"}), encoding="utf-8"
+        )
+
+        listed = json.loads(
+            self.command(sys.executable, SCRIPTS / "implementationctl.py",
+                         "links", legacy)
+        )
+
+        self.assertEqual(listed, {"links": []})
+        self.assertTrue((legacy / "session.sqlite3").exists())
 
     def test_links_are_listed_in_beat_order_whatever_order_they_were_approved(self):
         """A session can hold one authorization per accepted finding, and the operator's

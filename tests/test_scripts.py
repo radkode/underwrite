@@ -1501,7 +1501,7 @@ class RenderCli(unittest.TestCase):
             }, separators=(",", ":"), sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        store = rr.SessionStore(self.root)
+        store = rr.SessionStore(self.root, create=True)
         store.freeze_target(
             pr_target(state, merged_at), source, metadata, context
         )
@@ -1972,7 +1972,7 @@ class AnchorCli(unittest.TestCase):
         source.write_bytes(self.DIFF)
         metadata.write_text("{}\n", encoding="utf-8")
         self.head = "b" * 40
-        va.SessionStore(self.dir).freeze_target(
+        va.SessionStore(self.dir, create=True).freeze_target(
             {
                 "version": 1,
                 "kind": "github_pr",
