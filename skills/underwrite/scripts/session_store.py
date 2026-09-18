@@ -171,6 +171,25 @@ def _positive(value, name):
     return value
 
 
+def _refuse_slot_collision(beat):
+    """canonical_slots keeps both keys rather than drop one, and every reader past it
+    takes the canonical spelling alone, so the other one's prose reaches nothing."""
+    slots = beat.get("slots")
+    if not isinstance(slots, dict):
+        return
+    spellings = {}
+    for key in slots:
+        if isinstance(key, str) and key.lower() in BEAT_SLOTS:
+            spellings.setdefault(key.lower(), []).append(key)
+    collisions = [
+        f"beat {beat['n']} spells slot {name} as {' and '.join(sorted(keys))}"
+        for name, keys in spellings.items()
+        if len(keys) > 1
+    ]
+    if collisions:
+        raise StoreError("; ".join(collisions) + "; send one")
+
+
 def beat_budget_problems(beat):
     """Return the ways a beat about to be written blows rule 2's budget.
 
@@ -1820,6 +1839,7 @@ class SessionStore:
         )
 
     def _validate_new_beat(self, beat):
+        _refuse_slot_collision(beat)
         if beat.get("state") not in OPEN_STATES:
             raise StoreError(
                 f"new beat state must be one of {', '.join(OPEN_STATES)}"
@@ -3395,6 +3415,7 @@ class SessionStore:
             if row is None:
                 self._validate_new_beat(beat)
             if row is not None:
+                _refuse_slot_collision(beat)
                 current = json.loads(row["body_json"])
                 if isinstance(current.get("slots"), dict):
                     # The incoming beat was canonicalized on the way in.
@@ -3429,14 +3450,8 @@ class SessionStore:
                     if incoming_slots is not None and not isinstance(incoming_slots, dict):
                         raise StoreError(f"beat {beat['n']} slots must be an object")
                     if isinstance(incoming_slots, dict):
-                        # Two spellings of one key survive canonical_slots, and this slot
-                        # is the store's to set, under whichever one the caller sent.
-                        for key in [
-                            name
-                            for name in incoming_slots
-                            if isinstance(name, str) and name.lower() == "fix"
-                        ]:
-                            incoming_slots.pop(key)
+                        # This slot is the store's to set on an accepted beat.
+                        incoming_slots.pop("fix", None)
                     if isinstance(current_slots, dict) and "fix" in current_slots:
                         slots = beat.setdefault("slots", {})
                         if not isinstance(slots, dict):
