@@ -1,0 +1,35 @@
+name: release-drift
+
+on:
+  schedule:
+    # The age arm only advances with the clock, so something has to re-evaluate it.
+    - cron: "17 13 * * *"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Its own file so test.yml keeps its contents: read stance. No pull_request
+# trigger: that is the one event a fork controls, and this job can write issues.
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: release-drift
+
+jobs:
+  report:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Replay the detector over every release this repo has cut
+        run: python3 -m unittest tests.test_release_drift -v
+      - name: Report what no published version reaches
+        run: python3 .github/scripts/release-drift.py --reconcile
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
