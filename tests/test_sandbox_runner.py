@@ -27,10 +27,19 @@ with mock.patch.dict(sys.modules, {"artifacts": artifact_module}):
 INPUT_TREE = "a" * 64
 RUNNER_SHA256 = "b" * 64
 CAPABILITY_SHA256 = "c" * 64
-ISSUED_AT = datetime.now(timezone.utc) - timedelta(seconds=1)
-EXPIRES_AT = ISSUED_AT + timedelta(minutes=5)
-ISSUED_TEXT = sandbox_runner._timestamp(ISSUED_AT)
-EXPIRES_TEXT = sandbox_runner._timestamp(EXPIRES_AT)
+
+
+def capability_window():
+    """Stamped per call. The protocol caps a capability at 300 seconds and discover
+    imports every module before it runs a test, so a module-level one expires."""
+    issued_at = datetime.now(timezone.utc) - timedelta(seconds=1)
+    return issued_at, issued_at + timedelta(minutes=5)
+
+
+def capability_text():
+    return tuple(sandbox_runner._timestamp(stamp) for stamp in capability_window())
+
+
 EXECUTABLE_SHA256 = "d" * 64
 EXECUTABLE = {
     "path": "/usr/local/bin/python3",
@@ -658,8 +667,7 @@ class ChildContractTests(unittest.TestCase):
                     stderr_fd,
                     status_fd,
                     request,
-                    ISSUED_AT,
-                    EXPIRES_AT,
+                    *capability_window(),
                 )
 
         fchdir.assert_called_once_with(cwd_fd)
@@ -729,8 +737,7 @@ class ChildContractTests(unittest.TestCase):
                         output_fd,
                         status_write,
                         request_value(),
-                        ISSUED_AT,
-                        EXPIRES_AT,
+                        *capability_window(),
                     )
                     os._exit(126)
             os.close(status_write)
@@ -831,7 +838,7 @@ class RunJobTests(unittest.TestCase):
         ) as close:
             with self.assertRaisesRegex(sandbox_runner.JobFailure, "could not create"):
                 sandbox_runner._run_job(
-                    request_value(), 20, 21, ISSUED_AT, EXPIRES_AT
+                    request_value(), 20, 21, *capability_window()
                 )
         self.assertEqual(
             {call.args[0] for call in close.mock_calls},
@@ -856,7 +863,7 @@ class RunJobTests(unittest.TestCase):
             sandbox_runner.artifacts, "synthetic_git_tree", return_value="e" * 64
         ) as tree:
             result, stdout, stderr, archive = sandbox_runner._run_job(
-                request_value(), 20, 21, ISSUED_AT, EXPIRES_AT
+                request_value(), 20, 21, *capability_window()
             )
 
         monitor.assert_called_once_with(321, (10, 12, 14), LIMITS)
@@ -951,12 +958,13 @@ class MainProtocolTests(unittest.TestCase):
         run_job.assert_not_called()
 
     def test_clean_run_emits_result_then_exact_stream_and_archive_frames(self):
+        issued_text, expires_text = capability_text()
         return_code, frames, stderr, run_job = self.run_main(
             {
                 "command": "start",
                 "capabilityPayloadSha256": CAPABILITY_SHA256,
-                "issuedAt": ISSUED_TEXT,
-                "expiresAt": EXPIRES_TEXT,
+                "issuedAt": issued_text,
+                "expiresAt": expires_text,
             }
         )
         self.assertEqual(return_code, 0)
@@ -968,12 +976,13 @@ class MainProtocolTests(unittest.TestCase):
         run_job.assert_called_once()
 
     def test_job_failure_emits_no_partial_execution_artifacts(self):
+        issued_text, expires_text = capability_text()
         return_code, frames, stderr, run_job = self.run_main(
             {
                 "command": "start",
                 "capabilityPayloadSha256": CAPABILITY_SHA256,
-                "issuedAt": ISSUED_TEXT,
-                "expiresAt": EXPIRES_TEXT,
+                "issuedAt": issued_text,
+                "expiresAt": expires_text,
             },
             run_error=sandbox_runner.JobFailure("output limit exceeded"),
         )
