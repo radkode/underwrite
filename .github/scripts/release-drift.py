@@ -177,14 +177,14 @@ def tracking_issue(repo):
 
 def reconcile(state, repo):
     """One issue per repo, rewritten in place so a long drift sends one notification."""
+    # Every run, not just a firing one: this is the same issues: write the report
+    # needs, so a token that cannot report fails here instead of during a drift.
+    gh("label", "create", LABEL, "--repo", repo, "--force", "--color", "d4c5f9",
+       "--description", "main is ahead of its published version")
     issue = tracking_issue(repo)
     text = body(state, repo)
     if state["drifting"]:
         if issue is None:
-            # --force so the label is created here rather than as repo config no
-            # reviewer sees, and re-running never fails on an existing one.
-            gh("label", "create", LABEL, "--repo", repo, "--force",
-               "--color", "d4c5f9", "--description", "main is ahead of its published version")
             gh("issue", "create", "--repo", repo, "--title", TITLE,
                "--label", LABEL, "--body", text)
             return "opened"
