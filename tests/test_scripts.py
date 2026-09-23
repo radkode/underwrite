@@ -1537,6 +1537,29 @@ class RenderCli(unittest.TestCase):
         self.assertEqual(self.run_cli().returncode, 0)
         self.assertIn('href="https://github.com/acme/widget/pull/42"', self.page())
 
+    def test_a_frozen_diff_that_fails_to_verify_is_an_error_not_an_unlinked_page(self):
+        store = self.frozen_store(diff="diff --git a/src/app.py b/src/app.py\n")
+        store.put_beat(beat(n=1, where="src/app.py:1"))
+        (self.root / "pr.diff").write_bytes(b"x")
+
+        done = self.run_cli()
+
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("pr.diff does not match", done.stderr)
+        self.assertFalse((self.root / "report.html").exists())
+
+    def test_a_corrupt_session_database_is_an_error_not_an_unlinked_page(self):
+        store = self.frozen_store(diff="diff --git a/src/app.py b/src/app.py\n")
+        store.put_beat(beat(n=1, where="src/app.py:1"))
+        db = self.root / "session.sqlite3"
+        db.write_bytes(db.read_bytes()[: db.stat().st_size // 2])
+
+        done = self.run_cli()
+
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("render-report:", done.stderr)
+        self.assertFalse((self.root / "report.html").exists())
+
     def test_a_target_that_never_reached_the_store_links_nothing(self):
         """A session.json target is JSON a walk wrote, and the page cannot tell whose."""
         self.session({
