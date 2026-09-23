@@ -5,8 +5,8 @@ Render an underwrite session into a self-contained report page.
 Reads the authoritative session database, falling back to legacy JSON, inlines
 assets/report.css, and writes one HTML file that makes no external requests.
 
-Output is a body fragment, which is what the Artifact tool wants. Pass
---standalone for a document shell when the page will be opened as a local file.
+Output is a body fragment. Phase 4 passes --standalone for a document shell,
+because the finished page is a local file unless the reviewer opts into publishing.
 
 Beats are ordered by what is owed, not by beat number: open flags first, then
 accepted, then walked-and-clean. That ordering is the whole point of the page.

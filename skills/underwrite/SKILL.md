@@ -696,13 +696,13 @@ so render them with final delivery checks. Review mode needs a pre-POST preview,
 
 ```bash
 # branch mode
-$S/scripts/render-report.py $R --final
+$S/scripts/render-report.py $R --final --standalone
 
 # report mode
-$S/scripts/render-report.py $R --final
+$S/scripts/render-report.py $R --final --standalone
 
 # review mode, before the GitHub POST
-$S/scripts/render-report.py $R
+$S/scripts/render-report.py $R --standalone
 ```
 
 Every render states what the walk covered against what it planned, and names the beats it
@@ -717,9 +717,17 @@ failed validation and carries an `UNPROVEN` chip. For an open beat, read the aut
 object with `get-beat`, fix the complete object through `put-beat`, and re-render. Report
 acceptance validates and freezes the agent-authored finding, so an accepted report beat
 that later fails validation is an integrity error. Stop instead of trying to mutate it.
-Do not ship an unproven page. Publish with the `Artifact` tool. If that tool is unavailable,
-re-render with `--standalone` so the file opens correctly in a browser, and report the
-local `$R/report.html` path instead.
+Do not ship an unproven page. The finished page is the local file `$R/report.html`; report
+its path. That is the default outcome, and nothing leaves this machine.
+
+**Publishing is opt-in.** The page embeds quoted lines of the reviewed diff, its file paths,
+the reconstruction, every finding, the reviewer's notes and decisions, and the repository,
+PR and head SHA. Publishing it with the `Artifact` tool uploads all of that to claude.ai as
+a hosted page. Never publish unasked, and never read consent into an
+earlier yes to a review, a push, or an implementation. Once the session's final render
+passes, offer it once through the structured question tool, naming both facts in the
+question, with **Keep it local** and **Publish to claude.ai** as the options. Publish only
+on an explicit yes, and publish that same `$R/report.html`.
 
 **Branch mode.** The commits already exist from Phase 3. Report the branch and
 `git log --oneline`, and offer to push and open a PR. Do not do either unasked. A session
@@ -829,14 +837,14 @@ $S/scripts/sessionctl.py check-pr "$R"
 Then re-render the report with final delivery checks:
 
 ```bash
-$S/scripts/render-report.py $R --final
+$S/scripts/render-report.py $R --final --standalone
 ```
 
 Exit 2 now means the review posted but its write-back is incomplete. Repair it through
 the idempotent `land` and `patch-session` commands, then run the render again. Once it
-passes, re-publish the updated artifact so the page the reviewer keeps shows the review
-URL and What lands. If Artifact is unavailable, run the same command with `--standalone`
-and report the updated local file.
+passes, report the updated local file, which is the page the reviewer keeps with the review
+URL and What lands. If the reviewer already agreed to publish an earlier render,
+re-publish the updated artifact; otherwise make the publishing offer above now.
 
 ## Session state
 
