@@ -277,6 +277,60 @@ class ReportModeContract(unittest.TestCase):
         self.assertIn("author cannot approve their own PR", text)
 
 
+class PublishingIsOptIn(unittest.TestCase):
+    """The page quotes the reviewed diff, and Phase 4 used to publish it to claude.ai as
+    the normal end of a session with no question asked (DD-2361)."""
+
+    def finish(self):
+        text = " ".join(SKILL.read_text(encoding="utf-8").split())
+        return text[text.index("## Phase 4: finish"):text.index("## Session state")]
+
+    def test_every_phase_four_render_writes_the_local_file(self):
+        renders = [
+            line for line in SKILL.read_text(encoding="utf-8").splitlines()
+            if "render-report.py $R" in line
+        ]
+        self.assertTrue(renders)
+        for line in renders:
+            with self.subTest(line=line):
+                self.assertIn("--standalone", line)
+
+    def test_the_local_file_is_the_default_outcome(self):
+        rule = self.finish()
+        self.assertNotIn("Publish with the `Artifact` tool. If that tool is unavailable", rule)
+        self.assertIn("The finished page is the local file `$R/report.html`", rule)
+        self.assertIn("nothing leaves this machine", rule)
+
+    def test_publishing_waits_for_a_consent_that_names_the_diff_and_claude_ai(self):
+        rule = self.finish()
+        self.assertIn("**Publishing is opt-in.**", rule)
+        self.assertIn("quoted lines of the reviewed diff", rule)
+        self.assertIn("uploads all of that to claude.ai", rule)
+        self.assertIn("Never publish unasked", rule)
+        self.assertIn("**Keep it local**", rule)
+        self.assertIn("**Publish to claude.ai**", rule)
+        ask = rule.index("Publish only on an explicit yes")
+        self.assertLess(rule.index("**Publishing is opt-in.**"), ask)
+
+    def test_republishing_follows_an_earlier_yes_only(self):
+        rule = self.finish()
+        self.assertIn(
+            "If the reviewer already agreed to publish an earlier render, re-publish the "
+            "updated artifact",
+            rule,
+        )
+
+    def test_readme_says_what_publishing_sends_where(self):
+        text = " ".join(README.read_text(encoding="utf-8").split())
+        finish = text[text.index("**Finish.**"):text.index("## Trust and execution")]
+        self.assertIn("`report.html` in the session directory", finish)
+        self.assertIn("only after you say yes", finish)
+        self.assertIn("quoted lines of the reviewed diff", finish)
+        self.assertIn("claude.ai", finish)
+        page = text[text.index("## The page drives"):text.index("## Session state")]
+        self.assertIn("stays on your machine unless you agree to publish it", page)
+
+
 class FrozenSnapshotContract(unittest.TestCase):
     def skill(self):
         return SKILL.read_text(encoding="utf-8")
