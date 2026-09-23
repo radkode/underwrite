@@ -102,7 +102,8 @@ would not paste into claude.ai.
 Start a PR review from a clean checkout of its base, never from the PR head. Keep that
 controller checkout on the base for the whole session. A controller may load repository
 instructions before Underwrite begins, so discovering the mistake later is not enough:
-stop and restart from the base checkout.
+stop and restart from the base checkout. The refusal names what it found and prints the
+command for a fresh checkout of the exact base to restart from.
 
 Every PR head is untrusted executable input, regardless of author, fork, audience, review,
 or merge state. Underwrite reads the head, PR conversation, linked issues, and command

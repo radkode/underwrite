@@ -99,6 +99,14 @@ restart from a clean checkout of the base revision. Do not check out the base an
 in the same controller: repository instructions may already have been loaded before this
 skill began, and a later trusted-context manifest cannot undo that exposure.
 
+A controller at the wrong revision (including a clean `main` that only lags the base), or
+with any local change (staged, modified, deleted, untracked, or an ignored governing file
+that `git status` hides), is refused with the offending SHA or paths and a `git worktree
+add --detach` command for a fresh checkout of the exact base, placed beside the
+repository's main checkout rather than inside it. Relay that command and tell the reviewer
+to restart the review from the fresh checkout, because this session may already hold what
+it loaded.
+
 Check for an existing session first at `$R`. For a PR session, verify its frozen target
 and the controller checkout before offering to resume:
 
@@ -107,9 +115,12 @@ $S/scripts/sessionctl.py check-pr "$R"
 $S/scripts/sessionctl.py check-controller "$R" "$PWD"
 ```
 
-Exit 2 means its base, head, lifecycle, or controller moved. Stop and reconcile into a
+Exit 2 from `check-pr` means its base, head, or lifecycle moved. Stop and reconcile into a
 supervised replacement session. Never refresh the target or diff inside the existing
-session. An operational failure exits 1 and also blocks resumption until it is understood.
+session. A `check-controller` refusal means the controller checkout is wrong, not that the
+target moved: exit 2 for the wrong revision, exit 1 for a local change, and either way
+follow the printed command as above. Any other failure exits 1 and also blocks resumption
+until it is understood.
 
 Otherwise say what is about to happen before it does: you are freezing the target,
 fetching its objects, and reading the context around it, and then two decisions stand
@@ -138,8 +149,10 @@ $S/scripts/sessionctl.py snapshot-pr "$R" <owner/repo> <n> --controller-root "$P
 fetches the exact base commit and the base repository's `refs/pull/<n>/head` into a fresh
 bare repository, verifies both fetched commits, and saves a local three-dot diff plus a
 Git object bundle containing those exact revisions. It reads the PR again before freezing
-the target. Exit 2 means the PR moved during capture; repeat the new capture. It never uses
-a GitHub-rendered diff, whose successful response does not prove completeness.
+the target. Exit 2 means the PR moved during capture; repeat the new capture. When it
+says the controller checkout is not at the frozen base, follow the printed command
+instead. It never uses a GitHub-rendered diff, whose successful response does not prove
+completeness.
 
 The same capture builds `trusted-context.json` from `target.base_sha`. It includes every
 versioned `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, `CLAUDE.local.md`, and
