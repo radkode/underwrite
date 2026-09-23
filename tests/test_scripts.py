@@ -103,6 +103,23 @@ class BeatValidation(unittest.TestCase):
     def test_an_accept_may_still_have_delegated_work_pending(self):
         self.assertEqual(rr.validate(beat(state="accepted")), [])
 
+    def test_a_final_accept_with_pending_or_failed_delivery_is_not_shippable(self):
+        """The page said Implementation failed and the final render exited 0."""
+        for state in ("pending", "failed"):
+            accepted = beat(
+                state="accepted",
+                landed="abc1234",
+                branch="jacek/fix",
+                delivery_kind="commit",
+                delivery={"state": state, "error": "push rejected"},
+            )
+            with self.subTest(state=state):
+                self.assertEqual(rr.validate(accepted), [])
+                self.assertIn(
+                    f"accepted, {state} delivery",
+                    rr.validate(accepted, final=True)[0],
+                )
+
     def test_accepted_naming_what_it_landed_is_shippable(self):
         self.assertEqual(
             rr.validate(beat(
@@ -1618,6 +1635,27 @@ class RenderCli(unittest.TestCase):
 
         self.assertEqual(final.returncode, 2)
         self.assertIn("accepted, nothing landed", final.stderr)
+
+    def test_a_failed_branch_delivery_is_live_but_not_final(self):
+        self.session({
+            "repo": "acme/widget",
+            "audience": {"mode": "branch", "why": "the author owns the branch"},
+        })
+        self.put(beat(
+            n=1,
+            state="accepted",
+            landed="abc1234",
+            branch="jacek/fix",
+            delivery_kind="commit",
+            delivery={"state": "failed", "error": "push rejected"},
+        ))
+
+        self.assertEqual(self.run_cli().returncode, 0)
+        final = self.run_cli("--final")
+
+        self.assertEqual(final.returncode, 2)
+        self.assertIn("accepted, failed delivery", final.stderr)
+        self.assertIn("Implementation failed", self.page())
 
     def test_a_report_accept_is_terminal_in_the_final_report(self):
         store = self.frozen_store()
