@@ -176,6 +176,7 @@ class OverThisRepoHistory(unittest.TestCase):
         "0.6.4": False,
         "0.6.5": False,
         "0.7.0": True,
+        "0.8.0": False,
     }
 
     def releases(self):
