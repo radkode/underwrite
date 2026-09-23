@@ -90,12 +90,20 @@ It does not call `land` or create a GitHub effect.
 A linked child may land its verified output as one commit whose only parent is the frozen
 PR head. It updates only its generated local branch and never pushes.
 
+Every session ends with its page rendered to `report.html` in the session directory, on your
+machine. Once the final render passes, Underwrite offers to publish that page as a hosted
+Artifact on claude.ai, and does so only after you say yes. The page carries quoted lines of
+the reviewed diff, the changed file paths, the reconstruction, every finding, and your notes
+and decisions, so publishing uploads all of it. Say no for a private or client repository you
+would not paste into claude.ai.
+
 ## Trust and execution
 
 Start a PR review from a clean checkout of its base, never from the PR head. Keep that
 controller checkout on the base for the whole session. A controller may load repository
 instructions before Underwrite begins, so discovering the mistake later is not enough:
-stop and restart from the base checkout.
+stop and restart from the base checkout. The refusal names what it found and prints the
+command for a fresh checkout of the exact base to restart from.
 
 Every PR head is untrusted executable input, regardless of author, fork, audience, review,
 or merge state. Underwrite reads the head, PR conversation, linked issues, and command
@@ -157,6 +165,7 @@ proof. When the walk ends, that ledger is the page, and it is what the final ren
 Above it sits what the walk covered against what it planned, with any beat it never
 reached named and tiered, because a review that stopped at 6 of 9 should not read like one
 that finished.
+The final render stays on your machine unless you agree to publish it, as **Finish** says.
 The keys do what the row under the beat says: Enter saves a note, or records a decision
 when the note is the decision; ⌘Enter or Ctrl+Enter fires the row's primary action; `n`
 is Next beat and `f` goes to the first open flag.

@@ -114,6 +114,7 @@ class BranchWorkflow(WorkflowCase):
             "render-report.py", self.session, "--final", expected=2
         )
         self.assertIn("accepted, nothing landed", unfinished.stderr)
+        self.assertIn("accepted, failed delivery", unfinished.stderr)
         self.assertIn(
             "Implementation failed",
             (self.session / "report.html").read_text(encoding="utf-8"),

@@ -4,6 +4,7 @@
 import importlib.util
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -410,6 +411,21 @@ class TargetCommands(SessionCtlCase):
         changed = self.invoke("check-pr", self.root, env=self.gh(moved))
         self.assertEqual(changed.returncode, 2)
         self.assertIn("head_sha changed", changed.stderr)
+
+    def test_check_controller_off_the_base_prints_the_command_to_proceed(self):
+        moved = self.invoke("check-controller", self.root, self.repo)
+        self.assertEqual(moved.returncode, 2)
+        self.assertIn(f"not the frozen base {self.base}", moved.stderr)
+        command = moved.stderr.split("`")[1]
+        fresh = shlex.split(moved.stderr.split("then restart the review from ", 1)[1])[0]
+        self.assertIn(f"worktree add --detach {shlex.quote(fresh)} {self.base}", command)
+        self.assertIn("-c core.hooksPath=/dev/null", command)
+        subprocess.run(command, shell=True, check=True, capture_output=True)
+        self.assertFalse(Path(fresh).resolve().is_relative_to(self.repo.resolve()))
+
+        exact = self.invoke("check-controller", self.root, fresh)
+        self.assertEqual(exact.returncode, 0, exact.stderr)
+        self.assertEqual(json.loads(exact.stdout)["base_sha"], self.base)
 
     def test_open_pr_uses_review_and_never_enters_commit_delivery(self):
         pinned = self.invoke("pin-branch", self.root, "feature")

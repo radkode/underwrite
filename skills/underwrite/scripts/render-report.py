@@ -5,8 +5,8 @@ Render an underwrite session into a self-contained report page.
 Reads the authoritative session database, falling back to legacy JSON, inlines
 assets/report.css, and writes one HTML file that makes no external requests.
 
-Output is a body fragment, which is what the Artifact tool wants. Pass
---standalone for a document shell when the page will be opened as a local file.
+Output is a body fragment. Phase 4 passes --standalone for a document shell,
+because the finished page is a local file unless the reviewer opts into publishing.
 
 Beats are ordered by what is owed, not by beat number: open flags first, then
 accepted, then walked-and-clean. That ordering is the whole point of the page.
@@ -699,10 +699,7 @@ def changed_paths(root, session):
     # Reading the allowlist must not attempt the migration write a legacy session needs.
     if not stored(root):
         return ()
-    try:
-        return tuple(SessionStore(root).changed_paths())
-    except (OSError, sqlite3.Error, StoreError, ValueError):
-        return ()
+    return tuple(SessionStore(root).changed_paths())
 
 
 def resolve_path(candidate, paths):
@@ -1384,13 +1381,14 @@ def main():
         session, beats, css, problems_by_n, all_problems = load(
             root, css_path, args.final
         )
+        paths = changed_paths(root, session)
     except (OSError, sqlite3.Error, StoreError, json.JSONDecodeError) as err:
         sys.exit(f"render-report: {err}")
 
     out = Path(args.out).expanduser() if args.out else root / "report.html"
     page = render(
         session, beats, css, problems_by_n, args.live,
-        paths=changed_paths(root, session), is_stored=stored(root),
+        paths=paths, is_stored=stored(root),
     )
     out.write_text(SHELL + page if args.standalone else page, encoding="utf-8")
 

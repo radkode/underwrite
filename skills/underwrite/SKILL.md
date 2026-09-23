@@ -99,6 +99,14 @@ restart from a clean checkout of the base revision. Do not check out the base an
 in the same controller: repository instructions may already have been loaded before this
 skill began, and a later trusted-context manifest cannot undo that exposure.
 
+A controller at the wrong revision (including a clean `main` that only lags the base), or
+with any local change (staged, modified, deleted, untracked, or an ignored governing file
+that `git status` hides), is refused with the offending SHA or paths and a `git worktree
+add --detach` command for a fresh checkout of the exact base, placed beside the
+repository's main checkout rather than inside it. Relay that command and tell the reviewer
+to restart the review from the fresh checkout, because this session may already hold what
+it loaded.
+
 Check for an existing session first at `$R`. For a PR session, verify its frozen target
 and the controller checkout before offering to resume:
 
@@ -107,9 +115,12 @@ $S/scripts/sessionctl.py check-pr "$R"
 $S/scripts/sessionctl.py check-controller "$R" "$PWD"
 ```
 
-Exit 2 means its base, head, lifecycle, or controller moved. Stop and reconcile into a
+Exit 2 from `check-pr` means its base, head, or lifecycle moved. Stop and reconcile into a
 supervised replacement session. Never refresh the target or diff inside the existing
-session. An operational failure exits 1 and also blocks resumption until it is understood.
+session. A `check-controller` refusal means the controller checkout is wrong, not that the
+target moved: exit 2 for the wrong revision, exit 1 for a local change, and either way
+follow the printed command as above. Any other failure exits 1 and also blocks resumption
+until it is understood.
 
 Otherwise say what is about to happen before it does: you are freezing the target,
 fetching its objects, and reading the context around it, and then two decisions stand
@@ -138,8 +149,10 @@ $S/scripts/sessionctl.py snapshot-pr "$R" <owner/repo> <n> --controller-root "$P
 fetches the exact base commit and the base repository's `refs/pull/<n>/head` into a fresh
 bare repository, verifies both fetched commits, and saves a local three-dot diff plus a
 Git object bundle containing those exact revisions. It reads the PR again before freezing
-the target. Exit 2 means the PR moved during capture; repeat the new capture. It never uses
-a GitHub-rendered diff, whose successful response does not prove completeness.
+the target. Exit 2 means the PR moved during capture; repeat the new capture. When it
+says the controller checkout is not at the frozen base, follow the printed command
+instead. It never uses a GitHub-rendered diff, whose successful response does not prove
+completeness.
 
 The same capture builds `trusted-context.json` from `target.base_sha`. It includes every
 versioned `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, `CLAUDE.local.md`, and
@@ -696,13 +709,13 @@ so render them with final delivery checks. Review mode needs a pre-POST preview,
 
 ```bash
 # branch mode
-$S/scripts/render-report.py $R --final
+$S/scripts/render-report.py $R --final --standalone
 
 # report mode
-$S/scripts/render-report.py $R --final
+$S/scripts/render-report.py $R --final --standalone
 
 # review mode, before the GitHub POST
-$S/scripts/render-report.py $R
+$S/scripts/render-report.py $R --standalone
 ```
 
 Every render states what the walk covered against what it planned, and names the beats it
@@ -717,9 +730,17 @@ failed validation and carries an `UNPROVEN` chip. For an open beat, read the aut
 object with `get-beat`, fix the complete object through `put-beat`, and re-render. Report
 acceptance validates and freezes the agent-authored finding, so an accepted report beat
 that later fails validation is an integrity error. Stop instead of trying to mutate it.
-Do not ship an unproven page. Publish with the `Artifact` tool. If that tool is unavailable,
-re-render with `--standalone` so the file opens correctly in a browser, and report the
-local `$R/report.html` path instead.
+Do not ship an unproven page. The finished page is the local file `$R/report.html`; report
+its path. That is the default outcome, and nothing leaves this machine.
+
+**Publishing is opt-in.** The page embeds quoted lines of the reviewed diff, its file paths,
+the reconstruction, every finding, the reviewer's notes and decisions, and the repository,
+PR and head SHA. Publishing it with the `Artifact` tool uploads all of that to claude.ai as
+a hosted page. Never publish unasked, and never read consent into an
+earlier yes to a review, a push, or an implementation. Once the session's final render
+passes, offer it once through the structured question tool, naming both facts in the
+question, with **Keep it local** and **Publish to claude.ai** as the options. Publish only
+on an explicit yes, and publish that same `$R/report.html`.
 
 **Branch mode.** The commits already exist from Phase 3. Report the branch and
 `git log --oneline`, and offer to push and open a PR. Do not do either unasked. A session
@@ -829,14 +850,14 @@ $S/scripts/sessionctl.py check-pr "$R"
 Then re-render the report with final delivery checks:
 
 ```bash
-$S/scripts/render-report.py $R --final
+$S/scripts/render-report.py $R --final --standalone
 ```
 
 Exit 2 now means the review posted but its write-back is incomplete. Repair it through
 the idempotent `land` and `patch-session` commands, then run the render again. Once it
-passes, re-publish the updated artifact so the page the reviewer keeps shows the review
-URL and What lands. If Artifact is unavailable, run the same command with `--standalone`
-and report the updated local file.
+passes, report the updated local file, which is the page the reviewer keeps with the review
+URL and What lands. If the reviewer already agreed to publish an earlier render,
+re-publish the updated artifact; otherwise make the publishing offer above now.
 
 ## Session state
 
