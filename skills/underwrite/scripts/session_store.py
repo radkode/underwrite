@@ -279,6 +279,10 @@ def validate_beat(beat, mode="branch", final=False):
     elif state == "accepted":
         if final and not beat.get("landed"):
             problems.append(f"beat {n}: accepted, nothing landed")
+        delivery = beat.get("delivery")
+        if final and isinstance(delivery, dict):
+            if delivery.get("state") in ("pending", "failed"):
+                problems.append(f"beat {n}: accepted, {delivery['state']} delivery")
         if beat.get("landed"):
             expected_delivery = {
                 "branch": "commit",
