@@ -417,11 +417,10 @@ class TargetCommands(SessionCtlCase):
         self.assertEqual(moved.returncode, 2)
         self.assertIn(f"not the frozen base {self.base}", moved.stderr)
         command = moved.stderr.split("`")[1]
-        self.assertIn("worktree add --detach", command)
-        self.assertTrue(command.endswith(self.base), command)
+        fresh = shlex.split(moved.stderr.split("then restart the review from ", 1)[1])[0]
+        self.assertIn(f"worktree add --detach {shlex.quote(fresh)} {self.base}", command)
+        self.assertIn("-c core.hooksPath=/dev/null", command)
         subprocess.run(command, shell=True, check=True, capture_output=True)
-        fresh = shlex.split(command)[-2]
-        self.assertIn(f"restart the review from {shlex.quote(fresh)}", moved.stderr)
         self.assertFalse(Path(fresh).resolve().is_relative_to(self.repo.resolve()))
 
         exact = self.invoke("check-controller", self.root, fresh)

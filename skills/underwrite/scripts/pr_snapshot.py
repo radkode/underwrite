@@ -557,7 +557,7 @@ def _listing(paths):
     return f"{shown} and {hidden} more" if hidden > 0 else shown
 
 
-def _fresh_base_hint(top, base_sha, rerun=None):
+def _fresh_base_hint(top, base_sha):
     common = Path(
         os.fsdecode(_git(["rev-parse", "--git-common-dir"], top, safe=True).strip())
     )
@@ -571,26 +571,24 @@ def _fresh_base_hint(top, base_sha, rerun=None):
         suffix += 1
         path = root.parent / f"{name}-{suffix}"
     quoted = shlex.quote(str(path))
-    git = f"git -C {shlex.quote(str(root))}"
-    command = f"{git} worktree add --detach {quoted} {base_sha}"
+    # Hooks may come from the refused tree, and a sparse main copies its patterns over.
+    git = "git -c core.hooksPath=/dev/null -c core.fsmonitor=false"
+    here = f"{git} -C {shlex.quote(str(root))}"
+    command = (
+        f"{here} worktree add --detach {quoted} {base_sha}"
+        f" && {git} -C {quoted} sparse-checkout disable"
+    )
     try:
         _commit(top, base_sha)
     except SnapshotError:
-        command = f"{git} fetch origin {base_sha} && {command}"
-    # A controller that may hold untrusted instructions must restart, not just rerun.
-    then = f"{rerun} {quoted}" if rerun else f"restart the review from {quoted}"
-    return f"make a fresh checkout of the exact base with `{command}`, then {then}"
+        command = f"{here} fetch origin {base_sha} && {command}"
+    return (
+        f"make a fresh checkout of the exact base with `{command}`, then restart "
+        f"the review from {quoted}"
+    )
 
 
-def _is_ancestor(repo, ancestor, descendant):
-    try:
-        _git(["merge-base", "--is-ancestor", ancestor, descendant], repo, safe=True)
-    except SnapshotError:
-        return False
-    return True
-
-
-def _controller_at_base(repo_root, base_sha, rerun="rerun with --controller-root"):
+def _controller_at_base(repo_root, base_sha):
     requested = Path(repo_root).expanduser().resolve()
     try:
         top = Path(
@@ -603,18 +601,9 @@ def _controller_at_base(repo_root, base_sha, rerun="rerun with --controller-root
     _reject_controller_config(top)
     head = _commit(top, "HEAD")
     if head != base_sha:
-        moved = f"controller checkout is at {head}, not the frozen base {base_sha}"
-        clean = False
-        if _is_ancestor(top, head, base_sha):
-            try:
-                _reject_unclean(top)
-                clean = True
-            except _UncleanController as error:
-                moved = f"{moved}, and {error}"
-            except SnapshotError:
-                pass
         raise TargetMoved(
-            f"{moved}; " + _fresh_base_hint(top, base_sha, rerun if clean else None)
+            f"controller checkout is at {head}, not the frozen base {base_sha}; "
+            + _fresh_base_hint(top, base_sha)
         )
     try:
         _reject_unclean(top)
@@ -1159,9 +1148,7 @@ def capture(store, repo, number, controller_root, api=load_pr):
 
 def check_controller(store, repo_root):
     target = store.verify_target_files()
-    return _controller_at_base(
-        repo_root, target["base_sha"], rerun="rerun check-controller with"
-    )
+    return _controller_at_base(repo_root, target["base_sha"])
 
 
 def check(store, require_open=False, api=load_pr):

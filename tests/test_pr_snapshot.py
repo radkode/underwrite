@@ -974,15 +974,18 @@ class ControllerRefusals(SnapshotCase):
         self.assertNotIn("target", self.store.snapshot()[0])
         return str(caught.exception)
 
-    def proceed(self, message, then, controller=None):
+    def proceed(self, message, controller=None):
         command = message.split("`")[1]
-        self.assertIn("worktree add --detach", command)
-        self.assertTrue(command.endswith(self.base), command)
+        fresh = shlex.split(message.split("then restart the review from ", 1)[1])[0]
+        self.assertIn(
+            f"worktree add --detach {shlex.quote(fresh)} {self.base} && ", command
+        )
+        self.assertIn("-c core.hooksPath=/dev/null", command)
         subprocess.run(command, shell=True, check=True, capture_output=True)
-        fresh = shlex.split(command)[-2]
-        self.assertIn(f"then {then} {shlex.quote(fresh)}", message)
-        refused = Path(controller or self.work).resolve()
-        self.assertFalse(Path(fresh).resolve().is_relative_to(refused), fresh)
+        for refused in (controller or self.work, self.work):
+            self.assertFalse(
+                Path(fresh).resolve().is_relative_to(Path(refused).resolve()), fresh
+            )
         metadata = self.metadata()
         target = pr_snapshot.capture(
             self.store,
@@ -1002,15 +1005,11 @@ class ControllerRefusals(SnapshotCase):
 
         self.assertIn(f"not the frozen base {self.base}", message)
         self.assertNotIn("fetch", message)
-        self.proceed(message, "rerun with --controller-root")
-        with self.assertRaisesRegex(
-            pr_snapshot.TargetMoved, "then rerun check-controller with "
-        ):
-            pr_snapshot.check_controller(self.store, self.work)
+        self.proceed(message)
 
     def test_a_lagging_checkout_without_the_base_is_told_to_fetch_it(self):
         lagging = self.root / "lagging"
-        self.git("clone", "--quiet", self.remote, lagging)
+        self.git("clone", "--quiet", "--branch", "main", self.remote, lagging)
         self.git("-C", lagging, "reset", "--hard", "HEAD~1")
         self.git("-C", lagging, "update-ref", "-d", "refs/remotes/origin/main")
         self.git("-C", lagging, "reflog", "expire", "--expire=now", "--all")
@@ -1019,35 +1018,23 @@ class ControllerRefusals(SnapshotCase):
         message = self.refusal(pr_snapshot.TargetMoved, controller=lagging)
 
         self.assertIn(f"fetch origin {self.base} && ", message)
-        self.proceed(message, "restart the review from", controller=lagging)
+        self.proceed(message, controller=lagging)
 
-    def test_a_dirty_main_behind_the_base_is_told_to_restart_not_rerun(self):
-        self.git("-C", self.work, "reset", "--hard", "HEAD~1")
-        (self.work / "common.txt").write_text("PR head policy\n", encoding="utf-8")
-
-        message = self.refusal(pr_snapshot.TargetMoved)
-
-        self.assertIn('does not match HEAD: "common.txt"', message)
-        self.assertNotIn("--controller-root", message)
-        self.proceed(message, "restart the review from")
-
-    def test_a_main_behind_the_base_with_an_untracked_file_is_told_to_restart(self):
-        self.git("-C", self.work, "reset", "--hard", "HEAD~1")
-        (self.work / "AGENTS.md").write_text("PR head policy\n", encoding="utf-8")
+    def test_a_sparse_main_does_not_hand_its_patterns_to_the_fresh_checkout(self):
+        self.git("-C", self.work, "sparse-checkout", "set", "--no-cone", "/common.txt")
+        self.git("-C", self.work, "checkout", "--quiet", "feature")
 
         message = self.refusal(pr_snapshot.TargetMoved)
 
-        self.assertIn('untracked: "AGENTS.md"', message)
-        self.assertNotIn("--controller-root", message)
-        self.proceed(message, "restart the review from")
+        self.proceed(message)
 
-    def test_a_controller_at_the_pr_head_is_told_to_restart_not_rerun(self):
-        self.git("-C", self.work, "checkout", "feature")
+    def test_a_linked_worktree_at_the_pr_head_gets_a_checkout_outside_the_main_one(self):
+        linked = self.work / ".worktrees" / "pr"
+        self.git("-C", self.work, "worktree", "add", "--quiet", "--detach", linked, "feature")
 
-        message = self.refusal(pr_snapshot.TargetMoved)
+        message = self.refusal(pr_snapshot.TargetMoved, controller=linked)
 
-        self.assertNotIn("--controller-root", message)
-        self.proceed(message, "restart the review from")
+        self.proceed(message, controller=linked)
 
     def test_untracked_files_are_named_capped_and_distinguished_from_stash(self):
         for index in range(7):
@@ -1059,7 +1046,7 @@ class ControllerRefusals(SnapshotCase):
         self.assertIn('"stray-4.txt" and 2 more', message)
         self.assertNotIn("stray-5.txt", message)
         self.assertIn("git stash", message)
-        self.proceed(message, "restart the review from")
+        self.proceed(message)
 
     def test_ignored_governing_files_git_status_hides_are_named(self):
         (self.work / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
@@ -1076,7 +1063,7 @@ class ControllerRefusals(SnapshotCase):
 
         self.assertIn('"node_modules/pkg/AGENTS.md"', message)
         self.assertIn("git status", message)
-        self.proceed(message, "restart the review from")
+        self.proceed(message)
 
     def test_a_modified_tracked_file_is_named(self):
         (self.work / "common.txt").write_text("changed\n", encoding="utf-8")
@@ -1084,7 +1071,7 @@ class ControllerRefusals(SnapshotCase):
         message = self.refusal()
 
         self.assertIn('does not match HEAD: "common.txt"', message)
-        self.proceed(message, "restart the review from")
+        self.proceed(message)
 
     def test_staged_deleted_and_concealed_changes_are_named(self):
         common = self.work / "common.txt"
