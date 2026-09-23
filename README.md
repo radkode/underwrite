@@ -95,7 +95,9 @@ PR head. It updates only its generated local branch and never pushes.
 Start a PR review from a clean checkout of its base, never from the PR head. Keep that
 controller checkout on the base for the whole session. A controller may load repository
 instructions before Underwrite begins, so discovering the mistake later is not enough:
-stop and restart from the base checkout.
+stop and restart from the base checkout. The one exception is a clean checkout that is
+only behind the base, such as an older `main`: everything it loaded is already in the
+base's history, so the refusal prints a fresh base checkout to continue with instead.
 
 Every PR head is untrusted executable input, regardless of author, fork, audience, review,
 or merge state. Underwrite reads the head, PR conversation, linked issues, and command

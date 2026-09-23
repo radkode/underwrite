@@ -99,17 +99,30 @@ restart from a clean checkout of the base revision. Do not check out the base an
 in the same controller: repository instructions may already have been loaded before this
 skill began, and a later trusted-context manifest cannot undo that exposure.
 
+A controller at the wrong revision, or with any local change (staged, modified, deleted,
+untracked, or an ignored governing file that `git status` hides), is refused with the
+offending SHA or paths and a `git worktree add --detach` command for a fresh checkout of
+the exact base beside the refused one. When the checkout is clean and only behind the
+base, such as a `main` that lags it, the refusal says to rerun with that fresh checkout.
+Every other refusal says to restart the review from it, because this session may already
+hold what it loaded.
+
+Below, `$B` is the controller checkout: `$PWD`, or the fresh checkout a refusal told you
+to rerun with. Every later `check-controller` in the session uses the same `$B`.
+
 Check for an existing session first at `$R`. For a PR session, verify its frozen target
 and the controller checkout before offering to resume:
 
 ```bash
 $S/scripts/sessionctl.py check-pr "$R"
-$S/scripts/sessionctl.py check-controller "$R" "$PWD"
+$S/scripts/sessionctl.py check-controller "$R" "$B"
 ```
 
-Exit 2 means its base, head, lifecycle, or controller moved. Stop and reconcile into a
+Exit 2 from `check-pr` means its base, head, or lifecycle moved. Stop and reconcile into a
 supervised replacement session. Never refresh the target or diff inside the existing
-session. An operational failure exits 1 and also blocks resumption until it is understood.
+session. Exit 2 from `check-controller` means the controller checkout is not at the frozen
+base, not that the target moved: follow the printed command as above. An operational
+failure exits 1 and also blocks resumption until it is understood.
 
 Otherwise say what is about to happen before it does: you are freezing the target,
 fetching its objects, and reading the context around it, and then two decisions stand
@@ -131,15 +144,17 @@ contextual reads:
 ```bash
 mkdir -p "$R"
 $S/scripts/sessionctl.py init "$R"
-$S/scripts/sessionctl.py snapshot-pr "$R" <owner/repo> <n> --controller-root "$PWD"
+$S/scripts/sessionctl.py snapshot-pr "$R" <owner/repo> <n> --controller-root "$B"
 ```
 
 `snapshot-pr` reads both SHAs and the head repository and ref from one GitHub response,
 fetches the exact base commit and the base repository's `refs/pull/<n>/head` into a fresh
 bare repository, verifies both fetched commits, and saves a local three-dot diff plus a
 Git object bundle containing those exact revisions. It reads the PR again before freezing
-the target. Exit 2 means the PR moved during capture; repeat the new capture. It never uses
-a GitHub-rendered diff, whose successful response does not prove completeness.
+the target. Exit 2 means the PR moved during capture; repeat the new capture. When it
+says the controller checkout is not at the frozen base, follow the printed command
+instead. It never uses a GitHub-rendered diff, whose successful response does not prove
+completeness.
 
 The same capture builds `trusted-context.json` from `target.base_sha`. It includes every
 versioned `AGENTS.md`, `AGENTS.override.md`, `CLAUDE.md`, `CLAUDE.local.md`, and

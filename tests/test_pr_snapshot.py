@@ -4,6 +4,7 @@
 import hashlib
 import json
 import os
+import shlex
 import shutil
 import sqlite3
 import subprocess
@@ -289,7 +290,7 @@ class Capturing(SnapshotCase):
         self.assertEqual(self.git("-C", self.work, "status", "--porcelain"), "")
         metadata = self.metadata()
 
-        with self.assertRaisesRegex(pr_snapshot.SnapshotError, "is not empty"):
+        with self.assertRaisesRegex(pr_snapshot.SnapshotError, 'is not empty: "sub"'):
             pr_snapshot.capture(
                 self.store,
                 "acme/widget",
@@ -957,6 +958,181 @@ class Capturing(SnapshotCase):
                 self.store, "acme/widget", 7, self.work,
                 api=mock.Mock(side_effect=[metadata, metadata]),
             )
+
+
+class ControllerRefusals(SnapshotCase):
+    def refusal(self, error=pr_snapshot.SnapshotError, controller=None):
+        metadata = self.metadata()
+        with self.assertRaises(error) as caught:
+            pr_snapshot.capture(
+                self.store,
+                "acme/widget",
+                7,
+                controller or self.work,
+                api=mock.Mock(side_effect=[metadata, metadata]),
+            )
+        self.assertNotIn("target", self.store.snapshot()[0])
+        return str(caught.exception)
+
+    def proceed(self, message, then, controller=None):
+        command = message.split("`")[1]
+        self.assertIn("worktree add --detach", command)
+        self.assertTrue(command.endswith(self.base), command)
+        subprocess.run(command, shell=True, check=True, capture_output=True)
+        fresh = shlex.split(command)[-2]
+        self.assertIn(f"then {then} {shlex.quote(fresh)}", message)
+        refused = Path(controller or self.work).resolve()
+        self.assertFalse(Path(fresh).resolve().is_relative_to(refused), fresh)
+        metadata = self.metadata()
+        target = pr_snapshot.capture(
+            self.store,
+            "acme/widget",
+            7,
+            fresh,
+            api=mock.Mock(side_effect=[metadata, metadata]),
+        )
+        self.assertEqual(target["base_sha"], self.base)
+        return fresh
+
+    def test_a_main_checkout_behind_the_base_is_told_the_exact_way_forward(self):
+        self.git("-C", self.work, "reset", "--hard", "HEAD~1")
+        self.assertEqual(self.git("-C", self.work, "status", "--porcelain"), "")
+
+        message = self.refusal(pr_snapshot.TargetMoved)
+
+        self.assertIn(f"not the frozen base {self.base}", message)
+        self.assertNotIn("fetch", message)
+        self.proceed(message, "rerun with --controller-root")
+        with self.assertRaisesRegex(
+            pr_snapshot.TargetMoved, "then rerun check-controller with "
+        ):
+            pr_snapshot.check_controller(self.store, self.work)
+
+    def test_a_lagging_checkout_without_the_base_is_told_to_fetch_it(self):
+        lagging = self.root / "lagging"
+        self.git("clone", "--quiet", self.remote, lagging)
+        self.git("-C", lagging, "reset", "--hard", "HEAD~1")
+        self.git("-C", lagging, "update-ref", "-d", "refs/remotes/origin/main")
+        self.git("-C", lagging, "reflog", "expire", "--expire=now", "--all")
+        self.git("-C", lagging, "gc", "--quiet", "--prune=now")
+
+        message = self.refusal(pr_snapshot.TargetMoved, controller=lagging)
+
+        self.assertIn(f"fetch origin {self.base} && ", message)
+        self.proceed(message, "restart the review from", controller=lagging)
+
+    def test_a_dirty_main_behind_the_base_is_told_to_restart_not_rerun(self):
+        self.git("-C", self.work, "reset", "--hard", "HEAD~1")
+        (self.work / "common.txt").write_text("PR head policy\n", encoding="utf-8")
+
+        message = self.refusal(pr_snapshot.TargetMoved)
+
+        self.assertIn('does not match HEAD: "common.txt"', message)
+        self.assertNotIn("--controller-root", message)
+        self.proceed(message, "restart the review from")
+
+    def test_a_main_behind_the_base_with_an_untracked_file_is_told_to_restart(self):
+        self.git("-C", self.work, "reset", "--hard", "HEAD~1")
+        (self.work / "AGENTS.md").write_text("PR head policy\n", encoding="utf-8")
+
+        message = self.refusal(pr_snapshot.TargetMoved)
+
+        self.assertIn('untracked: "AGENTS.md"', message)
+        self.assertNotIn("--controller-root", message)
+        self.proceed(message, "restart the review from")
+
+    def test_a_controller_at_the_pr_head_is_told_to_restart_not_rerun(self):
+        self.git("-C", self.work, "checkout", "feature")
+
+        message = self.refusal(pr_snapshot.TargetMoved)
+
+        self.assertNotIn("--controller-root", message)
+        self.proceed(message, "restart the review from")
+
+    def test_untracked_files_are_named_capped_and_distinguished_from_stash(self):
+        for index in range(7):
+            (self.work / f"stray-{index}.txt").write_text("x\n", encoding="utf-8")
+
+        message = self.refusal()
+
+        self.assertIn('untracked: "stray-0.txt"', message)
+        self.assertIn('"stray-4.txt" and 2 more', message)
+        self.assertNotIn("stray-5.txt", message)
+        self.assertIn("git stash", message)
+        self.proceed(message, "restart the review from")
+
+    def test_ignored_governing_files_git_status_hides_are_named(self):
+        (self.work / ".gitignore").write_text("node_modules/\n", encoding="utf-8")
+        self.git("-C", self.work, "add", ".gitignore")
+        self.git("-C", self.work, "commit", "-m", "ignore dependencies")
+        self.base = self.rev("HEAD")
+        self.git("-C", self.work, "push", "origin", "main")
+        package = self.work / "node_modules" / "pkg"
+        package.mkdir(parents=True)
+        (package / "AGENTS.md").write_text("dependency policy\n", encoding="utf-8")
+        self.assertEqual(self.git("-C", self.work, "status", "--porcelain"), "")
+
+        message = self.refusal()
+
+        self.assertIn('"node_modules/pkg/AGENTS.md"', message)
+        self.assertIn("git status", message)
+        self.proceed(message, "restart the review from")
+
+    def test_a_modified_tracked_file_is_named(self):
+        (self.work / "common.txt").write_text("changed\n", encoding="utf-8")
+
+        message = self.refusal()
+
+        self.assertIn('does not match HEAD: "common.txt"', message)
+        self.proceed(message, "restart the review from")
+
+    def test_staged_deleted_and_concealed_changes_are_named(self):
+        common = self.work / "common.txt"
+
+        def stage(path, text):
+            (self.work / path).write_text(text, encoding="utf-8")
+            self.git("-C", self.work, "add", path)
+
+        def unmerge():
+            blob = self.rev("HEAD:common.txt")
+            self.git("-C", self.work, "rm", "--cached", "--quiet", "common.txt")
+            entries = "".join(
+                f"100644 {blob} {stage}\tcommon.txt\n" for stage in (1, 2, 3)
+            )
+            subprocess.run(
+                ["git", "-C", str(self.work), "update-index", "--index-info"],
+                input=entries, text=True, check=True,
+            )
+
+        cases = [
+            ("staged new file", lambda: stage("new.txt", "x\n"), "new.txt"),
+            ("staged change", lambda: stage("common.txt", "y\n"), "common.txt"),
+            (
+                "staged deletion",
+                lambda: self.git("-C", self.work, "rm", "--quiet", "common.txt"),
+                "common.txt",
+            ),
+            ("deleted file", common.unlink, "common.txt"),
+            ("mode change", lambda: common.chmod(0o755), "common.txt"),
+            ("unmerged entry", unmerge, "common.txt"),
+            (
+                "assume-unchanged",
+                lambda: self.git(
+                    "-C", self.work, "update-index", "--assume-unchanged", "common.txt"
+                ),
+                "common.txt",
+            ),
+        ]
+        for name, change, path in cases:
+            with self.subTest(name):
+                self.git("-C", self.work, "reset", "--hard", "--quiet")
+                self.git("-C", self.work, "clean", "-fdq")
+                change()
+
+                message = self.refusal()
+
+                self.assertIn(f': "{path}"; make a fresh checkout of the exact', message)
+                self.assertIn("then restart the review from", message)
 
 
 class Guarding(SnapshotCase):

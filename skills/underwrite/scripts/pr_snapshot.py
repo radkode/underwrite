@@ -50,6 +50,7 @@ _MAX_IMPORT_DEPTH = 4
 _MAX_BLOB_BYTES = 10_000_000
 _MAX_CONTEXT_COMMITS = 100
 _MAX_CONTROLLER_REPOSITORIES = 256
+_MAX_LISTED_PATHS = 5
 
 
 class SnapshotError(StoreError):
@@ -57,6 +58,10 @@ class SnapshotError(StoreError):
 
 
 class TargetMoved(Conflict):
+    pass
+
+
+class _UncleanController(SnapshotError):
     pass
 
 
@@ -350,6 +355,7 @@ def _reject_index_concealment(repo):
         repo,
         safe=True,
     ).split(b"\0")
+    concealed = []
     for entry in entries:
         if not entry:
             continue
@@ -357,10 +363,12 @@ def _reject_index_concealment(repo):
             raise SnapshotError("controller index contains a malformed entry")
         tag = entry[:1]
         if tag == b"S" or tag.islower():
-            raise SnapshotError(
-                "controller index uses assume-unchanged, skip-worktree, or sparse "
-                "entries"
-            )
+            concealed.append(entry[2:])
+    if concealed:
+        raise _UncleanController(
+            "controller index uses assume-unchanged, skip-worktree, or sparse "
+            "entries: " + _listing(concealed)
+        )
 
 
 def _index_tree(repo):
@@ -370,6 +378,7 @@ def _index_tree(repo):
         safe=True,
     )
     entries = {}
+    unmerged = []
     for record in raw.split(b"\0"):
         if not record:
             continue
@@ -379,8 +388,14 @@ def _index_tree(repo):
         except ValueError as error:
             raise SnapshotError("controller index contains a malformed entry") from error
         if stage != b"0" or path in entries:
-            raise SnapshotError("controller index does not exactly match HEAD")
+            unmerged.append(path)
+            continue
         entries[path] = (mode, object_id)
+    if unmerged:
+        raise _UncleanController(
+            "controller index has unmerged entries: "
+            + _listing(dict.fromkeys(unmerged))
+        )
     return entries
 
 
@@ -398,13 +413,15 @@ def _regular_blob(repo_path, executable, algorithm):
     try:
         descriptor = os.open(repo_path, flags)
     except OSError as error:
-        raise SnapshotError("controller tracked file cannot be read safely") from error
+        raise _UncleanController(
+            "controller tracked file is missing or cannot be read safely"
+        ) from error
     with os.fdopen(descriptor, "rb") as handle:
         details = os.fstat(handle.fileno())
         if not stat.S_ISREG(details.st_mode):
-            raise SnapshotError("controller tracked path is not a regular file")
+            raise _UncleanController("controller tracked path is not a regular file")
         if bool(details.st_mode & stat.S_IXUSR) != executable:
-            raise SnapshotError("controller tracked file mode does not match HEAD")
+            raise _UncleanController("controller tracked file mode does not match HEAD")
         digest = _blob_hasher(algorithm, details.st_size)
         while True:
             chunk = handle.read(1024 * 1024)
@@ -419,9 +436,11 @@ def _symlink_blob(repo_path, algorithm):
         details = os.lstat(repo_path)
         target = os.readlink(repo_path)
     except OSError as error:
-        raise SnapshotError("controller tracked symlink cannot be read safely") from error
+        raise _UncleanController(
+            "controller tracked symlink is missing or cannot be read safely"
+        ) from error
     if not stat.S_ISLNK(details.st_mode):
-        raise SnapshotError("controller tracked path is not a symlink")
+        raise _UncleanController("controller tracked path is not a symlink")
     raw = os.fsencode(target)
     digest = _blob_hasher(algorithm, len(raw))
     digest.update(raw)
@@ -437,16 +456,16 @@ def _verify_gitlink(repo, path, object_id):
     except OSError as error:
         raise SnapshotError("controller submodule path cannot be inspected") from error
     if not stat.S_ISDIR(details.st_mode):
-        raise SnapshotError("controller submodule path must be a real directory")
+        raise _UncleanController("controller submodule path must be a real directory")
     if os.path.lexists(candidate / ".git"):
         _reject_controller_config(candidate)
         if _commit(candidate, "HEAD").encode("ascii") != object_id:
-            raise SnapshotError("controller submodule revision does not match HEAD")
+            raise _UncleanController("controller submodule revision does not match HEAD")
         return
     try:
         with os.scandir(candidate) as children:
             if next(children, None) is not None:
-                raise SnapshotError(
+                raise _UncleanController(
                     "controller uninitialized submodule directory is not empty"
                 )
     except OSError as error:
@@ -459,8 +478,17 @@ def _verify_controller_files(repo):
         path: (mode, object_id)
         for path, (mode, _kind, object_id) in head.items()
     }
-    if _index_tree(repo) != expected_index:
-        raise SnapshotError("controller index does not exactly match HEAD")
+    index = _index_tree(repo)
+    if index != expected_index:
+        staged = sorted(
+            path
+            for path in index.keys() | expected_index.keys()
+            if index.get(path) != expected_index.get(path)
+        )
+        raise _UncleanController(
+            "controller index does not exactly match HEAD, so it has staged "
+            "changes: " + _listing(staged)
+        )
     try:
         algorithm = _git(
             ["rev-parse", "--show-object-format"], repo, safe=True
@@ -469,17 +497,22 @@ def _verify_controller_files(repo):
         raise SnapshotError("controller repository has an invalid object format") from error
     for path, (mode, kind, object_id) in head.items():
         repo_path = repo / os.fsdecode(path)
-        if mode in (b"100644", b"100755") and kind == b"blob":
-            actual = _regular_blob(repo_path, mode == b"100755", algorithm)
-        elif mode == b"120000" and kind == b"blob":
-            actual = _symlink_blob(repo_path, algorithm)
-        elif mode == b"160000" and kind == b"commit":
-            _verify_gitlink(repo, path, object_id)
-            continue
-        else:
-            raise SnapshotError("controller tree contains an unsupported entry")
-        if actual != object_id:
-            raise SnapshotError("controller tracked file content does not match HEAD")
+        try:
+            if mode in (b"100644", b"100755") and kind == b"blob":
+                actual = _regular_blob(repo_path, mode == b"100755", algorithm)
+            elif mode == b"120000" and kind == b"blob":
+                actual = _symlink_blob(repo_path, algorithm)
+            elif mode == b"160000" and kind == b"commit":
+                _verify_gitlink(repo, path, object_id)
+                continue
+            else:
+                raise SnapshotError("controller tree contains an unsupported entry")
+            if actual != object_id:
+                raise _UncleanController(
+                    "controller tracked file content does not match HEAD"
+                )
+        except _UncleanController as error:
+            raise _UncleanController(f"{error}: {_listing([path])}") from error
 
 
 def _reject_ignored_governing_files(repo):
@@ -498,7 +531,10 @@ def _reject_ignored_governing_files(repo):
         literal_paths=False,
     )
     if paths:
-        raise SnapshotError("controller checkout has ignored governing files")
+        raise _UncleanController(
+            "controller checkout has ignored governing files, which git status "
+            "does not show: " + _listing(paths.split(b"\0"))
+        )
 
 
 def _reject_untracked_files(repo):
@@ -508,13 +544,53 @@ def _reject_untracked_files(repo):
         safe=True,
     )
     if paths:
-        raise SnapshotError(
-            "controller checkout is not clean; restart from a clean exact-base "
-            "checkout"
+        raise _UncleanController(
+            "controller checkout is not clean, and git stash leaves untracked "
+            "files in place; untracked: " + _listing(paths.split(b"\0"))
         )
 
 
-def _controller_at_base(repo_root, base_sha):
+def _listing(paths):
+    paths = [json.dumps(os.fsdecode(path)) for path in paths if path]
+    shown = ", ".join(paths[:_MAX_LISTED_PATHS])
+    hidden = len(paths) - _MAX_LISTED_PATHS
+    return f"{shown} and {hidden} more" if hidden > 0 else shown
+
+
+def _fresh_base_hint(top, base_sha, rerun=None):
+    common = Path(
+        os.fsdecode(_git(["rev-parse", "--git-common-dir"], top, safe=True).strip())
+    )
+    common = (top / common).resolve()
+    root = common.parent if common.name == ".git" else top
+    # Outside the refused tree: agents load instruction files from every parent directory.
+    name = f"{root.name}-underwrite-base-{base_sha[:12]}"
+    path = root.parent / name
+    suffix = 1
+    while os.path.lexists(path):
+        suffix += 1
+        path = root.parent / f"{name}-{suffix}"
+    quoted = shlex.quote(str(path))
+    git = f"git -C {shlex.quote(str(root))}"
+    command = f"{git} worktree add --detach {quoted} {base_sha}"
+    try:
+        _commit(top, base_sha)
+    except SnapshotError:
+        command = f"{git} fetch origin {base_sha} && {command}"
+    # A controller that may hold untrusted instructions must restart, not just rerun.
+    then = f"{rerun} {quoted}" if rerun else f"restart the review from {quoted}"
+    return f"make a fresh checkout of the exact base with `{command}`, then {then}"
+
+
+def _is_ancestor(repo, ancestor, descendant):
+    try:
+        _git(["merge-base", "--is-ancestor", ancestor, descendant], repo, safe=True)
+    except SnapshotError:
+        return False
+    return True
+
+
+def _controller_at_base(repo_root, base_sha, rerun="rerun with --controller-root"):
     requested = Path(repo_root).expanduser().resolve()
     try:
         top = Path(
@@ -527,17 +603,40 @@ def _controller_at_base(repo_root, base_sha):
     _reject_controller_config(top)
     head = _commit(top, "HEAD")
     if head != base_sha:
+        moved = f"controller checkout is at {head}, not the frozen base {base_sha}"
+        clean = False
+        if _is_ancestor(top, head, base_sha):
+            try:
+                _reject_unclean(top)
+                clean = True
+            except _UncleanController as error:
+                moved = f"{moved}, and {error}"
+            except SnapshotError:
+                pass
         raise TargetMoved(
-            "controller checkout is not at the frozen base; restart from the exact "
-            "base revision"
+            f"{moved}; " + _fresh_base_hint(top, base_sha, rerun if clean else None)
         )
-    repositories = _controller_repositories(top)
-    for repo in repositories:
-        _reject_index_concealment(repo)
-        _reject_ignored_governing_files(repo)
-        _verify_controller_files(repo)
-        _reject_untracked_files(repo)
+    try:
+        _reject_unclean(top)
+    except _UncleanController as error:
+        raise SnapshotError(f"{error}; {_fresh_base_hint(top, base_sha)}") from error
     return {"controller_root": str(top), "base_sha": head}
+
+
+def _reject_unclean(top):
+    for repo in _controller_repositories(top):
+        try:
+            _reject_index_concealment(repo)
+            _reject_ignored_governing_files(repo)
+            _verify_controller_files(repo)
+            _reject_untracked_files(repo)
+        except _UncleanController as error:
+            prefix = os.path.relpath(repo, top)
+            if prefix == ".":
+                raise
+            raise _UncleanController(
+                f"{error} (in submodule {json.dumps(prefix)})"
+            ) from error
 
 
 def _diff_command(mode):
@@ -1060,7 +1159,9 @@ def capture(store, repo, number, controller_root, api=load_pr):
 
 def check_controller(store, repo_root):
     target = store.verify_target_files()
-    return _controller_at_base(repo_root, target["base_sha"])
+    return _controller_at_base(
+        repo_root, target["base_sha"], rerun="rerun check-controller with"
+    )
 
 
 def check(store, require_open=False, api=load_pr):
