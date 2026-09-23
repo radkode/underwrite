@@ -699,10 +699,7 @@ def changed_paths(root, session):
     # Reading the allowlist must not attempt the migration write a legacy session needs.
     if not stored(root):
         return ()
-    try:
-        return tuple(SessionStore(root).changed_paths())
-    except (OSError, sqlite3.Error, StoreError, ValueError):
-        return ()
+    return tuple(SessionStore(root).changed_paths())
 
 
 def resolve_path(candidate, paths):
@@ -1384,13 +1381,14 @@ def main():
         session, beats, css, problems_by_n, all_problems = load(
             root, css_path, args.final
         )
+        paths = changed_paths(root, session)
     except (OSError, sqlite3.Error, StoreError, json.JSONDecodeError) as err:
         sys.exit(f"render-report: {err}")
 
     out = Path(args.out).expanduser() if args.out else root / "report.html"
     page = render(
         session, beats, css, problems_by_n, args.live,
-        paths=changed_paths(root, session), is_stored=stored(root),
+        paths=paths, is_stored=stored(root),
     )
     out.write_text(SHELL + page if args.standalone else page, encoding="utf-8")
 

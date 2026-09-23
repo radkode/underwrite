@@ -9,6 +9,7 @@ acts and not before, that a malformed request gets an answer instead of dropping
 the connection, and that everything the page needs reaches it without asking.
 """
 import contextlib
+import hashlib
 import importlib.util
 import io
 import json
@@ -52,6 +53,7 @@ CLEAN = {
     "n": 2, "tier": "core", "state": "clean", "claim": "load-bearing", "where": "b.py:1",
     "slots": {"what": "x", "proof": "b.py:1"},
 }
+FROZEN_DIFF = b"diff\n"
 REPORT_TARGET = {
     "version": 1,
     "kind": "github_pr",
@@ -66,8 +68,8 @@ REPORT_TARGET = {
     "head_ref": "feature",
     "merge_base_sha": "c" * 40,
     "changed_files": 1,
-    "diff_sha256": "d" * 64,
-    "diff_bytes": 5,
+    "diff_sha256": hashlib.sha256(FROZEN_DIFF).hexdigest(),
+    "diff_bytes": len(FROZEN_DIFF),
     "trusted_context_sha256": "e" * 64,
     "trusted_context_bytes": 3,
 }
@@ -81,10 +83,10 @@ class SessionTest(unittest.TestCase):
         self.root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.root, True)
         (self.root / "beats").mkdir()
-        (self.root / "session.json").write_text(
-            json.dumps(self.session_document()),
-            encoding="utf-8",
-        )
+        document = self.session_document()
+        (self.root / "session.json").write_text(json.dumps(document), encoding="utf-8")
+        if "target" in document:
+            (self.root / "pr.diff").write_bytes(FROZEN_DIFF)
         for beat in (FLAG, CLEAN):
             self.put(beat)
         self.session = self.open_session()
@@ -972,6 +974,12 @@ class ReportRequests(Served):
         self.assertEqual(ack_status, 200)
         self.assertEqual(json.loads(ack_body), {"handled_seq": 1})
         self.assertFalse(self.session.store.reconcile()["recovery"])
+
+    def test_a_frozen_diff_that_went_missing_refuses_to_serve(self):
+        (self.root / "pr.diff").unlink()
+
+        with self.assertRaisesRegex(ValueError, "pr.diff is missing"):
+            serve.Session(self.root, serve.rr().default_css())
 
     def test_unproven_report_finding_cannot_be_included_over_http(self):
         invalid = self.session.store.snapshot()[1][0]
