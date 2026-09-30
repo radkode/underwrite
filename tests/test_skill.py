@@ -65,6 +65,22 @@ class BeforeThePageOpens(unittest.TestCase):
         self.assertIn("where no such tool exists", text)
 
 
+class RecommendationContract(unittest.TestCase):
+    def test_assessment_and_decisions_are_explicit_in_both_surfaces(self):
+        text = " ".join(SKILL.read_text(encoding="utf-8").split())
+        for phrase in (
+            "Lead the terminal with your assessment",
+            "decision: {question, recommendation}",
+            "names the choice and its options",
+            "names the preferred option and why",
+            "same assessment and count of decisions owed as the page",
+            "agent's recommendation, not the reviewer's GitHub verdict",
+            "A static review cannot claim verified runtime behavior",
+            "Before the walk is complete, call it provisional",
+        ):
+            self.assertIn(phrase, text)
+
+
 class TheHeadIsNotYourFinding(unittest.TestCase):
     """Rule 5 kept the head's prose out of the instructions and let it straight into the
     findings. On a well-commented self-authored PR that is most of a beat: three of six

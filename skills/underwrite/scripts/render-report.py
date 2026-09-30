@@ -768,7 +768,34 @@ def beat_html(
         cls = f' class="{key}"'
         rows.append(f"<dt{cls}>{key}</dt><dd{cls}>{md(value)}</dd>")
 
-    body = [f'<dl class="slots">{"".join(rows)}</dl>']
+    body = []
+    if beat.get("state") == "flag":
+        decision = beat.get("decision")
+        if isinstance(decision, dict):
+            question = decision.get("question", "Decision not recorded.")
+            recommendation = decision.get("recommendation", "Recommended option not recorded.")
+        else:
+            if beat.get("resolution_kind") != "decision" and (
+                replacement or (mode == "branch" and untrusted_pr)
+            ):
+                question = "Replace this blocked session before choosing delivery, or drop this finding?"
+            else:
+                question = (
+                    "Choose the policy option in FIX or drop this question?"
+                    if beat.get("resolution_kind") == "decision"
+                    else {
+                        "branch": "Implement the proposed fix or drop this finding?",
+                        "review": "Include in review or drop this finding?",
+                        "report": "Include in report or drop this finding?",
+                    }[mode]
+                )
+            recommendation = "Recommended option not recorded."
+        body.append(
+            '<div class="decision">'
+            f'<p><strong>Decision:</strong> {md(question)}</p>'
+            f'<p><strong>Recommended:</strong> {md(recommendation)}</p></div>'
+        )
+    body.append(f'<dl class="slots">{"".join(rows)}</dl>')
     if problems:
         prefix = f"beat {n}: "
         reasons = "".join(
@@ -1021,7 +1048,49 @@ def stage_html(session, beats, current, card):
     )
 
 
-def body_html(session, beats, problems_by_n, live=False, phase=None, paths=()):
+def assessment(session, beats, problems_by_n, validation_problems=()):
+    text = session.get("recommendation")
+    if not isinstance(text, str) or not text.strip():
+        text = "Recommendation not recorded. Do not infer merge readiness from the counts."
+    limits = []
+    plan = session.get("plan")
+    if not plan:
+        limits.append("The review was not planned; completeness is unknown.")
+    else:
+        left = sum(entry["state"] is None for entry in walk_entries(session, beats))
+        if left:
+            limits.append(f"{left} planned item{'s' if left != 1 else ''} not reviewed.")
+    unverified = sum(beat.get("state") == "unverified" for beat in beats)
+    if unverified:
+        limits.append(f"{unverified} item{'s' if unverified != 1 else ''} unverified.")
+    if problems_by_n or validation_problems:
+        limits.append("The report has validation problems; resolve them before relying on it.")
+    label = "Provisional recommendation" if limits else "Recommendation"
+    if execution_mode(session) == "no_exec":
+        limits.append("Static inspection only; runtime behavior was not verified.")
+    if session_mode(session) in ("review", "report") and any(
+        beat.get("state") == "accepted" for beat in beats
+    ):
+        limits.append("Inclusion does not mean the underlying issue was fixed.")
+    owed = sum(beat.get("state") == "flag" for beat in beats)
+    return label, text, limits, owed
+
+
+def assessment_html(session, beats, problems_by_n, validation_problems=()):
+    label, text, limits, owed = assessment(session, beats, problems_by_n, validation_problems)
+    return (
+        '<section class="assessment" aria-label="Review recommendation">'
+        f'<h2>{label}</h2><p class="recommendation">{md(text)}</p>'
+        f'<p class="decisions-owed">{owed} decision{"s" if owed != 1 else ""} owed</p>'
+        + "".join(f'<p class="qualification">{md(limit)}</p>' for limit in limits)
+        + '</section>'
+    )
+
+
+def body_html(
+    session, beats, problems_by_n, live=False, phase=None, paths=(),
+    validation_problems=(),
+):
     """Everything below the masthead. This is what /fragment re-serves on a change."""
     mode = session_mode(session)
     replacement = replacement_required(session)
@@ -1039,7 +1108,7 @@ def body_html(session, beats, problems_by_n, live=False, phase=None, paths=()):
             key=lambda b: b["n"],
             default=None,
         )
-    parts = []
+    parts = [assessment_html(session, beats, problems_by_n, validation_problems)]
     if live:
         parts.append(bar_html(session, beats, current, phase))
         if phase != "done":
@@ -1129,8 +1198,7 @@ def body_html(session, beats, problems_by_n, live=False, phase=None, paths=()):
 
 
 def frame_html(session, live):
-    """The pre-walk decisions. Folded while a walk is live, since the reviewer just read
-    them; open for anyone reading the page afterwards, who never saw the terminal."""
+    """Pre-walk context, folded live and open on the finished page."""
     prose = [(label, session.get(key)) for key, label in FRAME_PROSE if session.get(key)]
     calls = [(label, session.get(key)) for key, label in FRAME_CALLS if session.get(key)]
     if not prose and not calls:
@@ -1190,7 +1258,7 @@ def head_html(linked, identity):
 
 def render(
     session, beats, css, problems_by_n, live=False, phase=None, paths=(),
-    is_stored=False,
+    is_stored=False, validation_problems=(),
 ):
     target = session.get("target") if isinstance(session.get("target"), dict) else {}
     number = session.get("number") or target.get("number")
@@ -1223,6 +1291,14 @@ def render(
         f'</div><h1><span class="num">{html.escape(label)}</span> '
         f'{md(session.get("title", ""))}</h1>'
     )
+    parts.append("</header>")
+    parts.append('<div id="live-body">')
+    parts.append(body_html(
+        session, beats, problems_by_n, live, phase, paths,
+        validation_problems=validation_problems,
+    ))
+    parts.append("</div>")
+
     frame = frame_html(session, live)
     if frame:
         parts.append(frame)
@@ -1247,12 +1323,6 @@ def render(
         facts.insert(0, frozen_head)
     if facts:
         parts.append(f'<div class="facts">{"".join(facts)}</div>')
-    parts.append("</header>")
-
-    parts.append('<div id="live-body">')
-    parts.append(body_html(session, beats, problems_by_n, live, phase, paths))
-    parts.append("</div>")
-
     if session.get("footer"):
         parts.append(f"<footer>{md(session['footer'])}</footer>")
     parts.append("</div>")
@@ -1388,9 +1458,15 @@ def main():
     out = Path(args.out).expanduser() if args.out else root / "report.html"
     page = render(
         session, beats, css, problems_by_n, args.live,
-        paths=paths, is_stored=stored(root),
+        paths=paths, is_stored=stored(root), validation_problems=all_problems,
     )
     out.write_text(SHELL + page if args.standalone else page, encoding="utf-8")
+
+    label, recommendation, limits, owed = assessment(session, beats, problems_by_n, all_problems)
+    print(f"{label}: {recommendation}", file=sys.stderr)
+    print(f"{owed} decision{'s' if owed != 1 else ''} owed", file=sys.stderr)
+    for limit in limits:
+        print(limit, file=sys.stderr)
 
     if all_problems:
         print("render-report: rendered with problems", file=sys.stderr)

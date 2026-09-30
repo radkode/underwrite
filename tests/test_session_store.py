@@ -65,6 +65,84 @@ class StoreCase(unittest.TestCase):
         return next(beat for beat in self.store.snapshot()[1] if beat["n"] == n)
 
 
+class RecommendationAndDecisions(StoreCase):
+    def test_recommendation_and_decision_persist_across_reopen(self):
+        recommendation = "Resolve the authorization finding before merging."
+        decision = {
+            "question": "Include the authorization finding in the review?",
+            "recommendation": "Include it so the missing check is fixed.",
+        }
+
+        written = self.store.put_session(
+            dict(SESSION, recommendation=recommendation)
+        )
+        written_beat = self.store.put_beat(dict(FLAG, decision=decision))
+
+        self.assertEqual(written["recommendation"], recommendation)
+        self.assertEqual(written_beat["decision"], decision)
+        restored = session_store.SessionStore(self.root)
+        session, beats = restored.snapshot()
+        self.assertEqual(session["recommendation"], recommendation)
+        self.assertEqual(beats[0]["decision"], decision)
+        updated = "The authorization finding is resolved; finish the remaining walk."
+        restored.patch_session({"recommendation": updated})
+        self.assertEqual(
+            session_store.SessionStore(self.root).snapshot()[0]["recommendation"],
+            updated,
+        )
+
+    def test_supplied_recommendation_must_be_nonempty_text(self):
+        original = self.store.snapshot()[0]
+        for value in (None, "", " \n ", 1, True, [], {}):
+            for operation in ("put", "patch"):
+                with self.subTest(value=value, operation=operation):
+                    with self.assertRaisesRegex(
+                        session_store.StoreError, "recommendation"
+                    ):
+                        if operation == "put":
+                            self.store.put_session(
+                                dict(SESSION, recommendation=value)
+                            )
+                        else:
+                            self.store.patch_session({"recommendation": value})
+                    self.assertEqual(self.store.snapshot()[0], original)
+
+    def test_supplied_decision_requires_exact_nonempty_text_fields(self):
+        valid = {
+            "question": "Include the finding?", "recommendation": "Include it."
+        }
+        invalid = [
+            None, "Include it.", [], {},
+            {"question": "Include it?"}, {"recommendation": "Include it."},
+        ]
+        invalid.append(dict(valid, extra="not part of the contract"))
+        for field in ("question", "recommendation"):
+            invalid.extend(
+                dict(valid, **{field: value})
+                for value in (None, "", " \n ", 1, True, [], {})
+            )
+        original = self.beat(1)
+        for value in invalid:
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(session_store.StoreError, "decision"):
+                    self.store.put_beat(dict(FLAG, decision=value))
+                self.assertEqual(self.beat(1), original)
+
+    def test_legacy_and_new_documents_may_omit_recommendation_and_decision(self):
+        session, beats = self.store.snapshot()
+        self.assertNotIn("recommendation", session)
+        for beat in beats:
+            self.assertNotIn("decision", beat)
+
+        self.store.put_session(SESSION)
+        self.store.put_beat(dict(FLAG, n=3))
+
+        session, beats = session_store.SessionStore(self.root).snapshot()
+        self.assertNotIn("recommendation", session)
+        for beat in beats:
+            self.assertNotIn("decision", beat)
+
+
 class FrozenTargets(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
@@ -336,6 +414,35 @@ class FrozenTargets(unittest.TestCase):
 
         self.assertEqual(self.store.snapshot()[1][0]["state"], "flag")
         self.assertIsNone(self.store.head())
+
+    def test_accepted_report_freezes_the_decision_and_recommendation(self):
+        decision = {
+            "question": "Include the finding in the report?",
+            "recommendation": "Include it so the missing check is visible.",
+        }
+        self._report_session(dict(FLAG, decision=decision))
+        self.store.produce("accept-1", 1, "accept", "include it")
+        accepted = self.store.snapshot()[1][0]
+        changes = (
+            dict(decision, question="Drop the finding instead?"),
+            dict(decision, recommendation="Drop it."),
+            None,
+        )
+
+        for replacement in changes:
+            with self.subTest(replacement=replacement):
+                changed = dict(accepted)
+                if replacement is None:
+                    changed.pop("decision")
+                else:
+                    changed["decision"] = replacement
+                with self.assertRaisesRegex(
+                    session_store.Conflict, "cannot change decision"
+                ):
+                    self.store.put_beat(changed)
+                self.assertEqual(self.store.snapshot()[1][0], accepted)
+
+        self.assertEqual(self.store.put_beat(accepted)["decision"], decision)
 
     def test_report_accept_ack_requires_the_accepted_beat(self):
         target = dict(self.target(), state="closed", merged_at=None)
