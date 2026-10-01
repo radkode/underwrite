@@ -482,7 +482,27 @@ class TheWalk(unittest.TestCase):
         # the note comes first so Tab lands on the primary; Next beat closes the row
         row = stage.split('<div class="acts"')[1].split("</div>")[0]
         self.assertRegex(row, r'^[^>]*>\s*<input class="note"')
-        self.assertRegex(row, r'<button class="act" data-action="next">Next item</button>\s*<span class="act-msg"')
+        self.assertRegex(row, r'<button class="act" data-action="next">Next item</button></span>\s*<span class="act-msg"')
+
+    def test_the_decision_buttons_are_grouped_apart_from_note_and_next(self):
+        open_flag = beat(n=4, state="flag",
+                         slots={"what": "x", "proof": "d.ts:4", "risk": "r", "fix": "f"})
+        html = self.live(self.beats() + [open_flag])
+        row = html.split('id="stage"')[1].split('<div class="acts"')[1].split("</div>")[0]
+        decide = row.split('<span class="acts-decide">')[1].split("</span>")[0]
+        self.assertIn('data-action="accept"', decide)
+        self.assertIn('data-action="drop"', decide)
+        self.assertNotIn('data-action="note"', decide)
+        other = row.split('<span class="acts-else">')[1].split("</span>")[0]
+        self.assertIn('data-action="note">Save note</button>', other)
+        self.assertIn('data-action="next">Next item</button>', other)
+        self.assertIn("Save note keeps your words on this item without deciding.", row)
+        self.assertIn("Next item leaves this decision open", row)
+        # a clean beat on the stage offers no decision, so no help line either
+        clean = self.live([beat(n=1, state="clean")])
+        self.assertNotIn("acts-decide", clean)
+        self.assertNotIn("acts-help", clean)
+        self.assertIn('data-action="note">Save note</button>', clean)
 
     def test_the_stage_row_says_what_the_keys_do(self):
         decision = beat(n=3, state="flag", resolution_kind="decision",
@@ -1127,6 +1147,41 @@ class ReviewRecommendation(unittest.TestCase):
         for tag in ("<img", "<script>", "<svg"):
             self.assertNotIn(tag, page)
         self.assertIn("&lt;img", page)
+
+
+class TheBeatCard(unittest.TestCase):
+    """A cold reader could not tell the quoted diff from the proposed fix, nor what an
+    accepted finding became."""
+
+    def flag(self, **changes):
+        return beat(**{"n": 1, "state": "flag", "diff": ["+  guard(tenant)"], "slots": {
+            "what": "w", "proof": "a.ts:1", "risk": "r", "fix": "add the tenant check",
+        }, **changes})
+
+    def test_the_quote_is_captioned_and_fix_follows_it(self):
+        html = rr.render({"repo": "r"}, [self.flag()], "", {})
+        self.assertIn('<span class="diff-cap">Quoted from the change</span>', html)
+        self.assertLess(html.index('class="diff"'), html.index('<dt class="fix">'))
+        self.assertLess(html.index("<dt class=\"what\">"), html.index('class="diff"'))
+        self.assertIn('<dl class="slots fix-row"><dt class="fix">fix</dt>', html)
+
+    def test_an_accepted_finding_says_what_it_became(self):
+        review = {"repo": "r", "audience": {"mode": "review"}}
+        posted = self.flag(state="accepted", landed="https://x/pull/1#r1")
+        self.assertIn("posted to the PR as a review comment; the change itself is not altered",
+                      rr.render(review, [posted], "", {}))
+        queued = rr.render(review, [self.flag(state="accepted")], "", {}, live=True, phase="parked")
+        self.assertIn("goes out with the review you post at the end", queued)
+        report = rr.render(dict(report_session(), plan=[{"n": 1}]), [self.flag(state="accepted")], "", {})
+        self.assertIn("You included this finding in the report.", report)
+        branch = rr.render({"repo": "r"}, [self.flag(state="accepted", landed="abc123")], "", {})
+        self.assertIn("You chose Implement. The fix was applied and committed.", branch)
+        unlanded = rr.render({"repo": "r"}, [self.flag(state="accepted")], "", {})
+        self.assertIn("You chose Implement. Nothing has landed yet.", unlanded)
+        self.assertNotIn("being applied", unlanded)
+        failed = self.flag(state="accepted", delivery={"state": "failed", "kind": "review"})
+        self.assertNotIn('class="outcome"', rr.render(review, [failed], "", {}))
+        self.assertNotIn('class="outcome"', rr.render(review, [self.flag()], "", {}))
 
 
 class TheFrame(unittest.TestCase):

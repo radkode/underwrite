@@ -592,7 +592,37 @@ def diff_html(lines):
         head = line[:1]
         kind = {"+": "add", "-": "del", " ": "ctx"}.get(head, "file")
         out.append(f'<span class="l {kind}">{html.escape(line, quote=False)}</span>')
-    return f'<div class="diff"><pre>{"".join(out)}</pre></div>'
+    return (
+        '<div class="diff"><span class="diff-cap">Quoted from the change</span>'
+        f'<pre>{"".join(out)}</pre></div>'
+    )
+
+
+def outcome_html(beat, mode):
+    """One plain sentence on an accepted beat: what the reviewer chose and what it did.
+    Accepting posts or records a finding; only branch mode changes the code."""
+    if beat.get("state") != "accepted":
+        return ""
+    delivery = beat.get("delivery") if isinstance(beat.get("delivery"), dict) else {}
+    if delivery.get("state") in ("pending", "failed"):
+        return ""
+    landed = bool(beat.get("landed"))
+    if mode == "review":
+        text = (
+            "You included this finding. It was posted to the PR as a review comment; "
+            "the change itself is not altered."
+            if landed else
+            "You included this finding. It goes out with the review you post at the "
+            "end; the change itself is not altered."
+        )
+    elif mode == "report":
+        text = "You included this finding in the report. The change itself is not altered."
+    else:
+        text = (
+            "You chose Implement. The fix was applied and committed."
+            if landed else "You chose Implement. Nothing has landed yet."
+        )
+    return f'<p class="outcome">{text}</p>'
 
 
 def delivery_html(beat, mode, replacement=False, untrusted_pr=False):
@@ -767,6 +797,10 @@ def beat_html(
             continue
         cls = f' class="{key}"'
         rows.append(f"<dt{cls}>{key}</dt><dd{cls}>{md(value)}</dd>")
+    # The quoted lines are evidence for the slots above them, and FIX is the conclusion,
+    # so FIX comes after the quote rather than reading as its caption.
+    fix_row = [row for row in rows if row.startswith('<dt class="fix"')]
+    rows = [row for row in rows if row not in fix_row]
 
     body = []
     if beat.get("state") == "flag":
@@ -795,7 +829,8 @@ def beat_html(
             f'<p><strong>Decision:</strong> {md(question)}</p>'
             f'<p><strong>Recommended:</strong> {md(recommendation)}</p></div>'
         )
-    body.append(f'<dl class="slots">{"".join(rows)}</dl>')
+    if rows:
+        body.append(f'<dl class="slots">{"".join(rows)}</dl>')
     if problems:
         prefix = f"beat {n}: "
         reasons = "".join(
@@ -809,6 +844,9 @@ def beat_html(
         )
     if beat.get("diff"):
         body.append(diff_html(beat["diff"]))
+    if fix_row:
+        body.append(f'<dl class="slots fix-row">{"".join(fix_row)}</dl>')
+    body.append(outcome_html(beat, mode))
     if beat.get("call"):
         body.append(
             '<div class="call"><span class="lbl">Your call · item '
@@ -848,8 +886,8 @@ def beat_html(
                     message = "Complete finding evidence before inclusion"
                 controls = (
                     f'<span class="execution-blocked">{message}</span>'
-                    '<button class="act" data-action="drop">Drop</button>'
-                    '<button class="act" data-action="note">Save note</button>'
+                    '<span class="acts-decide">'
+                    '<button class="act" data-action="drop">Drop</button></span>'
                 )
                 placeholder = (
                     "record a note before replacing this session"
@@ -864,9 +902,9 @@ def beat_html(
                     "report": "Include in report",
                 }[mode]
                 controls = (
+                    '<span class="acts-decide">'
                     f'<button class="act primary" data-action="{action}">{label}</button>'
-                    '<button class="act" data-action="drop">Drop</button>'
-                    '<button class="act" data-action="note">Save note</button>'
+                    '<button class="act" data-action="drop">Drop</button></span>'
                 )
                 placeholder = (
                     "record the decision in your own words"
@@ -881,11 +919,11 @@ def beat_html(
                 else:
                     mod = verb
         else:
-            controls = '<button class="act" data-action="note">Save note</button>'
+            controls = ""
             placeholder = "note this for the record"
-        # The stage carries its own Next beat so the whole decision happens in one row,
+        # The stage carries its own Next item so the whole decision happens in one row,
         # and says what the keys do, once, where the reviewer is acting.
-        advance = keys = ""
+        advance = keys = help = ""
         if stage:
             advance = '<button class="act" data-action="next">Next item</button>'
             hints = [f"<kbd>Enter</kbd> {enter}"]
@@ -893,11 +931,22 @@ def beat_html(
                 hints.append(f'<kbd><span data-mod>⌘</span>Enter</kbd> {mod}')
             hints.append("<kbd>n</kbd> next item")
             keys = f'<span class="keys">{" · ".join(hints)}</span>'
+            if flag:
+                help = (
+                    '<span class="acts-help">Save note keeps your words on this item '
+                    'without deciding. Next item leaves this decision open and goes on '
+                    'to the next item.</span>'
+                )
+        others = (
+            '<span class="acts-else">'
+            '<button class="act" data-action="note">Save note</button>'
+            f'{advance}</span>'
+        )
         # The note comes first so Tab lands on the primary right after typing.
         body.append(
             f'<div class="acts" data-acts="{attr(n)}">'
             f'<input class="note" aria-label="your words, item {attr(n)}" placeholder="{placeholder}">'
-            f'{controls}{advance}<span class="act-msg" role="status"></span>{keys}</div>'
+            f'{controls}{others}<span class="act-msg" role="status"></span>{help}{keys}</div>'
         )
 
     return (

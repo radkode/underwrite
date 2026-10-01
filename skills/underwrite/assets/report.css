@@ -501,6 +501,8 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
 }
 .slots dd.fix { padding-top: 14px; font-weight: 560; }
 .slots dt.fix { padding-top: 19px; }
+.slots.fix-row dt.fix, .slots.fix-row dd.fix { margin-top: 0; border-top: 0; padding-top: 0; }
+.outcome { margin: 0; max-width: 70ch; font-size: 14px; }
 
 .slots dd code, .b-claim code, .facts code, .next code, .frame code {
   font-family: var(--mono);
@@ -518,6 +520,15 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
   border: 1px solid var(--rule-soft);
   border-radius: 3px;
   overflow-x: auto;
+}
+.diff .diff-cap {
+  display: block;
+  padding: 7px 14px 0;
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--ink-3);
 }
 .diff pre {
   margin: 0;
@@ -775,6 +786,14 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
   align-items: center;
 }
 .acts.walk { padding-top: 2px; }
+.acts-decide, .acts-else { display: inline-flex; gap: 8px; }
+.acts-else { margin-left: auto; }
+.acts-help {
+  flex-basis: 100%;
+  max-width: 70ch;
+  font-size: 13px;
+  color: var(--ink-2);
+}
 .execution-blocked {
   font-family: var(--mono);
   font-size: 11px;
