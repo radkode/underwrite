@@ -53,11 +53,26 @@ STATE_STYLE = {
 
 # (heading, hint, states, expanded by default)
 SECTIONS = (
-    ("Needs your call", "out of item order, on purpose", ("flag",), True),
-    ("Accepted", "your call, and what came of it", ("accepted", "decided"), True),
+    ("Decisions owed", "out of item order, on purpose", ("flag",), True),
+    ("Decided", "your call, and what came of it", ("accepted", "decided"), True),
     ("Read and clean", "nothing owed, proof on each", ("clean", "unverified"), False),
     ("Dropped", "raised, then set aside", ("dropped",), False),
 )
+
+# An accepted finding is named for what the reviewer's button did, so the token and the
+# button share a word.
+ACCEPTED_TOKEN = {"branch": "IMPLEMENTED", "review": "INCLUDED", "report": "INCLUDED"}
+
+
+def state_token(state, mode, landed=True):
+    suffix, token = STATE_STYLE.get(state, ("unver", "UNVERIFIED"))
+    if state != "accepted":
+        return suffix, token
+    # Implemented is a claim about the code, so it waits for the commit.
+    if mode == "branch" and not landed:
+        return suffix, "TO IMPLEMENT"
+    return suffix, ACCEPTED_TOKEN[mode]
+
 
 LANDS_TAG = {"landed": "Landed", "ready": "Ready", "open": "Your call"}
 FRAME_PROSE = (("claim_check", "Claim check"),)
@@ -812,7 +827,7 @@ def beat_html(
     paths=(),
     target=None,
 ):
-    suffix, token = STATE_STYLE.get(beat.get("state"), ("unver", "UNVERIFIED"))
+    suffix, token = state_token(beat.get("state"), mode, bool(beat.get("landed")))
     raw_slots = beat.get("slots")
     slots = raw_slots if isinstance(raw_slots, dict) else {}
     n = beat.get("n", "?")
@@ -963,7 +978,6 @@ def beat_html(
         f'{" open" if expanded else ""}>'
         f"<summary>"
         f'<span class="b-num">{md(n)}</span>'
-        f'<span class="b-tier">{md(beat.get("tier", ""))}</span>'
         f'<span class="b-claim"><span class="state">{token}</span> &nbsp;'
         f'{md(beat.get("claim", ""))}{chip}</span>'
         f'<span class="b-path">'
@@ -996,6 +1010,7 @@ def walk_entries(session, beats):
             n, {"n": n, "tier": "", "where": "", "what": "", "state": None}
         )
         entry["state"] = beat.get("state")
+        entry["landed"] = bool(beat.get("landed"))
         entry["tier"] = beat.get("tier") or entry["tier"]
         entry["where"] = beat.get("where") or entry["where"]
     return [entries[n] for n in sorted(entries)]
@@ -1015,13 +1030,13 @@ def coverage_html(session, beats):
     rows = []
     for entry in left:
         what = entry["what"] or entry["where"]
-        tier = entry["tier"] or "untiered"
-        risk = " is-risk" if entry["tier"] == "risk" else ""
+        care = (
+            ' <span class="cov-care">read carefully</span>' if entry["tier"] == "risk" else ""
+        )
         rows.append(
             f'<li title="{attr(what)}"><span class="cov-n">{entry["n"]}</span>'
-            f'<span class="cov-tier{risk}">{md(tier)}</span>'
             f'<span class="cov-what">'
-            f'{md(textwrap.shorten(what, 88, placeholder="…"))}</span></li>'
+            f'{md(textwrap.shorten(what, 88, placeholder="…"))}{care}</span></li>'
         )
     return (
         f'<div class="coverage"><p>{md(head)}. Not read yet:</p>'
@@ -1040,13 +1055,13 @@ def bar_html(session, beats, current, phase):
         if state is None:
             cls, word = "is-todo", "not read yet"
         else:
-            suffix, token = STATE_STYLE.get(state, ("unver", "UNVERIFIED"))
+            suffix, token = state_token(state, session_mode(session), entry.get("landed", False))
             cls, word = f"s-{suffix}", token.lower()
         now = entry["n"] == current_n
         current_attr = ' aria-current="step"' if now else ""
         title = " · ".join(
             part for part in (
-                f"item {entry['n']}", entry["tier"], entry["where"], word
+                f"item {entry['n']}", entry["where"], word
             ) if part
         )
         marks.append(
@@ -1079,19 +1094,14 @@ def stage_html(session, beats, current, card):
     current_n = current.get("n") if current else 0
     upcoming = next((e for e in entries if e["n"] == current_n + 1), None)
     if current:
-        hint = " · ".join(
-            part for part in (
-                f"item {current_n} of {total}" if total else f"item {current_n}",
-                current.get("tier", ""),
-            ) if part
-        )
+        hint = f"item {current_n} of {total}" if total else f"item {current_n}"
     else:
         hint = "nothing read yet"
     ghost = ""
     if upcoming:
         line = " · ".join(
             part for part in (
-                f"item {upcoming['n']} of {total}", upcoming["tier"], upcoming["where"]
+                f"item {upcoming['n']} of {total}", upcoming["where"]
             ) if part
         )
         ghost = (
@@ -1230,8 +1240,8 @@ def body_html(
     # One tile per section, so the first four always sum to the last.
     tiles = [
         ("is-clean", counts.get("clean", 0) + counts.get("unverified", 0), "clean"),
-        ("is-flag", counts.get("flag", 0), "needs your call"),
-        ("is-acc", counts.get("accepted", 0) + counts.get("decided", 0), "accepted"),
+        ("is-flag", counts.get("flag", 0), "decisions owed"),
+        ("is-acc", counts.get("accepted", 0) + counts.get("decided", 0), "decided"),
         ("is-drop", counts.get("dropped", 0), "dropped"),
         ("is-mute", len(beats), "items read"),
     ]
