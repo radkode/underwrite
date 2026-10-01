@@ -390,22 +390,24 @@ class Handler(BaseHTTPRequestHandler):
             if route == "/events":
                 return self.stream_events()
             if route == "/":
-                session, beats, css, problems, _ = self.session.load()
+                session, beats, css, problems, all_problems = self.session.load()
                 render = rr()
                 page = render.SHELL + render.render(
                     session, beats, css, problems, live=True,
                     phase=self.session.status.get("phase"),
                     paths=self.session.paths, is_stored=self.session.stored,
+                    validation_problems=all_problems,
                 )
                 return self.send(200, page, "text/html")
             if route == "/fragment":
-                session, beats, _css, problems, _ = self.session.load()
+                session, beats, _css, problems, all_problems = self.session.load()
                 return self.send(
                     200,
                     rr().body_html(
                         session, beats, problems, True,
                         phase=self.session.status.get("phase"),
                         paths=self.session.paths,
+                        validation_problems=all_problems,
                     ),
                     "text/html",
                 )

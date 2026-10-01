@@ -474,7 +474,7 @@ class TheWalk(unittest.TestCase):
     def test_the_newest_beat_is_staged_and_left_out_of_the_ledger(self):
         html = self.live(self.beats())
         stage = html.split('id="stage"')[1].split("</section>")[0]
-        ledger = html.split("</section>", 1)[1]
+        ledger = html.split('id="stage"')[1].split("</section>", 1)[1]
         self.assertIn('data-n="3"', stage)
         self.assertNotIn('data-n="3"', ledger)
         self.assertIn('data-n="1"', ledger)
@@ -1035,6 +1035,97 @@ class CitedLocations(unittest.TestCase):
         self.assertIn("apps/web/src/lib/mcp/scopes.ts:53", html)
 
 
+class ReviewRecommendation(unittest.TestCase):
+    def session(self, **changes):
+        return dict({
+            "repo": "acme/widget",
+            "recommendation": "Request changes: the authorization check is missing.",
+            "plan": [{"n": 1}, {"n": 2}],
+        }, **changes)
+
+    def flag(self, n=1, **changes):
+        return beat(n=n, state="flag", slots={
+            "what": "authorization is missing", "proof": "app.py:4",
+            "risk": "another tenant can read records", "fix": "check the tenant",
+        }, decision={
+            "question": "Include the authorization finding in the review or drop it?",
+            "recommendation": "Include in review so the author adds the tenant check.",
+        }, **changes)
+
+    def test_recommendation_leads_the_page_before_context_and_counts(self):
+        session = self.session(reconstruction="what the change does", facts=["3 files"])
+        page = rr.render(session, [self.flag(), beat(n=2)], "", {})
+        markers = ("Request changes:", 'class="counts"', 'class="frame"', 'class="facts"')
+        self.assertEqual([page.index(m) for m in markers], sorted(page.index(m) for m in markers))
+
+    def test_live_fragment_counts_only_unresolved_flags(self):
+        states = [self.flag(), self.flag(n=2), beat(n=3, state="accepted"),
+                  beat(n=4, state="decided", call="keep owner-only"),
+                  beat(n=5, state="dropped"), beat(n=6)]
+        fragment = rr.body_html(self.session(), states, {}, live=True, phase="parked")
+        self.assertIn("Request changes:", fragment)
+        self.assertIn("2 decisions owed", fragment)
+        states[0] = dict(states[0], state="accepted")
+        states[1] = dict(states[1], state="decided", call="keep owner-only")
+        resolved = rr.body_html(self.session(), states, {}, live=True, phase="done")
+        self.assertIn("0 decisions owed", resolved)
+
+    def test_every_flag_names_the_decision_and_recommendation(self):
+        policy = self.flag(n=2, resolution_kind="decision")
+        policy["decision"] = {
+            "question": "Keep owner-only access or allow tenant-wide access?",
+            "recommendation": "Keep owner-only access until sharing is designed.",
+        }
+        for live in (False, True):
+            page = rr.render(self.session(), [self.flag(), policy], "", {}, live=live)
+            for item in (self.flag(), policy):
+                self.assertIn(item["decision"]["question"], page)
+                self.assertIn(item["decision"]["recommendation"], page)
+
+    def test_partial_static_and_unverified_reviews_are_qualified(self):
+        session = self.session(execution_policy={"mode": "no_exec"})
+        page = rr.render(session, [beat(state="unverified")], "", {1: ["bad proof"]})
+        for phrase in ("Provisional recommendation", "1 planned item not reviewed",
+                       "1 item unverified", "validation problems",
+                       "Static inspection only; runtime behavior was not verified"):
+            self.assertIn(phrase, page)
+
+    def test_unknown_coverage_and_missing_assessment_never_invent_approval(self):
+        page = rr.render({"repo": "r"}, [beat()], "", {})
+        self.assertIn("Recommendation not recorded", page)
+        self.assertIn("completeness is unknown", page)
+        self.assertNotIn("Safe to merge", page)
+
+    def test_live_fragment_qualifies_session_validation_problems(self):
+        fragment = rr.body_html(
+            self.session(), [beat(n=1), beat(n=2)], {}, live=True,
+            validation_problems=["session cursor mismatch"],
+        )
+        self.assertIn("Provisional recommendation", fragment)
+        self.assertIn("validation problems", fragment)
+
+    def test_included_findings_are_not_reported_as_fixes(self):
+        session = dict(report_session(), recommendation="Address the authorization finding.",
+                       plan=[{"n": 1}])
+        page = rr.render(session, [beat(state="accepted")], "", {})
+        self.assertIn("Inclusion does not mean the underlying issue was fixed", page)
+
+    def test_legacy_flags_show_the_choice_without_guessing_a_recommendation(self):
+        item = self.flag()
+        item.pop("decision")
+        page = rr.render(self.session(audience={"mode": "review"}), [item], "", {})
+        self.assertIn("Include in review or drop this finding?", page)
+        self.assertIn("Recommended option not recorded", page)
+
+    def test_authored_assessment_and_decisions_cannot_insert_html(self):
+        item = self.flag()
+        item["decision"] = {"question": "<img src=x>", "recommendation": "<script>bad</script>"}
+        page = rr.render(self.session(recommendation="<svg onload=bad>"), [item], "", {})
+        for tag in ("<img", "<script>", "<svg"):
+            self.assertNotIn(tag, page)
+        self.assertIn("&lt;img", page)
+
+
 class TheFrame(unittest.TestCase):
     """Orient and plan happen before the page exists, so the page is where they survive."""
 
@@ -1051,11 +1142,11 @@ class TheFrame(unittest.TestCase):
         html = rr.render({"repo": "r", "facts": ["x"]}, [], "", {})
         self.assertNotIn('class="frame"', html)
 
-    def test_a_final_page_opens_on_it_between_the_title_and_the_facts(self):
+    def test_a_final_page_keeps_context_after_the_review_assessment(self):
         html = rr.render(self.SESSION, [], "", {})
         order = [
             html.index(marker)
-            for marker in ("</h1>", '<details class="frame" open>', 'class="facts"', 'id="live-body"')
+            for marker in ("</h1>", 'id="live-body"', '<details class="frame" open>', 'class="facts"')
         ]
         self.assertEqual(order, sorted(order))
         self.assertIn("<dd>closes the hole <code>S0</code> left</dd>", html)
@@ -1545,6 +1636,41 @@ class RenderCli(unittest.TestCase):
         self.assertIn(
             'href="https://github.com/acme/widget/commit/' + "b" * 40 + '"', self.page()
         )
+
+    def test_persisted_recommendation_leads_terminal_and_page_output(self):
+        store = self.frozen_store()
+        store.patch_session({
+            "recommendation": "Address the missing tenant check.",
+            "plan": [{"n": 1}],
+        })
+        item = beat(state="flag", slots={
+            "what": "tenant check missing", "proof": "app.py:4",
+            "risk": "cross-tenant reads", "fix": "add the tenant check",
+        }, decision={
+            "question": "Include this finding in the report or drop it?",
+            "recommendation": "Include in report to preserve the evidence.",
+        })
+        store.put_beat(item)
+        done = self.run_cli("--standalone")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertTrue(done.stderr.startswith("Recommendation: Address the missing tenant check."))
+        self.assertIn("1 decision owed", done.stderr)
+        self.assertIn("Static inspection only", done.stderr)
+        for text in ("Address the missing tenant check.", item["decision"]["question"],
+                     item["decision"]["recommendation"]):
+            self.assertIn(text, self.page())
+
+    def test_session_validation_qualifies_page_and_terminal_recommendation(self):
+        self.session({
+            "repo": "acme/widget", "cursor": 2, "plan": [{"n": 1}],
+            "recommendation": "The reviewed change looks good.",
+        })
+        self.put(beat())
+        done = self.run_cli()
+        self.assertEqual(done.returncode, 2)
+        for text in ("Provisional recommendation", "validation problems"):
+            self.assertIn(text, self.page())
+            self.assertIn(text, done.stderr)
 
     def test_a_frozen_pr_links_even_when_its_diff_names_no_file(self):
         """The store is what the links rest on, not the contents of the diff."""

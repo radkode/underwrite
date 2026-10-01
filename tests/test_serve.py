@@ -1312,6 +1312,24 @@ class Fragment(Served):
         self.assertIn("yes, pin it", body)
         self.assertIn("Implementation pending", body)
 
+    def test_recommendation_and_decision_count_refresh_after_resolution(self):
+        self.session.store.patch_session({"recommendation": "Pin the dependency before merging."})
+        self.assertIn("Pin the dependency before merging.", self.get("/fragment")[1])
+        self.assertIn("1 decision owed", self.get("/fragment")[1])
+        self.post("/act", {"n": 1, "action": "drop"})
+        self.assertIn("0 decisions owed", self.get("/fragment")[1])
+
+    def test_full_page_and_fragment_qualify_session_validation_errors(self):
+        self.session.store.patch_session({
+            "recommendation": "The reviewed change looks good.",
+            "cursor": 3, "plan": [{"n": 1}, {"n": 2}],
+        })
+        for route in ("/", "/fragment"):
+            status, body = self.get(route)
+            self.assertEqual(status, 200)
+            self.assertIn("Provisional recommendation", body)
+            self.assertIn("validation problems", body)
+
     def test_it_shows_failed_delivery_without_rewriting_the_accepted_intent(self):
         self.post("/act", {"n": 1, "action": "accept"})
         self.session.store.fail(1, "tests failed", "repair the fixture")

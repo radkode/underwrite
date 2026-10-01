@@ -228,9 +228,22 @@ def beat_budget_problems(beat):
     return over
 
 
+def decision_problems(beat):
+    if "decision" not in beat:
+        return []
+    decision = beat["decision"]
+    if (
+        not isinstance(decision, dict)
+        or set(decision) != {"question", "recommendation"}
+        or any(not isinstance(value, str) or not value.strip() for value in decision.values())
+    ):
+        return [f"beat {beat.get('n', '?')}: decision requires question and recommendation as nonempty text"]
+    return []
+
+
 def validate_beat(beat, mode="branch", final=False):
     """Return beat contract violations. Empty means the beat is shippable."""
-    problems = []
+    problems = decision_problems(beat)
     n = beat.get("n", "?")
     state = beat.get("state")
     raw_slots = beat.get("slots")
@@ -1313,6 +1326,11 @@ class SessionStore:
         version = body.pop("schema_version", SCHEMA_VERSION)
         if type(version) is not int or version != SCHEMA_VERSION:
             raise StoreError(f"session schema_version must be {SCHEMA_VERSION}")
+        if "recommendation" in body and (
+            not isinstance(body["recommendation"], str)
+            or not body["recommendation"].strip()
+        ):
+            raise StoreError("session recommendation must be nonempty text")
         audience = body.get("audience")
         if audience is not None:
             if not isinstance(audience, dict):
@@ -1601,6 +1619,9 @@ class SessionStore:
             raise StoreError("beat must be an object")
         beat = _copy(document)
         _positive(beat.get("n"), "beat n")
+        problems = decision_problems(beat)
+        if problems:
+            raise StoreError("; ".join(problems))
         if isinstance(beat.get("slots"), dict):
             beat["slots"] = canonical_slots(beat["slots"])
         if (
@@ -3457,7 +3478,7 @@ class SessionStore:
                         beat.pop("resolution_kind", None)
                 if current.get("state") == "accepted":
                     if self._audience_mode(session) == "report":
-                        frozen_fields = ("tier", "claim", "where", "slots", "diff")
+                        frozen_fields = ("tier", "claim", "where", "slots", "diff", "decision")
                         changed_fields = [
                             field
                             for field in frozen_fields
