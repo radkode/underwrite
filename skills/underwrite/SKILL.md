@@ -722,6 +722,9 @@ handoff with the same assessment and count of decisions owed as the page. Say wh
 reviewed or verified; clean counts and included findings alone do not establish merge
 readiness. The renderer qualifies incomplete coverage, unverified items, and static
 inspection instead of turning a delivery-complete page into a verified review.
+For every included finding, say in the recommendation whether it blocks the merge and who
+acts on it; a finished page that says "safe to merge" above a finding leaves the reviewer
+guessing which one wins.
 
 Render the page first, so the reviewer makes any remaining calls off the hoisted flags
 rather than off scrollback. Branch delivery and report acceptance are already complete,

@@ -77,6 +77,7 @@ class RecommendationContract(unittest.TestCase):
             "agent's recommendation, not the reviewer's GitHub verdict",
             "A static review cannot claim verified runtime behavior",
             "Before the walk is complete, call it provisional",
+            "say in the recommendation whether it blocks the merge",
         ):
             self.assertIn(phrase, text)
 

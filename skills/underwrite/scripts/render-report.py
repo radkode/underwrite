@@ -61,7 +61,11 @@ SECTIONS = (
 
 LANDS_TAG = {"landed": "Landed", "ready": "Ready", "open": "Your call"}
 FRAME_PROSE = (("claim_check", "Claim check"),)
-FRAME_CALLS = (("orient_call", "Your answer on the summary"), ("plan_call", "Your answer on the order"))
+# (session key, the question the reviewer answered before the walk)
+FRAME_CALLS = (
+    ("orient_call", "Is the summary of this change right?"),
+    ("plan_call", "In what order should the items be read?"),
+)
 
 # Only for --standalone. The viewport tag is load-bearing: report.css has a
 # 620px breakpoint that never fires without it.
@@ -387,7 +391,7 @@ LIVE_JS = """<script>
   // ledger both say so; this says it where the click happened.
   function owedNote() {
     const staged = document.querySelector('#stage .beat.s-flag');
-    return staged ? `beat ${staged.dataset.n} stays owed` : '';
+    return staged ? `item ${staged.dataset.n} stays owed` : '';
   }
 
   function resumePending() {
@@ -598,6 +602,30 @@ def diff_html(lines):
     )
 
 
+def decision_text(beat, mode, replacement=False, untrusted_pr=False):
+    """A flag's (question, recommendation). A session older than the field gets the
+    choice its buttons offer, and no guessed recommendation."""
+    decision = beat.get("decision")
+    if isinstance(decision, dict):
+        return (
+            decision.get("question", "Decision not recorded."),
+            decision.get("recommendation", "Recommended option not recorded."),
+        )
+    if beat.get("resolution_kind") != "decision" and (
+        replacement or (mode == "branch" and untrusted_pr)
+    ):
+        question = "Replace this blocked session before choosing delivery, or drop this finding?"
+    elif beat.get("resolution_kind") == "decision":
+        question = "Choose the policy option in FIX or drop this question?"
+    else:
+        question = {
+            "branch": "Implement the proposed fix or drop this finding?",
+            "review": "Include in review or drop this finding?",
+            "report": "Include in report or drop this finding?",
+        }[mode]
+    return question, "Recommended option not recorded."
+
+
 def outcome_html(beat, mode):
     """One plain sentence on an accepted beat: what the reviewer chose and what it did.
     Accepting posts or records a finding; only branch mode changes the code."""
@@ -804,26 +832,7 @@ def beat_html(
 
     body = []
     if beat.get("state") == "flag":
-        decision = beat.get("decision")
-        if isinstance(decision, dict):
-            question = decision.get("question", "Decision not recorded.")
-            recommendation = decision.get("recommendation", "Recommended option not recorded.")
-        else:
-            if beat.get("resolution_kind") != "decision" and (
-                replacement or (mode == "branch" and untrusted_pr)
-            ):
-                question = "Replace this blocked session before choosing delivery, or drop this finding?"
-            else:
-                question = (
-                    "Choose the policy option in FIX or drop this question?"
-                    if beat.get("resolution_kind") == "decision"
-                    else {
-                        "branch": "Implement the proposed fix or drop this finding?",
-                        "review": "Include in review or drop this finding?",
-                        "report": "Include in report or drop this finding?",
-                    }[mode]
-                )
-            recommendation = "Recommended option not recorded."
+        question, recommendation = decision_text(beat, mode, replacement, untrusted_pr)
         body.append(
             '<div class="decision">'
             f'<p><strong>Decision:</strong> {md(question)}</p>'
@@ -950,7 +959,8 @@ def beat_html(
         )
 
     return (
-        f'<details class="beat s-{suffix}" data-n="{attr(n)}"{" open" if expanded else ""}>'
+        f'<details class="beat s-{suffix}" id="item-{attr(n)}" data-n="{attr(n)}"'
+        f'{" open" if expanded else ""}>'
         f"<summary>"
         f'<span class="b-num">{md(n)}</span>'
         f'<span class="b-tier">{md(beat.get("tier", ""))}</span>'
@@ -1097,7 +1107,7 @@ def stage_html(session, beats, current, card):
     )
 
 
-def assessment(session, beats, problems_by_n, validation_problems=()):
+def assessment(session, beats, problems_by_n, validation_problems=(), walking=False):
     text = session.get("recommendation")
     if not isinstance(text, str) or not text.strip():
         text = "Recommendation not recorded. Do not infer merge readiness from the counts."
@@ -1114,7 +1124,11 @@ def assessment(session, beats, problems_by_n, validation_problems=()):
         limits.append(f"{unverified} item{'s' if unverified != 1 else ''} unverified.")
     if problems_by_n or validation_problems:
         limits.append("The report has validation problems; resolve them before relying on it.")
-    label = "Provisional recommendation" if limits else "Recommendation"
+    owed = sum(beat.get("state") == "flag" for beat in beats)
+    if limits:
+        label = "Provisional recommendation"
+    else:
+        label = "Recommendation" if owed or walking else "Final recommendation"
     if execution_mode(session) == "no_exec":
         limits.append("Static inspection only; runtime behavior was not verified.")
     mode = session_mode(session)
@@ -1124,17 +1138,46 @@ def assessment(session, beats, problems_by_n, validation_problems=()):
             f"{included} finding{'s' if included != 1 else ''} included in the {mode}. "
             "Including a finding does not fix the issue it describes."
         )
-    owed = sum(beat.get("state") == "flag" for beat in beats)
     return label, text, limits, owed
 
 
-def assessment_html(session, beats, problems_by_n, validation_problems=()):
-    label, text, limits, owed = assessment(session, beats, problems_by_n, validation_problems)
+NEXT_STEP = {
+    "review": "Nothing reaches GitHub until you post the whole review at the end.",
+    "report": "Including a finding records it in this report and posts nothing.",
+    "branch": "Implement applies the stated fix and commits it.",
+}
+
+
+def assessment_html(
+    session, beats, problems_by_n, validation_problems=(),
+    replacement=False, untrusted_pr=False, walking=False,
+):
+    label, text, limits, owed = assessment(
+        session, beats, problems_by_n, validation_problems, walking,
+    )
     change = session.get("reconstruction")
+    mode = session_mode(session)
+    asks = "".join(
+        f'<li><a href="#item-{attr(beat.get("n", "?"))}">Item {md(beat.get("n", "?"))}</a>: '
+        f'{md(decision_text(beat, mode, replacement, untrusted_pr)[0])}</li>'
+        for beat in beats if beat.get("state") == "flag"
+    )
+    if asks:
+        blocked = replacement or (mode == "branch" and untrusted_pr)
+        step = (
+            "Implementing is blocked for this session; a finding can only be dropped or noted."
+            if blocked else NEXT_STEP[mode]
+        )
+        waiting = f'<ul class="asks">{asks}</ul><p class="next-step">{step}</p>'
+    elif label == "Final recommendation":
+        waiting = '<p class="next-step">The review is complete. Nothing is waiting on you.</p>'
+    else:
+        waiting = ""
     return (
         '<section class="assessment" aria-label="Review recommendation">'
         f'<h2>{label}</h2><p class="recommendation">{md(text)}</p>'
         f'<p class="decisions-owed">{owed} decision{"s" if owed != 1 else ""} owed</p>'
+        + waiting
         + "".join(f'<p class="qualification">{md(limit)}</p>' for limit in limits)
         + (f'<h3>What this change is</h3><p class="change">{md(change)}</p>' if change else "")
         + '</section>'
@@ -1162,7 +1205,10 @@ def body_html(
             key=lambda b: b["n"],
             default=None,
         )
-    parts = [assessment_html(session, beats, problems_by_n, validation_problems)]
+    parts = [assessment_html(
+        session, beats, problems_by_n, validation_problems, replacement, untrusted_pr,
+        walking=live and phase != "done",
+    )]
     if live:
         parts.append(bar_html(session, beats, current, phase))
         if phase != "done":
@@ -1257,10 +1303,11 @@ def frame_html(session, live):
     calls = [(label, session.get(key)) for key, label in FRAME_CALLS if session.get(key)]
     if not prose and not calls:
         return ""
-    summary = '<span class="sep">·</span>'.join(
-        f'<span class="frame-k">{label}</span><q>{md(text)}</q>' for label, text in calls
-    ) or '<span class="frame-k">How this review was framed</span>'
-    body = "".join(f"<dt>{label}</dt><dd>{md(text)}</dd>" for label, text in prose)
+    summary = '<span class="frame-k">How this review was framed</span>'
+    body = "".join(
+        f'<dt class="frame-q">{label}</dt><dd>You answered <q>{md(text)}</q></dd>'
+        for label, text in calls
+    ) + "".join(f"<dt>{label}</dt><dd>{md(text)}</dd>" for label, text in prose)
     if body:
         body = f"<dl>{body}</dl>"
     return (
@@ -1516,7 +1563,9 @@ def main():
     )
     out.write_text(SHELL + page if args.standalone else page, encoding="utf-8")
 
-    label, recommendation, limits, owed = assessment(session, beats, problems_by_n, all_problems)
+    label, recommendation, limits, owed = assessment(
+        session, beats, problems_by_n, all_problems, walking=args.live,
+    )
     print(f"{label}: {recommendation}", file=sys.stderr)
     print(f"{owed} decision{'s' if owed != 1 else ''} owed", file=sys.stderr)
     for limit in limits:
