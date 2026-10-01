@@ -363,14 +363,14 @@ class ReportOrdering(unittest.TestCase):
         order = [
             html.index("Needs your call"),
             html.index("Accepted"),
-            html.index("Walked and clean"),
+            html.index("Read and clean"),
             html.index("Dropped"),
         ]
         self.assertEqual(order, sorted(order))
 
     def test_empty_sections_are_omitted(self):
         html = self.render([beat(n=1, state="clean")])
-        self.assertIn("Walked and clean", html)
+        self.assertIn("Read and clean", html)
         self.assertNotIn("Needs your call", html)
         self.assertNotIn("Dropped", html)
 
@@ -478,11 +478,11 @@ class TheWalk(unittest.TestCase):
         self.assertIn('data-n="3"', stage)
         self.assertNotIn('data-n="3"', ledger)
         self.assertIn('data-n="1"', ledger)
-        self.assertIn("beat 3 of 4 · core", stage)
+        self.assertIn("item 3 of 4 · core", stage)
         # the note comes first so Tab lands on the primary; Next beat closes the row
         row = stage.split('<div class="acts"')[1].split("</div>")[0]
         self.assertRegex(row, r'^[^>]*>\s*<input class="note"')
-        self.assertRegex(row, r'<button class="act" data-action="next">Next beat</button>\s*<span class="act-msg"')
+        self.assertRegex(row, r'<button class="act" data-action="next">Next item</button>\s*<span class="act-msg"')
 
     def test_the_stage_row_says_what_the_keys_do(self):
         decision = beat(n=3, state="flag", resolution_kind="decision",
@@ -494,26 +494,26 @@ class TheWalk(unittest.TestCase):
                           beat(n=2, state="flag", slots={"what": "x", "proof": "b:2", "risk": "r", "fix": "f"})])
         self.assertIn("<kbd>Enter</kbd> saves a note", html)
         self.assertIn('<kbd><span data-mod>⌘</span>Enter</kbd> implements', html)
-        self.assertIn("<kbd>n</kbd> next beat", html)
+        self.assertIn("<kbd>n</kbd> next item", html)
         # only the stage row carries the hint
         self.assertEqual(html.count('class="keys"'), 1)
 
     def test_the_ghost_of_the_next_planned_beat_is_hidden_until_between_beats(self):
         html = self.live(self.beats())
         self.assertIn('<div class="ghost" hidden>', html)
-        self.assertIn("beat 4 of 4 · follow-through · d.ts:4", html)
+        self.assertIn("item 4 of 4 · follow-through · d.ts:4", html)
 
     def test_before_the_first_beat_the_ghost_of_beat_one_shows(self):
         html = self.live([])
         self.assertIn('<div class="ghost">', html)
-        self.assertIn("beat 1 of 4 · enabling · a.ts:1", html)
-        self.assertIn("nothing walked yet", html)
-        self.assertIn('aria-label="waiting for beat 1"', html)
+        self.assertIn("item 1 of 4 · enabling · a.ts:1", html)
+        self.assertIn("nothing read yet", html)
+        self.assertIn('aria-label="waiting for item 1"', html)
 
     def test_the_track_marks_every_planned_beat_with_its_state(self):
         html = self.live(self.beats())
         track = html.split('<ol class="track"')[1].split("</ol>")[0]
-        self.assertIn('aria-label="beat 3 of 4"', track)
+        self.assertIn('aria-label="item 3 of 4"', track)
         self.assertRegex(track, r'<li class="tk s-clean"[^>]*>1</li>')
         self.assertRegex(track, r'<li class="tk s-acc"[^>]*>2</li>')
         self.assertRegex(track, r'<li class="tk s-clean is-now" aria-current="step"[^>]*>3</li>')
@@ -523,7 +523,7 @@ class TheWalk(unittest.TestCase):
         html = self.live(self.beats(), phase="done")
         self.assertNotIn('id="stage"', html)
         self.assertIn('data-n="3"', html)
-        self.assertIn('aria-label="3 of 4 walked"', html)
+        self.assertIn('aria-label="3 of 4 read"', html)
 
     def test_a_final_render_has_neither_bar_nor_stage(self):
         html = rr.render(self.session(), self.beats(), "", {})
@@ -566,7 +566,7 @@ class WalkCoverage(unittest.TestCase):
 
     def test_a_short_walk_names_the_count_and_every_beat_it_never_reached(self):
         html = self.final([beat(n=1, state="clean"), beat(n=2, state="clean")])
-        self.assertIn("2 of 4 beats walked. Not walked:", html)
+        self.assertIn("2 of 4 items read. Not read yet:", html)
         block = html.split('class="cov-left"')[1].split("</ul>")[0]
         self.assertIn(">3</span>", block)
         self.assertIn(">4</span>", block)
@@ -581,18 +581,18 @@ class WalkCoverage(unittest.TestCase):
 
     def test_a_finished_walk_says_so_and_lists_nothing(self):
         html = self.final([beat(n=n, state="clean") for n in (1, 2, 3, 4)])
-        self.assertIn('<p class="coverage is-done">4 of 4 beats walked.</p>', html)
+        self.assertIn('<p class="coverage is-done">4 of 4 items read.</p>', html)
         self.assertNotIn("cov-left", html)
-        self.assertNotIn("Not walked", html)
+        self.assertNotIn("Not read yet", html)
 
     def test_a_beat_walked_off_plan_still_counts_in_the_denominator(self):
         html = self.final([beat(n=n, state="clean") for n in (1, 2, 3, 4, 9)])
-        self.assertIn("5 of 5 beats walked", html)
+        self.assertIn("5 of 5 items read", html)
 
     def test_a_session_with_no_plan_reports_what_it_walked(self):
         html = self.final([beat(n=1, state="clean")], plan=False)
-        self.assertIn("1 of 1 beats walked", html)
-        self.assertNotIn("Not walked", html)
+        self.assertIn("1 of 1 items read", html)
+        self.assertNotIn("Not read yet", html)
 
     def test_a_session_with_nothing_at_all_renders_no_coverage_block(self):
         self.assertNotIn("coverage", self.final([], plan=False))
@@ -602,9 +602,9 @@ class WalkCoverage(unittest.TestCase):
         html = self.final(beats)
         # the track is --live only, which is how a partial walk published as complete
         self.assertNotIn('class="track"', html)
-        self.assertIn("1 of 4 beats walked", html)
+        self.assertIn("1 of 4 items read", html)
         live = rr.render(self.session(), beats, "", {}, live=True, phase="parked")
-        self.assertIn("1 of 4 beats walked", live)
+        self.assertIn("1 of 4 items read", live)
         self.assertEqual(live.count('class="coverage'), 1)
 
     def test_a_long_plan_entry_is_shortened_and_kept_whole_in_the_title(self):
@@ -1053,9 +1053,12 @@ class ReviewRecommendation(unittest.TestCase):
         }, **changes)
 
     def test_recommendation_leads_the_page_before_context_and_counts(self):
-        session = self.session(reconstruction="what the change does", facts=["3 files"])
+        session = self.session(
+            reconstruction="what the change does", claim_check="holds", facts=["3 files"],
+        )
         page = rr.render(session, [self.flag(), beat(n=2)], "", {})
-        markers = ("Request changes:", 'class="counts"', 'class="frame"', 'class="facts"')
+        markers = ("Request changes:", "What this change is", 'class="counts"',
+                   'class="frame"', 'class="facts"')
         self.assertEqual([page.index(m) for m in markers], sorted(page.index(m) for m in markers))
 
     def test_live_fragment_counts_only_unresolved_flags(self):
@@ -1108,7 +1111,7 @@ class ReviewRecommendation(unittest.TestCase):
         session = dict(report_session(), recommendation="Address the authorization finding.",
                        plan=[{"n": 1}])
         page = rr.render(session, [beat(state="accepted")], "", {})
-        self.assertIn("Inclusion does not mean the underlying issue was fixed", page)
+        self.assertIn("1 finding included in the report. Including a finding does not fix the issue it describes.", page)
 
     def test_legacy_flags_show_the_choice_without_guessing_a_recommendation(self):
         item = self.flag()
@@ -1149,7 +1152,7 @@ class TheFrame(unittest.TestCase):
             for marker in ("</h1>", 'id="live-body"', '<details class="frame" open>', 'class="facts"')
         ]
         self.assertEqual(order, sorted(order))
-        self.assertIn("<dd>closes the hole <code>S0</code> left</dd>", html)
+        self.assertIn('<h3>What this change is</h3><p class="change">closes the hole <code>S0</code> left</p>', html)
         self.assertIn("<dd>the body holds up</dd>", html)
 
     def test_a_live_walk_folds_it_to_the_reviewers_answers(self):
@@ -1159,8 +1162,16 @@ class TheFrame(unittest.TestCase):
         self.assertIn("<q>Walk it in this order</q>", summary)
 
     def test_prose_with_no_recorded_answer_is_still_labelled(self):
-        html = rr.render({"repo": "r", "reconstruction": "what it is for"}, [], "", {})
-        self.assertIn('<summary><span class="frame-k">Orient</span></summary>', html)
+        html = rr.render({"repo": "r", "claim_check": "the body holds up"}, [], "", {})
+        self.assertIn('<summary><span class="frame-k">How this review was framed</span></summary>', html)
+
+    def test_the_reconstruction_leads_as_what_the_change_is_and_leaves_the_frame(self):
+        html = rr.render(self.SESSION, [], "", {})
+        self.assertLess(html.index("What this change is"), html.index('class="frame"'))
+        frame = html.split('<details class="frame"')[1]
+        self.assertNotIn("closes the hole", frame)
+        self.assertIn("Your answer on the summary", frame)
+        self.assertNotIn("What this change is", rr.render({"repo": "r"}, [], "", {}))
 
     def test_the_reviewers_words_cannot_carry_markup(self):
         session = dict(self.SESSION, orient_call="<img src=x onerror=alert(1)>")

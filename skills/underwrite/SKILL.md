@@ -332,7 +332,7 @@ ordinary flag shows Implement for local `branch` targets or Include in review in
 mode, or Include in report in `report` mode, plus Drop. A legacy or malformed PR in branch
 mode shows that implementation is blocked instead. A decision-only flag with top-level
 `resolution_kind: "decision"` shows Record decision. Save note remains available on any
-beat, and Next beat works anywhere. The page writes its URL to `$R/serve.json`.
+beat, and Next item works anywhere. The page writes its URL to `$R/serve.json`.
 
 Those labels name the effect while the durable protocol remains stable. Implement,
 Include in review, and Include in report all post the canonical `accept` action.
