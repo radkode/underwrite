@@ -158,7 +158,7 @@ handling untrusted artifacts. Neither the gateway nor the linked implementation 
 A walk serves itself on loopback, and the page is where you actually review. While a walk
 is listening, the beat being read leads the page on its own, under a bar that stays in
 view: the plan as a track with the current beat marked, the agent's own sentence about
-what it is doing, and Next beat. Everything already walked sits below, ordered by what is
+what it is doing, and Next item. Everything already walked sits below, ordered by what is
 owed rather than by what was walked: open flags expanded at the top, resolved beats folded
 to one line with your call on it, clean beats to one line each that still carries its
 proof. When the walk ends, that ledger is the page, and it is what the final render keeps.
@@ -168,17 +168,17 @@ that finished.
 The final render stays on your machine unless you agree to publish it, as **Finish** says.
 The keys do what the row under the beat says: Enter saves a note, or records a decision
 when the note is the decision; ⌘Enter or Ctrl+Enter fires the row's primary action; `n`
-is Next beat and `f` goes to the first open flag.
+is Next item and `f` goes to the first open flag.
 Resolving a beat asks twice, because none of it can be walked back: the store lets accept
 and drop out of an open flag only, and refuses to re-decide a beat that carries a delivery.
 So Implement, Include, Record decision and Drop all arm on the first click and send on the
 second, with the prompt naming which beat. Anything else answers no, including three
-seconds of nothing. Save note and Next beat go straight through.
+seconds of nothing. Save note and Next item go straight through.
 
 Decisions happen there too. Review mode uses Include in review and Drop. Report mode uses
 Include in report and Drop. Local branch and working-tree sessions retain Implement. A
 policy question whose answer completes the work carries Record decision.
-Each has a field for putting the call in your own words, and Next beat advances the walk
+Each has a field for putting the call in your own words, and Next item advances the walk
 from anywhere. Clicking is what unblocks the terminal side, which parks on the server
 between beats rather than spinning. The terminal still takes the same answers in words,
 so closing the tab never strands a session.

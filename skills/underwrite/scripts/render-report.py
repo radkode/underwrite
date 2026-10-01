@@ -53,15 +53,15 @@ STATE_STYLE = {
 
 # (heading, hint, states, expanded by default)
 SECTIONS = (
-    ("Needs your call", "out of beat order, on purpose", ("flag",), True),
+    ("Needs your call", "out of item order, on purpose", ("flag",), True),
     ("Accepted", "your call, and what came of it", ("accepted", "decided"), True),
-    ("Walked and clean", "nothing owed, proof on each", ("clean", "unverified"), False),
+    ("Read and clean", "nothing owed, proof on each", ("clean", "unverified"), False),
     ("Dropped", "raised, then set aside", ("dropped",), False),
 )
 
 LANDS_TAG = {"landed": "Landed", "ready": "Ready", "open": "Your call"}
-FRAME_PROSE = (("reconstruction", "Reconstruction"), ("claim_check", "Claim check"))
-FRAME_CALLS = (("orient_call", "Orient"), ("plan_call", "Plan"))
+FRAME_PROSE = (("claim_check", "Claim check"),)
+FRAME_CALLS = (("orient_call", "Your answer on the summary"), ("plan_call", "Your answer on the order"))
 
 # Only for --standalone. The viewport tag is load-bearing: report.css has a
 # 620px breakpoint that never fires without it.
@@ -113,7 +113,7 @@ LIVE_JS = """<script>
     disarm();
     const label = button.textContent;
     const verb = label.split(' ')[0];
-    const which = n === 'walk' ? '' : ` beat ${n}`;
+    const which = n === 'walk' ? '' : ` item ${n}`;
     armed = {
       button,
       label,
@@ -131,7 +131,7 @@ LIVE_JS = """<script>
   // stored, so it is not the reviewer's to repeat; a walk that failed or stopped still
   // needs telling, which is the one thing the page cannot do.
   const NOUNS = {
-    accept: 'decision', drop: 'decision', decide: 'decision', next: 'next beat',
+    accept: 'decision', drop: 'decision', decide: 'decision', next: 'next item',
   };
   function held(kind, headState) {
     const noun = NOUNS[kind] || kind || 'call';
@@ -811,7 +811,7 @@ def beat_html(
         body.append(diff_html(beat["diff"]))
     if beat.get("call"):
         body.append(
-            '<div class="call"><span class="lbl">Your call · beat '
+            '<div class="call"><span class="lbl">Your call · item '
             f'{n}</span><q>{md(beat["call"])}</q></div>'
         )
     delivery = delivery_html(beat, mode, replacement, untrusted_pr)
@@ -887,16 +887,16 @@ def beat_html(
         # and says what the keys do, once, where the reviewer is acting.
         advance = keys = ""
         if stage:
-            advance = '<button class="act" data-action="next">Next beat</button>'
+            advance = '<button class="act" data-action="next">Next item</button>'
             hints = [f"<kbd>Enter</kbd> {enter}"]
             if mod:
                 hints.append(f'<kbd><span data-mod>⌘</span>Enter</kbd> {mod}')
-            hints.append("<kbd>n</kbd> next beat")
+            hints.append("<kbd>n</kbd> next item")
             keys = f'<span class="keys">{" · ".join(hints)}</span>'
         # The note comes first so Tab lands on the primary right after typing.
         body.append(
             f'<div class="acts" data-acts="{attr(n)}">'
-            f'<input class="note" aria-label="your words, beat {attr(n)}" placeholder="{placeholder}">'
+            f'<input class="note" aria-label="your words, item {attr(n)}" placeholder="{placeholder}">'
             f'{controls}{advance}<span class="act-msg" role="status"></span>{keys}</div>'
         )
 
@@ -950,7 +950,7 @@ def coverage_html(session, beats):
         return ""
     left = [e for e in entries if e["state"] is None]
     walked = len(entries) - len(left)
-    head = f"{walked} of {len(entries)} beats walked"
+    head = f"{walked} of {len(entries)} items read"
     if not left:
         return f'<p class="coverage is-done">{md(head)}.</p>'
     rows = []
@@ -965,7 +965,7 @@ def coverage_html(session, beats):
             f'{md(textwrap.shorten(what, 88, placeholder="…"))}</span></li>'
         )
     return (
-        f'<div class="coverage"><p>{md(head)}. Not walked:</p>'
+        f'<div class="coverage"><p>{md(head)}. Not read yet:</p>'
         f'<ul class="cov-left">{"".join(rows)}</ul></div>'
     )
 
@@ -979,7 +979,7 @@ def bar_html(session, beats, current, phase):
     for entry in entries:
         state = entry["state"]
         if state is None:
-            cls, word = "is-todo", "not yet walked"
+            cls, word = "is-todo", "not read yet"
         else:
             suffix, token = STATE_STYLE.get(state, ("unver", "UNVERIFIED"))
             cls, word = f"s-{suffix}", token.lower()
@@ -987,7 +987,7 @@ def bar_html(session, beats, current, phase):
         current_attr = ' aria-current="step"' if now else ""
         title = " · ".join(
             part for part in (
-                f"beat {entry['n']}", entry["tier"], entry["where"], word
+                f"item {entry['n']}", entry["tier"], entry["where"], word
             ) if part
         )
         marks.append(
@@ -996,17 +996,17 @@ def bar_html(session, beats, current, phase):
             f"{md(entry['n'])}</li>"
         )
     if current_n:
-        position = f"beat {current_n} of {total}" if total else f"beat {current_n}"
+        position = f"item {current_n} of {total}" if total else f"item {current_n}"
     elif phase == "done":
-        position = f"{len(beats)} of {total} walked" if total else f"{len(beats)} walked"
+        position = f"{len(beats)} of {total} read" if total else f"{len(beats)} read"
     else:
-        position = "waiting for beat 1"
+        position = "waiting for item 1"
     return (
         '<div class="bar">'
         f'<ol class="track" aria-label="{attr(position)}">{"".join(marks)}</ol>'
         '<span id="live" class="live starting" role="status">connecting</span>'
         '<div class="acts walk" data-acts="walk">'
-        '<button class="act" data-action="next">Next beat</button>'
+        '<button class="act" data-action="next">Next item</button>'
         '<span class="act-msg" role="status"></span></div>'
         "</div>"
     )
@@ -1022,17 +1022,17 @@ def stage_html(session, beats, current, card):
     if current:
         hint = " · ".join(
             part for part in (
-                f"beat {current_n} of {total}" if total else f"beat {current_n}",
+                f"item {current_n} of {total}" if total else f"item {current_n}",
                 current.get("tier", ""),
             ) if part
         )
     else:
-        hint = "nothing walked yet"
+        hint = "nothing read yet"
     ghost = ""
     if upcoming:
         line = " · ".join(
             part for part in (
-                f"beat {upcoming['n']} of {total}", upcoming["tier"], upcoming["where"]
+                f"item {upcoming['n']} of {total}", upcoming["tier"], upcoming["where"]
             ) if part
         )
         ghost = (
@@ -1068,21 +1068,26 @@ def assessment(session, beats, problems_by_n, validation_problems=()):
     label = "Provisional recommendation" if limits else "Recommendation"
     if execution_mode(session) == "no_exec":
         limits.append("Static inspection only; runtime behavior was not verified.")
-    if session_mode(session) in ("review", "report") and any(
-        beat.get("state") == "accepted" for beat in beats
-    ):
-        limits.append("Inclusion does not mean the underlying issue was fixed.")
+    mode = session_mode(session)
+    included = sum(beat.get("state") == "accepted" for beat in beats)
+    if mode in ("review", "report") and included:
+        limits.append(
+            f"{included} finding{'s' if included != 1 else ''} included in the {mode}. "
+            "Including a finding does not fix the issue it describes."
+        )
     owed = sum(beat.get("state") == "flag" for beat in beats)
     return label, text, limits, owed
 
 
 def assessment_html(session, beats, problems_by_n, validation_problems=()):
     label, text, limits, owed = assessment(session, beats, problems_by_n, validation_problems)
+    change = session.get("reconstruction")
     return (
         '<section class="assessment" aria-label="Review recommendation">'
         f'<h2>{label}</h2><p class="recommendation">{md(text)}</p>'
         f'<p class="decisions-owed">{owed} decision{"s" if owed != 1 else ""} owed</p>'
         + "".join(f'<p class="qualification">{md(limit)}</p>' for limit in limits)
+        + (f'<h3>What this change is</h3><p class="change">{md(change)}</p>' if change else "")
         + '</section>'
     )
 
@@ -1133,7 +1138,7 @@ def body_html(
         ("is-flag", counts.get("flag", 0), "needs your call"),
         ("is-acc", counts.get("accepted", 0) + counts.get("decided", 0), "accepted"),
         ("is-drop", counts.get("dropped", 0), "dropped"),
-        ("is-mute", len(beats), "beats walked"),
+        ("is-mute", len(beats), "items read"),
     ]
     parts.append(
         '<div class="counts">'
@@ -1205,7 +1210,7 @@ def frame_html(session, live):
         return ""
     summary = '<span class="sep">·</span>'.join(
         f'<span class="frame-k">{label}</span><q>{md(text)}</q>' for label, text in calls
-    ) or '<span class="frame-k">Orient</span>'
+    ) or '<span class="frame-k">How this review was framed</span>'
     body = "".join(f"<dt>{label}</dt><dd>{md(text)}</dd>" for label, text in prose)
     if body:
         body = f"<dl>{body}</dl>"
