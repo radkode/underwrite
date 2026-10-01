@@ -295,7 +295,7 @@ class DecidedBeats(unittest.TestCase):
     def test_it_renders_among_the_beats_the_reviewer_said_yes_to(self):
         html = rr.render(
             {"repo": "r"}, [beat(n=1, state="decided", call="stays as is")], "", {})
-        self.assertIn("Accepted", html)
+        self.assertIn("<h2>Decided</h2>", html)
         self.assertIn("DECIDED", html)
         self.assertNotIn("Unplaced", html)
 
@@ -361,8 +361,8 @@ class ReportOrdering(unittest.TestCase):
             ]
         )
         order = [
-            html.index("Needs your call"),
-            html.index("Accepted"),
+            html.index("<h2>Decisions owed</h2>"),
+            html.index("<h2>Decided</h2>"),
             html.index("Read and clean"),
             html.index("Dropped"),
         ]
@@ -371,7 +371,7 @@ class ReportOrdering(unittest.TestCase):
     def test_empty_sections_are_omitted(self):
         html = self.render([beat(n=1, state="clean")])
         self.assertIn("Read and clean", html)
-        self.assertNotIn("Needs your call", html)
+        self.assertNotIn("<h2>Decisions owed</h2>", html)
         self.assertNotIn("Dropped", html)
 
     def test_flags_open_expanded_and_clean_beats_collapsed(self):
@@ -478,7 +478,7 @@ class TheWalk(unittest.TestCase):
         self.assertIn('data-n="3"', stage)
         self.assertNotIn('data-n="3"', ledger)
         self.assertIn('data-n="1"', ledger)
-        self.assertIn("item 3 of 4 · core", stage)
+        self.assertIn('<span class="hint">item 3 of 4</span>', stage)
         # the note comes first so Tab lands on the primary; Next beat closes the row
         row = stage.split('<div class="acts"')[1].split("</div>")[0]
         self.assertRegex(row, r'^[^>]*>\s*<input class="note"')
@@ -521,12 +521,12 @@ class TheWalk(unittest.TestCase):
     def test_the_ghost_of_the_next_planned_beat_is_hidden_until_between_beats(self):
         html = self.live(self.beats())
         self.assertIn('<div class="ghost" hidden>', html)
-        self.assertIn("item 4 of 4 · follow-through · d.ts:4", html)
+        self.assertIn("item 4 of 4 · d.ts:4", html)
 
     def test_before_the_first_beat_the_ghost_of_beat_one_shows(self):
         html = self.live([])
         self.assertIn('<div class="ghost">', html)
-        self.assertIn("item 1 of 4 · enabling · a.ts:1", html)
+        self.assertIn("item 1 of 4 · a.ts:1", html)
         self.assertIn("nothing read yet", html)
         self.assertIn('aria-label="waiting for item 1"', html)
 
@@ -594,10 +594,13 @@ class WalkCoverage(unittest.TestCase):
         self.assertIn("the migration", block)
         self.assertNotIn("the helper", block)
 
-    def test_the_risk_tier_is_marked_so_the_gap_reads_at_a_glance(self):
+    def test_only_the_risky_gap_is_marked_and_in_plain_words(self):
         html = self.final([beat(n=1, state="clean")])
-        self.assertIn('<span class="cov-tier is-risk">risk</span>', html)
-        self.assertIn('<span class="cov-tier">core</span>', html)
+        block = html.split('class="cov-left"')[1].split("</ul>")[0]
+        self.assertEqual(block.count('<span class="cov-care">read carefully</span>'), 1)
+        self.assertIn('the migration <span class="cov-care">read carefully</span>', block)
+        for tier in ("core", "enabling", "follow-through"):
+            self.assertNotIn(f">{tier}<", block)
 
     def test_a_finished_walk_says_so_and_lists_nothing(self):
         html = self.final([beat(n=n, state="clean") for n in (1, 2, 3, 4)])
@@ -636,7 +639,7 @@ class WalkCoverage(unittest.TestCase):
         html = rr.render(session, [beat(n=1, state="clean")], "", {})
         self.assertIn(
             "the lock order: 0109's revision trigger inverts it, "
-            "both performDelete paths are…</span>",
+            'both performDelete paths are… <span class="cov-care">read carefully</span></span>',
             html,
         )
         self.assertIn('real-Postgres lanes are the proof"><span class="cov-n">4', html)
@@ -1223,6 +1226,38 @@ class TheBeatCard(unittest.TestCase):
         failed = self.flag(state="accepted", delivery={"state": "failed", "kind": "review"})
         self.assertNotIn('class="outcome"', rr.render(review, [failed], "", {}))
         self.assertNotIn('class="outcome"', rr.render(review, [self.flag()], "", {}))
+
+
+class OneNamePerState(unittest.TestCase):
+    """Readers stopped on "needs your call" beside "decisions owed", and on ACCEPTED under a
+    button that said Include in review."""
+
+    def test_tiers_stay_off_the_item_line(self):
+        html = rr.render({"repo": "r"}, [beat(n=1, tier="risk", state="clean")], "", {})
+        self.assertNotIn("b-tier", html)
+        self.assertNotIn(">risk<", html.split('class="beat')[1].split("</summary>")[0])
+
+    def test_the_owed_count_has_one_name_everywhere(self):
+        flag = beat(n=1, state="flag", slots={"what": "w", "proof": "a:1", "risk": "r", "fix": "f"})
+        html = rr.render({"repo": "r"}, [flag], "", {})
+        self.assertIn("1 decision owed", html)
+        self.assertIn('<span class="k">decisions owed</span>', html)
+        self.assertIn("<h2>Decisions owed</h2>", html)
+        self.assertNotIn("needs your call", html.lower())
+
+    def test_an_accepted_finding_is_named_for_its_button(self):
+        accepted = beat(n=1, state="accepted", landed="https://x/pull/1#r1")
+        review = rr.render({"repo": "r", "audience": {"mode": "review"}}, [accepted], "", {})
+        self.assertIn('<span class="state">INCLUDED</span>', review)
+        self.assertNotIn("ACCEPTED", review)
+        self.assertIn('<span class="k">decided</span>', review)
+        branch = rr.render({"repo": "r"}, [dict(accepted, landed="abc123")], "", {})
+        self.assertIn('<span class="state">IMPLEMENTED</span>', branch)
+        live = rr.render({"repo": "r", "plan": [{"n": 1}, {"n": 2}]}, [dict(accepted, landed="abc123")],
+                         "", {}, live=True, phase="parked")
+        self.assertIn("· implemented", live)
+        pending = rr.render({"repo": "r"}, [dict(accepted, landed=None)], "", {})
+        self.assertIn('<span class="state">TO IMPLEMENT</span>', pending)
 
 
 class TheFrame(unittest.TestCase):
