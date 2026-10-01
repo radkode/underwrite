@@ -559,11 +559,11 @@ class TheWalk(unittest.TestCase):
 
     def test_a_resolved_beat_folds_to_its_line_with_the_call_while_walking(self):
         html = self.live(self.beats())
-        self.assertRegex(html, r'<details class="beat s-acc" data-n="2">')
+        self.assertRegex(html, r'<details class="beat s-acc" id="item-2" data-n="2">')
         self.assertIn('<span class="b-call">“leave it”</span>', html)
         # and stays open once the walk is done, as the final report has it
         self.assertRegex(self.live(self.beats(), phase="done"),
-                         r'<details class="beat s-acc" data-n="2" open>')
+                         r'<details class="beat s-acc" id="item-2" data-n="2" open>')
 
 
 class WalkCoverage(unittest.TestCase):
@@ -1093,6 +1093,47 @@ class ReviewRecommendation(unittest.TestCase):
         resolved = rr.body_html(self.session(), states, {}, live=True, phase="done")
         self.assertIn("0 decisions owed", resolved)
 
+    def test_the_summary_lists_each_open_question_and_the_next_step(self):
+        second = self.flag(n=2)
+        second["decision"] = dict(second["decision"], question="Keep or revert the cache change?")
+        page = rr.render(self.session(audience={"mode": "review"}),
+                         [self.flag(), second, beat(n=3)], "", {})
+        summary = page.split('class="assessment"')[1].split("</section>")[0]
+        self.assertIn('<a href="#item-1">Item 1</a>: Include the authorization finding', summary)
+        self.assertIn('<a href="#item-2">Item 2</a>: Keep or revert the cache change?', summary)
+        self.assertIn("Nothing reaches GitHub until you post the whole review at the end.", summary)
+        self.assertLess(summary.index('class="asks"'), summary.index("What this change is")
+                        if "What this change is" in summary else len(summary))
+        self.assertIn('id="item-2"', page)
+        legacy = self.flag()
+        legacy.pop("decision")
+        old = rr.render(self.session(audience={"mode": "review"}), [legacy], "", {})
+        self.assertIn('<a href="#item-1">Item 1</a>: Include in review or drop this finding?', old)
+
+    def test_a_finished_review_is_labelled_final_and_says_nothing_is_waiting(self):
+        done = rr.render(self.session(), [beat(n=1), beat(n=2)], "", {})
+        self.assertIn("<h2>Final recommendation</h2>", done)
+        self.assertIn("The review is complete. Nothing is waiting on you.", done)
+        owed = rr.render(self.session(), [self.flag(), beat(n=2)], "", {})
+        self.assertIn("<h2>Recommendation</h2>", owed)
+        self.assertNotIn("Nothing is waiting on you", owed)
+        partial = rr.render(self.session(), [beat(n=1)], "", {})
+        self.assertIn("<h2>Provisional recommendation</h2>", partial)
+        self.assertNotIn("Nothing is waiting on you", partial)
+        # every item read but the walk has not said done: not final yet
+        walking = rr.render(self.session(), [beat(n=1), beat(n=2)], "", {}, live=True, phase="parked")
+        self.assertIn("<h2>Recommendation</h2>", walking)
+        self.assertNotIn("Nothing is waiting on you", walking)
+        ended = rr.render(self.session(), [beat(n=1), beat(n=2)], "", {}, live=True, phase="done")
+        self.assertIn("<h2>Final recommendation</h2>", ended)
+
+    def test_a_blocked_session_does_not_promise_the_blocked_action(self):
+        page = rr.render(self.session(target={"kind": "github_pr", "repo": "a/b", "number": 1}),
+                         [self.flag()], "", {})
+        summary = page.split('class="assessment"')[1].split("</section>")[0]
+        self.assertIn("Implementing is blocked for this session", summary)
+        self.assertNotIn("Implement applies the stated fix", summary)
+
     def test_every_flag_names_the_decision_and_recommendation(self):
         policy = self.flag(n=2, resolution_kind="decision")
         policy["decision"] = {
@@ -1210,11 +1251,16 @@ class TheFrame(unittest.TestCase):
         self.assertIn('<h3>What this change is</h3><p class="change">closes the hole <code>S0</code> left</p>', html)
         self.assertIn("<dd>the body holds up</dd>", html)
 
-    def test_a_live_walk_folds_it_to_the_reviewers_answers(self):
+    def test_a_live_walk_folds_it_and_each_answer_sits_beside_its_question(self):
         html = rr.render(self.SESSION, [], "", {}, live=True, phase="parked")
-        summary = html.split('<details class="frame"><summary>')[1].split("</summary>")[0]
-        self.assertIn("<q>confirm</q>", summary)
-        self.assertIn("<q>Walk it in this order</q>", summary)
+        frame = html.split('<details class="frame">')[1].split("</details>")[0]
+        self.assertIn('<summary><span class="frame-k">How this review was framed</span></summary>', frame)
+        self.assertIn(
+            '<dt class="frame-q">Is the summary of this change right?</dt>'
+            "<dd>You answered <q>confirm</q></dd>", frame)
+        self.assertIn(
+            '<dt class="frame-q">In what order should the items be read?</dt>'
+            "<dd>You answered <q>Walk it in this order</q></dd>", frame)
 
     def test_prose_with_no_recorded_answer_is_still_labelled(self):
         html = rr.render({"repo": "r", "claim_check": "the body holds up"}, [], "", {})
@@ -1225,7 +1271,7 @@ class TheFrame(unittest.TestCase):
         self.assertLess(html.index("What this change is"), html.index('class="frame"'))
         frame = html.split('<details class="frame"')[1]
         self.assertNotIn("closes the hole", frame)
-        self.assertIn("Your answer on the summary", frame)
+        self.assertIn("Is the summary of this change right?", frame)
         self.assertNotIn("What this change is", rr.render({"repo": "r"}, [], "", {}))
 
     def test_the_reviewers_words_cannot_carry_markup(self):
