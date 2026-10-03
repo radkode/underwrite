@@ -926,6 +926,116 @@ class Requests(Served):
         self.assertEqual(self.get("/../../../etc/passwd")[0], 404)
 
 
+class ReviewerQuestions(Served):
+    def cli(self, *args, envelope=None):
+        return subprocess.run(
+            [sys.executable, str(SCRIPTS / "sessionctl.py"), *map(str, args)],
+            input=json.dumps(envelope) if envelope is not None else None,
+            capture_output=True, text=True,
+        )
+
+    def test_http_question_cli_answer_and_final_report_preserve_the_review(self):
+        self.session.act(1, "note", "Keep this observation.")
+        self.session.ack(1)
+        before = self.session.store.snapshot()
+        question = "Is this proven?"
+        answer = "No. The runtime behavior is not proven."
+        evidence = "Static inspection of a.py:1 only; no test was run."
+
+        status, body = self.post(
+            "/act", {"n": 1, "action": "question", "note": question}
+        )
+        self.assertEqual(status, 200, body)
+        produced = json.loads(body)
+        self.assertEqual(produced["state"], "produced")
+        self.assertIsNone(produced["result"])
+        self.assertEqual(self.session.status["text"], "answering your question")
+        self.assertEqual(json.loads(self.get("/await")[1]), produced)
+        pending = self.get("/fragment")[1]
+        self.assertIn(question, pending)
+        self.assertIn("1 decision owed", pending)
+        self.assertEqual(self.session.store.snapshot(), before)
+        self.assertEqual(self.post("/ack", {"seq": produced["seq"]})[0], 409)
+
+        result = {"kind": "question", "answer": answer, "evidence": evidence}
+        done = self.cli("apply", self.root, produced["seq"], envelope={"result": result})
+        self.assertEqual(done.returncode, 0, done.stderr)
+        receipt = json.loads(done.stdout)
+        self.assertEqual(receipt["result"], result)
+        self.assertEqual(receipt["note"], question)
+        self.assertEqual(json.loads(self.get("/await")[1])["result"], result)
+        self.assertEqual(self.open_session().wait(0)["result"], result)
+        self.assertEqual(self.post("/ack", {"seq": produced["seq"]})[0], 200)
+        self.assertEqual(self.session.store.snapshot(), before)
+        self.assertIsNone(self.session.store.head())
+
+        for route in ("/", "/fragment"):
+            page_status, page = self.get(route)
+            self.assertEqual(page_status, 200)
+            for text in (question, answer, evidence, "Keep this observation.", "1 decision owed"):
+                self.assertIn(text, page)
+        rendered = subprocess.run(
+            [sys.executable, str(SCRIPTS / "render-report.py"), str(self.root),
+             "--final", "--standalone"],
+            capture_output=True, text=True,
+        )
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        final_page = (self.root / "report.html").read_text(encoding="utf-8")
+        for text in (question, answer, evidence):
+            self.assertIn(text, final_page)
+            self.assertIn(text, rendered.stderr)
+        self.assertIn("1 decision owed", rendered.stderr)
+        self.assertNotIn("data-action=", final_page)
+
+    def test_retry_and_server_reopen_keep_one_unanswered_question(self):
+        payload = {"id": "retry-question", "n": 2, "action": "question", "note": "What proves this?"}
+
+        first = self.post("/act", payload)
+        second = self.post("/act", payload)
+
+        self.assertEqual(first, second)
+        self.assertEqual(first[0], 200)
+        record = json.loads(first[1])
+        self.assertEqual(self.open_session().wait(0)["action_id"], record["id"])
+        self.assertEqual(len(self.decisions()), 1)
+        _session, beats = self.session.store.presentation_snapshot()
+        self.assertEqual(beats[1]["questions"], [{
+            "seq": 1, "question": payload["note"], "state": "produced",
+            "answer": None, "evidence": None,
+        }])
+        self.assertEqual(
+            self.post("/act", {**payload, "note": "Another question"})[0], 409
+        )
+        self.assertEqual(self.beat(2)["state"], "clean")
+        self.assertNotIn("call", self.beat(2))
+
+    def test_empty_or_unanchored_questions_are_rejected(self):
+        for note, n in (("", 1), ("   ", 1), ("Why?", None), ("Why?", 99)):
+            with self.subTest(note=note, n=n):
+                status, body = self.post(
+                    "/act", {"n": n, "action": "question", "note": note}
+                )
+                self.assertEqual(status, 400, body)
+        self.assertEqual(self.session.seq, 0)
+
+    def test_cli_rejects_an_incomplete_answer_and_question_navigation(self):
+        self.post("/act", {"n": 1, "action": "question", "note": "Is this proven?"})
+        before = self.session.store.snapshot()
+        for envelope in (
+            {"result": {"kind": "question", "answer": "", "evidence": "a.py:1"}},
+            {"result": {"kind": "question", "answer": "Not proven.", "evidence": ""}},
+            {"result": {"kind": "question", "answer": "Not proven.", "evidence": "a.py:1"},
+             "session": before[0]},
+            {"result": {"kind": "question", "answer": "Not proven.", "evidence": "a.py:1"},
+             "beats": [before[1][0]]},
+        ):
+            with self.subTest(envelope=envelope):
+                done = self.cli("apply", self.root, 1, envelope=envelope)
+                self.assertEqual(done.returncode, 1, done.stderr)
+                self.assertEqual(self.session.store.head()["state"], "produced")
+                self.assertEqual(self.session.store.snapshot(), before)
+
+
 class ReviewRequests(Served):
     def session_document(self):
         return {
@@ -997,6 +1107,34 @@ class ReportRequests(Served):
         self.assertEqual(action_status, 409)
         self.assertIn("requires a shippable beat", body)
         self.assertEqual(self.beat(1)["state"], "flag")
+
+    def test_question_answer_preserves_an_accepted_no_exec_finding(self):
+        self.post("/act", {"n": 1, "action": "accept", "note": "include it"})
+        self.post("/ack", {"seq": 1})
+        before = self.session.store.snapshot()
+        policy = before[0]["execution_policy"]
+        self.assertEqual(policy["mode"], "no_exec")
+        status, body = self.post(
+            "/act", {"n": 1, "action": "question", "note": "Did a test prove this?"}
+        )
+        self.assertEqual(status, 200, body)
+        result = {
+            "kind": "question", "answer": "No runtime test was run.",
+            "evidence": "Static a.py:1 inspection only.",
+        }
+        done = subprocess.run(
+            [sys.executable, str(SCRIPTS / "sessionctl.py"), "apply", str(self.root), "2"],
+            input=json.dumps({"result": result}), capture_output=True, text=True,
+        )
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertEqual(self.post("/ack", {"seq": 2})[0], 200)
+        self.assertEqual(self.session.store.snapshot(), before)
+        self.assertEqual(self.session.store.snapshot()[0]["execution_policy"], policy)
+        page = self.get("/fragment")[1]
+        self.assertIn("Included in report", page)
+        self.assertIn("0 decisions owed", page)
+        self.assertIn(result["answer"], page)
+        self.assertIn(result["evidence"], page)
 
 
 class LegacyPrRequests(Served):

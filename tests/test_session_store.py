@@ -143,6 +143,311 @@ class RecommendationAndDecisions(StoreCase):
             self.assertNotIn("decision", beat)
 
 
+class QuestionActions(StoreCase):
+    RESULT = {
+        "kind": "question",
+        "answer": "There is not enough evidence to prove this yet.",
+        "evidence": "Static inspection of a.py:1; runtime behavior was not verified.",
+    }
+
+    def ask(self, action_id="question-1", n=1):
+        return self.store.produce(action_id, n, "question", "Is this proven?")
+
+    def questions(self, n=1):
+        return next(
+            beat["questions"]
+            for beat in self.store.presentation_snapshot()[1]
+            if beat["n"] == n
+        )
+
+    def test_question_and_answer_preserve_the_canonical_review(self):
+        note = self.store.produce("note-1", 1, "note", "Keep the reviewer call.")
+        self.store.ack(note["seq"])
+        before = self.store.snapshot()
+        delivery = self.store.reconcile()["pending_deliveries"]
+
+        asked = self.ask()
+        answered = self.store.apply(asked["seq"], self.RESULT)
+        self.store.ack(asked["seq"])
+        restored = session_store.SessionStore(self.root)
+
+        self.assertEqual(asked["state"], "produced")
+        self.assertIsNone(asked["result"])
+        self.assertEqual(answered["result"], self.RESULT)
+        self.assertEqual(restored.snapshot(), before)
+        self.assertEqual(restored.reconcile()["pending_deliveries"], delivery)
+        self.assertEqual(restored.presentation_snapshot()[1][0]["questions"], [{
+            "seq": asked["seq"], "question": "Is this proven?", "state": "acked",
+            "answer": self.RESULT["answer"], "evidence": self.RESULT["evidence"],
+        }])
+
+    def test_question_requires_words_and_an_existing_beat(self):
+        for n, note in ((1, ""), (1, " \n "), (None, "Why?"), (99, "Why?")):
+            with self.subTest(n=n, note=note):
+                revision = self.store.delivery_state()["render_revision"]
+                with self.assertRaises(session_store.StoreError):
+                    self.store.produce("invalid", n, "question", note)
+                self.assertIsNone(self.store.head())
+                self.assertEqual(self.store.delivery_state()["render_revision"], revision)
+
+    def test_pending_answered_and_abandoned_questions_invalidate_presentation(self):
+        revision = self.store.delivery_state()["render_revision"]
+        asked = self.ask()
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision + 1)
+        self.assertEqual(self.questions(), [{
+            "seq": asked["seq"], "question": "Is this proven?", "state": "produced",
+            "answer": None, "evidence": None,
+        }])
+        self.store.apply(asked["seq"], self.RESULT)
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision + 2)
+        self.store.ack(asked["seq"])
+        abandoned = self.ask("question-2", 2)
+        self.store.abandon_head(abandoned["seq"], "reviewer", "No longer needed.")
+        self.assertEqual(self.questions(2)[0]["state"], "abandoned")
+        self.assertIsNone(self.questions(2)[0]["answer"])
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision + 4)
+
+    def test_question_produce_and_answer_replay_without_new_writes(self):
+        asked = self.ask()
+        revision = self.store.delivery_state()["render_revision"]
+        self.assertEqual(self.ask(), asked)
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision)
+        with self.assertRaisesRegex(session_store.Conflict, "different action"):
+            self.store.produce("question-1", 1, "question", "A different question?")
+        answered = self.store.apply(asked["seq"], self.RESULT)
+        revision = self.store.delivery_state()["render_revision"]
+        self.assertEqual(self.store.apply(asked["seq"], self.RESULT), answered)
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision)
+        with self.assertRaisesRegex(session_store.Conflict, "different application"):
+            self.store.apply(asked["seq"], dict(self.RESULT, answer="It is proven."))
+        self.store.ack(asked["seq"])
+        self.assertEqual(self.ask()["result"], self.RESULT)
+        self.assertEqual(self.store.apply(asked["seq"], self.RESULT)["state"], "acked")
+
+    def test_questions_are_answered_and_acknowledged_in_fifo_order(self):
+        first = self.ask()
+        second = self.ask("question-2", 2)
+        with self.assertRaisesRegex(session_store.Conflict, "at the head"):
+            self.store.apply(second["seq"], self.RESULT)
+        with self.assertRaisesRegex(session_store.Conflict, "has not been applied"):
+            self.store.ack(first["seq"])
+        with self.assertRaisesRegex(session_store.Conflict, "must be applied"):
+            self.store.produce("note-1", 1, "note", "Reviewer note.")
+        self.store.apply(first["seq"], self.RESULT)
+        self.store.ack(first["seq"])
+        self.assertEqual(self.store.head()["seq"], second["seq"])
+        self.store.apply(second["seq"], self.RESULT)
+        self.store.ack(second["seq"])
+        self.assertIsNone(self.store.head())
+
+    def test_apply_and_reconciliation_enforce_the_same_answer_contract(self):
+        asked = self.ask()
+        invalid = [None, [], {}, {"kind": "question"}, dict(self.RESULT, extra="x")]
+        invalid.extend(
+            dict(self.RESULT, **{field: value})
+            for field in ("answer", "evidence")
+            for value in (None, "", " \n ", 1, True, [], {})
+        )
+        invalid.append(dict(self.RESULT, kind="beat"))
+        for operation in ("apply", "reconcile_action"):
+            method = getattr(self.store, operation)
+            options = {"evidence": "Observed question action."} if operation == "reconcile_action" else {}
+            for result in invalid:
+                with self.subTest(operation=operation, result=result):
+                    with self.assertRaisesRegex(session_store.StoreError, "question result"):
+                        method(asked["seq"], result, **options)
+                    self.assertEqual(self.store.head(), asked)
+            for payload in ({"session": self.store.snapshot()[0]}, {"beats": [FLAG]}):
+                with self.subTest(operation=operation, payload=payload):
+                    with self.assertRaisesRegex(session_store.StoreError, "cannot change"):
+                        method(asked["seq"], self.RESULT, **payload, **options)
+                    self.assertEqual(self.store.head(), asked)
+        with self.assertRaisesRegex(session_store.StoreError, "evidence must be"):
+            self.store.reconcile_action(asked["seq"], self.RESULT)
+
+    def test_question_reconciliation_is_a_stable_receipt(self):
+        asked = self.ask()
+        answered = self.store.reconcile_action(
+            asked["seq"], self.RESULT, evidence="Observed the persisted question."
+        )
+        self.assertEqual(answered["result"], self.RESULT)
+        self.assertEqual(self.store.apply(asked["seq"], self.RESULT), answered)
+        self.assertEqual(self.store.reconcile_action(
+            asked["seq"], self.RESULT, evidence="Observed the persisted answer."
+        ), answered)
+
+    def test_question_production_and_answer_faults_roll_back_receipt_and_revision(self):
+        before = self.store.snapshot()
+        revision = self.store.delivery_state()["render_revision"]
+        with mock.patch.object(self.store, "_bump_render", side_effect=OSError("disk")):
+            with self.assertRaises(OSError):
+                self.ask()
+        self.assertIsNone(self.store.head())
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision)
+        asked = self.ask()
+        revision = self.store.delivery_state()["render_revision"]
+        with mock.patch.object(self.store, "_bump_render", side_effect=OSError("disk")):
+            with self.assertRaises(OSError):
+                self.store.apply(asked["seq"], self.RESULT)
+        self.assertEqual(self.store.head(), asked)
+        self.assertEqual(self.store.snapshot(), before)
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision)
+
+    def test_question_does_not_change_an_accepted_delivery(self):
+        accepted = self.store.produce("accept-1", 1, "accept", "Implement it.")
+        self.store.land(accepted["seq"], 1, "abc1234", "commit", branch="jacek/fix")
+        self.store.ack(accepted["seq"])
+        before = self.store.snapshot()
+        delivery = self.store.presentation_snapshot()[1][0]["delivery"]
+        asked = self.ask()
+        self.store.apply(asked["seq"], self.RESULT)
+        self.assertEqual(self.store.snapshot(), before)
+        self.assertEqual(self.store.presentation_snapshot()[1][0]["delivery"], delivery)
+
+    def test_questions_are_projected_only_from_action_receipts(self):
+        spoof = [{"question": "Spoofed?", "answer": "Yes."}]
+        written = self.store.put_beat(dict(FLAG, questions=spoof))
+        self.assertNotIn("questions", written)
+        self.assertEqual(self.questions(), [])
+        with self.store._write() as db:
+            db.execute("UPDATE beats SET body_json = ? WHERE n = 1", (json.dumps(dict(FLAG, questions=spoof)),))
+        self.assertEqual(self.questions(), [])
+        asked = self.ask()
+        self.assertEqual(self.questions()[0]["seq"], asked["seq"])
+
+    def test_export_import_preserves_pending_and_answered_question_receipts(self):
+        answered = self.ask()
+        self.store.apply(answered["seq"], self.RESULT)
+        self.store.ack(answered["seq"])
+        pending = self.ask("question-2", 2)
+        before = self.store.presentation_snapshot()[1]
+        self.store.export_json()
+        (self.root / "session.sqlite3").unlink()
+        restored = session_store.SessionStore(self.root)
+        self.assertEqual(restored.head(), pending)
+        self.assertEqual(restored.presentation_snapshot()[1], before)
+        self.assertEqual(restored.apply(answered["seq"], self.RESULT)["state"], "acked")
+
+    def test_export_import_keeps_an_applied_answer_unacknowledged(self):
+        asked = self.ask()
+        answered = self.store.apply(asked["seq"], self.RESULT)
+        self.store.export_json()
+        (self.root / "session.sqlite3").unlink()
+        restored = session_store.SessionStore(self.root)
+        self.assertEqual(restored.head(), answered)
+        restored.ack(asked["seq"])
+        self.assertIsNone(restored.head())
+
+    def test_export_import_keeps_abandoned_questions_unanswered(self):
+        asked = self.ask()
+        self.store.abandon_head(asked["seq"], "reviewer", "No longer needed.")
+        self.store.export_json()
+        (self.root / "session.sqlite3").unlink()
+        restored = session_store.SessionStore(self.root)
+        question = restored.presentation_snapshot()[1][0]["questions"][0]
+        self.assertEqual(question["state"], "abandoned")
+        self.assertIsNone(question["answer"])
+        self.assertIsNone(restored.head())
+        self.assertEqual(restored.abandon_head(
+            asked["seq"], "reviewer", "No longer needed."
+        )["state"], "abandoned")
+
+    def test_import_rejects_a_handled_question_without_an_answer(self):
+        asked = self.ask()
+        self.store.export_json()
+        (self.root / "session.sqlite3").unlink()
+        (self.root / "ack.json").write_text(json.dumps({"version": 1, "handled_seq": asked["seq"]}), encoding="utf-8")
+        with self.assertRaisesRegex(session_store.MigrationError, "handled sequence"):
+            session_store.SessionStore(self.root)
+
+
+class QuestionMigration(StoreCase):
+    @staticmethod
+    def downgrade(store):
+        db = sqlite3.connect(str(store.path), isolation_level=None)
+        try:
+            db.execute("PRAGMA foreign_keys = OFF")
+            db.execute("BEGIN IMMEDIATE")
+            db.execute(store._actions_schema("legacy_actions").replace(", 'question'", ""))
+            db.execute("INSERT INTO legacy_actions SELECT * FROM actions")
+            db.execute("DROP TABLE actions")
+            db.execute("ALTER TABLE legacy_actions RENAME TO actions")
+            db.execute("PRAGMA user_version = 6")
+            db.execute("COMMIT")
+        finally:
+            db.close()
+
+    def database_state(self):
+        db = sqlite3.connect(str(self.store.path))
+        try:
+            return (
+                db.execute("PRAGMA user_version").fetchone()[0],
+                db.execute("SELECT sql FROM sqlite_master WHERE name = 'actions'").fetchone()[0],
+                db.execute("SELECT * FROM actions ORDER BY seq").fetchall(),
+            )
+        finally:
+            db.close()
+
+    def test_v6_migration_preserves_actions_canonical_state_and_replay(self):
+        noted = self.store.produce("note-1", 1, "note", "Reviewer words.")
+        self.store.ack(noted["seq"])
+        abandoned = self.store.produce("nav-1", None, "next", "")
+        self.store.abandon_head(abandoned["seq"], "reviewer", "Skip this navigation.")
+        pending = self.store.produce("nav-2", None, "back", "")
+        before = self.store.snapshot()
+        self.downgrade(self.store)
+        actions = self.database_state()[2]
+
+        self.store = session_store.SessionStore(self.root)
+
+        self.assertEqual(self.database_state()[0], 7)
+        self.assertEqual(self.database_state()[2], actions)
+        self.assertEqual(self.store.snapshot(), before)
+        self.assertEqual(self.store.head(), pending)
+        self.assertEqual(self.store.produce("note-1", 1, "note", "Reviewer words.")["state"], "acked")
+        self.store.abandon_head(pending["seq"], "reviewer", "Done with navigation.")
+        asked = self.store.produce("question-1", 1, "question", "Is this proven?")
+        self.assertEqual(self.store.apply(asked["seq"], QuestionActions.RESULT)["state"], "applied")
+        db = self.store._connect()
+        try:
+            self.assertEqual(db.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+            self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+        finally:
+            db.close()
+
+    def test_v6_migration_failure_rolls_back_and_reopen_retries(self):
+        self.store.produce("note-1", 1, "note", "Reviewer words.")
+        self.downgrade(self.store)
+        before = self.database_state()
+        upgrade = session_store.SessionStore._upgrade_actions
+
+        def fail(store, db):
+            upgrade(store, db)
+            raise OSError("Migration interrupted.")
+
+        with mock.patch.object(session_store.SessionStore, "_upgrade_actions", fail):
+            with self.assertRaisesRegex(OSError, "Migration interrupted"):
+                session_store.SessionStore(self.root)
+        self.assertEqual(self.database_state(), before)
+        restored = session_store.SessionStore(self.root)
+        self.assertEqual(restored.head()["note"], "Reviewer words.")
+        self.assertEqual(self.database_state()[0], 7)
+
+    def test_v6_migration_rejects_orphaned_references_without_advancing_version(self):
+        self.downgrade(self.store)
+        db = sqlite3.connect(str(self.store.path))
+        try:
+            db.execute("CREATE TABLE bad_reference (seq INTEGER REFERENCES actions(seq))")
+            db.execute("INSERT INTO bad_reference VALUES (999)")
+            db.commit()
+        finally:
+            db.close()
+        before = self.database_state()
+        with self.assertRaisesRegex(session_store.StoreError, "violates foreign keys"):
+            session_store.SessionStore(self.root)
+        self.assertEqual(self.database_state(), before)
+
+
 class FrozenTargets(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
@@ -301,6 +606,20 @@ class FrozenTargets(unittest.TestCase):
                 **SESSION,
                 "audience": {"mode": "report", "why": "bypass delivery"},
             })
+
+    def test_question_does_not_change_an_accepted_report_finding(self):
+        diff, metadata = self.inputs()
+        self.store.freeze_target(
+            dict(self.target(), state="closed"), diff, metadata, self.context_input()
+        )
+        self.store.put_beat(FLAG)
+        accepted = self.store.produce("accept-1", 1, "accept", "Include it.")
+        self.store.ack(accepted["seq"])
+        before = self.store.snapshot()
+        asked = self.store.produce("question-1", 1, "question", "Is this proven?")
+        self.store.apply(asked["seq"], QuestionActions.RESULT)
+        self.store.ack(asked["seq"])
+        self.assertEqual(self.store.snapshot(), before)
 
     def test_review_audience_requires_a_frozen_or_legacy_pr(self):
         with self.assertRaisesRegex(
@@ -1712,7 +2031,7 @@ class CreatingAndMigrating(StoreCase):
 
     def test_the_database_and_export_format_are_versioned(self):
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 7)
             self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "delete")
         db = self.store._connect()
         try:
@@ -1732,7 +2051,7 @@ class CreatingAndMigrating(StoreCase):
 
         self.assertNotIn("execution_policy", upgraded.snapshot()[0])
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 7)
 
     def test_the_session_identity_survives_restart_but_not_recreation(self):
         first = self.store.delivery_state()["session_id"]
@@ -1757,7 +2076,7 @@ class CreatingAndMigrating(StoreCase):
         self.assertEqual(upgraded.head()["action_id"], action["action_id"])
         self.assertTrue(upgraded.delivery_state()["session_id"])
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 7)
             columns = {row[1] for row in db.execute("PRAGMA table_info(session)")}
         self.assertIn("session_id", columns)
 
@@ -1779,7 +2098,7 @@ class CreatingAndMigrating(StoreCase):
         failed = upgraded.presentation_snapshot()[1][0]["delivery"]
         self.assertEqual(failed["owed"], "retry with the fixture")
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 7)
 
     def test_a_v2_upgrade_strips_a_failure_injected_fix_written_in_upper_case(self):
         """The restore reads the six lowercase keys, so the slot repair has to run before
@@ -1943,7 +2262,7 @@ class CreatingAndMigrating(StoreCase):
 
         self.assertEqual({path: path.stat().st_mtime_ns for path in derived}, before)
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 7)
 
     def test_a_current_session_opens_in_a_directory_it_cannot_write(self):
         """Reading a published review out of a directory someone locked down."""
@@ -2068,13 +2387,13 @@ class CreatingAndMigrating(StoreCase):
         (self.root / "session.sqlite3").unlink()
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
             self.assertEqual(db.execute("PRAGMA journal_mode = WAL").fetchone()[0], "wal")
-            db.execute("PRAGMA user_version = 7")
+            db.execute("PRAGMA user_version = 8")
 
         with self.assertRaisesRegex(session_store.StoreError, "newer than supported"):
             session_store.SessionStore(self.root)
 
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 7)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 8)
             self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
 
     def test_legacy_actions_without_an_ack_migrate_as_handled(self):
@@ -3648,9 +3967,52 @@ class LinkedImplementations(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
             }
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 6)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 7)
         self.assertIn("implementation_links", names)
         self.assertIn("implementation_attempts", names)
+
+    def test_v6_question_migration_preserves_implementation_links_and_attempts(self):
+        child, link, _created = self.create_child()
+        attempt = child.reserve_implementation_attempt(1, self.profile())
+        before_source = self.source.snapshot()
+        before_child = child.snapshot()
+        before_link = self.source.implementation_link(link["link_id"])
+        QuestionMigration.downgrade(self.source)
+        QuestionMigration.downgrade(child)
+
+        source = session_store.SessionStore(self.source_root)
+        restored_child = session_store.SessionStore(child.root)
+
+        self.assertEqual(source.snapshot(), before_source)
+        self.assertEqual(restored_child.snapshot(), before_child)
+        self.assertEqual(source.implementation_link(link["link_id"]), before_link)
+        self.assertEqual(restored_child.implementation_attempt(1), attempt)
+        for store in (source, restored_child):
+            db = store._connect()
+            try:
+                self.assertEqual(db.execute("PRAGMA foreign_key_check").fetchall(), [])
+                self.assertEqual(db.execute("PRAGMA foreign_keys").fetchone()[0], 1)
+                tables = {
+                    row["table"]
+                    for name in ("implementation_links", "implementation_attempts")
+                    for row in db.execute(f"PRAGMA foreign_key_list({name})")
+                }
+                self.assertIn("actions", tables)
+                self.assertNotIn("legacy_actions", tables)
+            finally:
+                db.close()
+
+    def test_question_answer_leaves_the_authorized_finding_pinned(self):
+        link = self.authorize()
+        before = self.source.snapshot()
+        asked = self.source.produce("question-1", 1, "question", "Is this proven?")
+        self.source.apply(asked["seq"], QuestionActions.RESULT)
+        self.source.ack(asked["seq"])
+        self.assertEqual(self.source.snapshot(), before)
+        self.assertEqual(self.source.authorize_implementation(
+            self.source_action, 1, "reviewer", "implement this finding"
+        )["link_id"], link["link_id"])
+        self.assertTrue(self.source.create_linked_implementation(link["link_id"]))
 
     def test_linked_json_export_cannot_be_reimported_without_attempt_authority(self):
         child, _link, _created = self.create_child()
