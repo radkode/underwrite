@@ -17,7 +17,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 
-DB_SCHEMA_VERSION = 6
+DB_SCHEMA_VERSION = 7
 SCHEMA_VERSION = 1
 DELIVERY_VERSION = 1
 FINDINGS_FILE = "findings.md"
@@ -36,7 +36,7 @@ BLOCKED_REPLACEMENT_DELIVERY_SUFFIX = (
 MAX_OBJECT_BUNDLE_MEMORY_BYTES = 64 * 1024 * 1024
 MAX_IMPLEMENTATION_PROFILE_BYTES = 256 * 1024
 MAX_IMPLEMENTATION_REQUEST_BYTES = 384 * 1024
-ACTIONS = ("accept", "drop", "decide", "note", "next", "back", "skip")
+ACTIONS = ("accept", "drop", "decide", "note", "question", "next", "back", "skip")
 NAVIGATION = ("next", "back", "skip")
 RESOLVE = {"accept": "accepted", "drop": "dropped", "decide": "decided"}
 RESOLVABLE = {"accept": ("flag",), "drop": ("flag",), "decide": ("flag", "accepted")}
@@ -657,29 +657,7 @@ class SessionStore:
                     CHECK (delivery_state IN ('none', 'pending', 'failed', 'landed')),
                 delivery_json TEXT
             )""",
-            """CREATE TABLE actions (
-                seq INTEGER PRIMARY KEY CHECK (seq > 0),
-                action_id TEXT NOT NULL UNIQUE,
-                beat_n INTEGER REFERENCES beats(n),
-                kind TEXT NOT NULL
-                    CHECK (kind IN ('accept', 'drop', 'decide', 'note', 'next', 'back', 'skip')),
-                note TEXT NOT NULL DEFAULT '',
-                state TEXT NOT NULL
-                    CHECK (state IN ('produced', 'applied', 'acked', 'abandoned')),
-                result_json TEXT,
-                evidence TEXT NOT NULL DEFAULT '',
-                produced_at TEXT NOT NULL,
-                applied_at TEXT,
-                acked_at TEXT,
-                abandoned_at TEXT,
-                abandoned_by TEXT,
-                abandoned_reason TEXT,
-                CHECK (
-                    (state = 'produced' AND result_json IS NULL) OR
-                    (state IN ('applied', 'acked') AND result_json IS NOT NULL) OR
-                    state = 'abandoned'
-                )
-            )""",
+            self._actions_schema("actions"),
             """CREATE TABLE implementation_links (
                 link_id TEXT PRIMARY KEY,
                 source_action_seq INTEGER NOT NULL UNIQUE REFERENCES actions(seq),
@@ -724,6 +702,39 @@ class SessionStore:
             db.execute(statement)
         db.execute(f"PRAGMA user_version = {DB_SCHEMA_VERSION}")
 
+    def _actions_schema(self, name):
+        return f"""CREATE TABLE {name} (
+            seq INTEGER PRIMARY KEY CHECK (seq > 0),
+            action_id TEXT NOT NULL UNIQUE,
+            beat_n INTEGER REFERENCES beats(n),
+            kind TEXT NOT NULL
+                CHECK (kind IN ('accept', 'drop', 'decide', 'note', 'question', 'next', 'back', 'skip')),
+            note TEXT NOT NULL DEFAULT '',
+            state TEXT NOT NULL
+                CHECK (state IN ('produced', 'applied', 'acked', 'abandoned')),
+            result_json TEXT,
+            evidence TEXT NOT NULL DEFAULT '',
+            produced_at TEXT NOT NULL,
+            applied_at TEXT,
+            acked_at TEXT,
+            abandoned_at TEXT,
+            abandoned_by TEXT,
+            abandoned_reason TEXT,
+            CHECK (
+                (state = 'produced' AND result_json IS NULL) OR
+                (state IN ('applied', 'acked') AND result_json IS NOT NULL) OR
+                state = 'abandoned'
+            )
+        )"""
+
+    def _upgrade_actions(self, db):
+        db.execute(self._actions_schema("question_actions"))
+        db.execute("INSERT INTO question_actions SELECT * FROM actions")
+        db.execute("DROP TABLE actions")
+        db.execute("ALTER TABLE question_actions RENAME TO actions")
+        if db.execute("PRAGMA foreign_key_check").fetchone() is not None:
+            raise StoreError("action migration violates foreign keys")
+
     def _upgrade_schema(self):
         db = self._connect()
         try:
@@ -732,6 +743,7 @@ class SessionStore:
                 return
             if version not in range(1, DB_SCHEMA_VERSION):
                 raise StoreError(f"unsupported session database version {version}")
+            db.execute("PRAGMA foreign_keys = OFF")
             db.execute("BEGIN IMMEDIATE")
             # Nothing between here and the gate below writes a row but the repairs.
             before = db.total_changes
@@ -773,6 +785,7 @@ class SessionStore:
                 # Derived from rows a repair just rewrote, and before the commit, so a
                 # failed write takes the repair with it and the next open retries both.
                 self._export_locked(db)
+            self._upgrade_actions(db)
             db.execute(f"PRAGMA user_version = {DB_SCHEMA_VERSION}")
             db.execute("COMMIT")
         except Exception:
@@ -780,6 +793,7 @@ class SessionStore:
                 db.execute("ROLLBACK")
             raise
         finally:
+            db.execute("PRAGMA foreign_keys = ON")
             db.close()
 
     def _create_implementation_tables(self, db):
@@ -1228,7 +1242,29 @@ class SessionStore:
             if not isinstance(note, str):
                 raise MigrationError("legacy action note must be text")
             state, application = "produced", None
-            if seq <= handled:
+            abandoned = {}
+            if kind == "question":
+                if n not in by_n or not note.strip():
+                    raise MigrationError("question requires an existing beat and non-empty note")
+                state = record.get("state", "produced")
+                if state not in ("produced", "applied", "acked", "abandoned"):
+                    raise MigrationError("question has an unsupported action state")
+                result = record.get("result")
+                if state in ("applied", "acked"):
+                    self._question_result(result, None, ())
+                    application = self._application(result, None, ())
+                elif result is not None:
+                    raise MigrationError("unanswered question cannot carry a result")
+                if state == "abandoned":
+                    abandoned = {
+                        field: record.get(field)
+                        for field in ("abandoned_at", "abandoned_by", "abandoned_reason")
+                    }
+                    if any(not isinstance(value, str) or not value.strip() for value in abandoned.values()):
+                        raise MigrationError("abandoned question requires its recovery record")
+                if (seq <= handled) != (state in ("acked", "abandoned")):
+                    raise MigrationError("question state does not match the handled sequence")
+            elif seq <= handled:
                 state = "acked"
                 application = self._application(
                     {"kind": "legacy", "handled": True}, None, ()
@@ -1250,6 +1286,7 @@ class SessionStore:
                 "produced_at": timestamp,
                 "applied_at": timestamp if state in ("applied", "acked") else None,
                 "acked_at": timestamp if state == "acked" else None,
+                **abandoned,
             })
         return session, beats, actions
 
@@ -1618,6 +1655,7 @@ class SessionStore:
         if not isinstance(document, dict):
             raise StoreError("beat must be an object")
         beat = _copy(document)
+        beat.pop("questions", None)
         _positive(beat.get("n"), "beat n")
         problems = decision_problems(beat)
         if problems:
@@ -3540,6 +3578,19 @@ class SessionStore:
             session_row = self._session_row(db)
             session = json.loads(session_row["body_json"])
             session["schema_version"] = session_row["format_version"]
+            questions = {}
+            for row in db.execute(
+                "SELECT * FROM actions WHERE kind = 'question' ORDER BY seq"
+            ):
+                action = self._action(row)
+                result = action["result"] or {}
+                questions.setdefault(row["beat_n"], []).append({
+                    "seq": row["seq"],
+                    "question": row["note"],
+                    "state": row["state"],
+                    "answer": result.get("answer"),
+                    "evidence": result.get("evidence"),
+                })
             beats = []
             for row in db.execute("SELECT * FROM beats ORDER BY n"):
                 beat = json.loads(row["body_json"])
@@ -3554,7 +3605,31 @@ class SessionStore:
                 )
                 delivery["state"] = row["delivery_state"]
                 beat["delivery"] = delivery
+                beat["questions"] = questions.get(row["n"], [])
                 beats.append(beat)
+        return session, beats
+
+    @classmethod
+    def legacy_presentation_snapshot(cls, root):
+        """Project exported question receipts without creating database authority."""
+        reader = cls.__new__(cls)
+        reader.root = Path(root).expanduser()
+        session, beats, actions = reader._legacy_data(None)
+        questions = {}
+        for action in actions:
+            if action["kind"] != "question":
+                continue
+            application = action["application"]
+            result = application["result"] if application is not None else {}
+            questions.setdefault(action["beat_n"], []).append({
+                "seq": action["seq"],
+                "question": action["note"],
+                "state": action["state"],
+                "answer": result.get("answer"),
+                "evidence": result.get("evidence"),
+            })
+        for beat in beats:
+            beat["questions"] = questions.get(beat["n"], [])
         return session, beats
 
     # ---- action queue -------------------------------------------------
@@ -3580,11 +3655,15 @@ class SessionStore:
         produced_at=None,
         applied_at=None,
         acked_at=None,
+        abandoned_at=None,
+        abandoned_by=None,
+        abandoned_reason=None,
     ):
         db.execute(
             "INSERT INTO actions "
             "(seq, action_id, beat_n, kind, note, state, result_json, evidence, "
-            "produced_at, applied_at, acked_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "produced_at, applied_at, acked_at, abandoned_at, abandoned_by, "
+            "abandoned_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             (
                 seq,
                 action_id,
@@ -3597,6 +3676,9 @@ class SessionStore:
                 produced_at or _now(),
                 applied_at,
                 acked_at,
+                abandoned_at,
+                abandoned_by,
+                abandoned_reason,
             ),
         )
 
@@ -3686,14 +3768,18 @@ class SessionStore:
                     raise Conflict(
                         "branch implementation is disabled for untrusted PR snapshots"
                     )
-            if kind == "decide" and not note:
-                raise StoreError("decide requires a non-empty note")
+            if kind in ("decide", "question") and not note:
+                raise StoreError(f"{kind} requires a non-empty note")
 
             seq = db.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM actions").fetchone()[0]
-            if kind in NAVIGATION:
+            if kind in NAVIGATION or kind == "question":
+                if kind == "question":
+                    self._beat_row(db, n)
                 self._insert_action(
                     db, seq, action_id, n, kind, note, "produced", None
                 )
+                if kind == "question":
+                    self._bump_render(db)
             else:
                 head = self._head_row(db)
                 if head is not None and head["state"] == "produced":
@@ -3859,12 +3945,47 @@ class SessionStore:
             )
         return current == application
 
+    def _question_result(self, result, session, beats):
+        if session is not None or beats:
+            raise StoreError("question answer cannot change the session or beats")
+        if (
+            not isinstance(result, dict)
+            or set(result) != {"kind", "answer", "evidence"}
+            or result["kind"] != "question"
+            or any(
+                not isinstance(result[field], str) or not result[field].strip()
+                for field in ("answer", "evidence")
+            )
+        ):
+            raise StoreError("question result requires kind, non-empty answer and evidence")
+
+    def _apply_question(self, db, row, result, session, beats, evidence=""):
+        self._question_result(result, session, beats)
+        application = self._application(result, None, ())
+        seq = row["seq"]
+        if row["state"] in ("applied", "acked"):
+            if not self._same_application(row, application):
+                raise Conflict(f"action {seq} already has a different application")
+            return self._action(row)
+        if row["state"] == "abandoned":
+            raise Conflict(f"action {seq} was abandoned")
+        self._require_head(db, seq)
+        db.execute(
+            "UPDATE actions SET state = 'applied', result_json = ?, evidence = ?, "
+            "applied_at = ? WHERE seq = ?",
+            (_dump(application), evidence, _now(), seq),
+        )
+        self._bump_render(db)
+        return self._action(self._action_row(db, seq))
+
     def apply(self, seq, result, session=None, beats=()):
         _positive(seq, "seq")
         with self._write() as db:
             row = db.execute("SELECT * FROM actions WHERE seq = ?", (seq,)).fetchone()
             if row is None:
                 raise StoreError(f"no action {seq}")
+            if row["kind"] == "question":
+                return self._apply_question(db, row, result, session, beats)
             if row["state"] in ("applied", "acked"):
                 stored = json.loads(row["result_json"])
                 application, _normalized_session, _normalized_beats = (
@@ -4211,6 +4332,10 @@ class SessionStore:
             raise StoreError("evidence must be non-empty text")
         with self._write() as db:
             row = self._action_row(db, seq)
+            if row["kind"] == "question":
+                return self._apply_question(
+                    db, row, result, session, beats, evidence.strip()
+                )
             if row["state"] in ("applied", "acked"):
                 stored = json.loads(row["result_json"])
                 application, _normalized_session, _normalized_beats = (
@@ -4277,6 +4402,8 @@ class SessionStore:
                 "abandoned_by = ?, abandoned_reason = ? WHERE seq = ?",
                 (_now(), actor, reason, seq),
             )
+            if row["kind"] == "question":
+                self._bump_render(db)
             updated = db.execute("SELECT * FROM actions WHERE seq = ?", (seq,)).fetchone()
             return self._action(updated)
 
@@ -4320,6 +4447,15 @@ class SessionStore:
                     "action": row["kind"],
                     "note": row["note"],
                     "delivery_version": DELIVERY_VERSION,
+                    **({
+                        "state": row["state"],
+                        "result": self._action(row)["result"],
+                        **({
+                            "abandoned_at": row["abandoned_at"],
+                            "abandoned_by": row["abandoned_by"],
+                            "abandoned_reason": row["abandoned_reason"],
+                        } if row["state"] == "abandoned" else {}),
+                    } if row["kind"] == "question" else {}),
                 },
                 ensure_ascii=False,
                 separators=(",", ":"),

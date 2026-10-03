@@ -818,7 +818,8 @@ class DelegatedActionControls(unittest.TestCase):
             html,
         )
         self.assertIn('placeholder="record the decision in your own words"', html)
-        self.assertIn("fresh.action === 'decide' && !fresh.note", html)
+        self.assertIn("['decide', 'question'].includes(button.dataset.action)", html)
+        self.assertIn("!(note && note.value.trim())", html)
         self.assertIn("enter the decision first", html)
         self.assertNotIn('data-action="accept"', html)
 
@@ -1191,6 +1192,65 @@ class ReviewRecommendation(unittest.TestCase):
         for tag in ("<img", "<script>", "<svg"):
             self.assertNotIn(tag, page)
         self.assertIn("&lt;img", page)
+
+
+class QuestionRendering(unittest.TestCase):
+    def question(self, **changes):
+        item = {
+            "seq": 1, "question": "Is this proven?", "state": "produced",
+            "answer": None, "evidence": None,
+        }
+        item.update(changes)
+        return item
+
+    def test_pending_question_is_distinct_from_the_reviewers_call(self):
+        page = rr.beat_html(beat(questions=[self.question()]), [], True)
+        self.assertIn("Your question", page)
+        self.assertIn("Is this proven?", page)
+        self.assertIn("Awaiting an answer", page)
+        self.assertNotIn("Your call", page)
+
+    def test_answer_names_the_evidence_limit_and_keeps_question_order(self):
+        questions = [
+            self.question(state="acked", answer="Not proven at runtime.",
+                          evidence="Static inspection only: a.ts:1."),
+            self.question(seq=2, question="What remains unchecked?"),
+        ]
+        page = rr.beat_html(beat(questions=questions), [], True)
+        self.assertLess(page.index("Is this proven?"), page.index("What remains unchecked?"))
+        self.assertIn("Not proven at runtime.", page)
+        self.assertIn("Evidence and limits", page)
+        self.assertIn("Static inspection only: a.ts:1.", page)
+
+    def test_question_answer_and_evidence_are_escaped(self):
+        value = '<script>alert("x")</script>'
+        item = self.question(state="applied", question=value, answer=value, evidence=value)
+        page = rr.beat_html(beat(questions=[item]), [], True)
+        self.assertNotIn("<script>", page)
+        self.assertEqual(page.count("&lt;script&gt;"), 3)
+
+    def test_abandoned_question_does_not_look_answered_or_pending(self):
+        page = rr.beat_html(beat(questions=[self.question(state="abandoned")]), [], True)
+        self.assertIn("Question closed without an answer", page)
+        self.assertNotIn("Awaiting an answer", page)
+
+    def test_question_history_does_not_change_decisions_owed(self):
+        session = {"recommendation": "Check the outstanding finding.", "plan": [{"n": 1}]}
+        item = beat(state="flag", questions=[self.question(state="acked", answer="No.", evidence="Not verified.")])
+        self.assertEqual(rr.assessment(session, [item], {})[3], 1)
+
+    def test_asking_is_available_on_every_existing_state(self):
+        for state in ("clean", "unverified", "flag", "accepted", "decided", "dropped"):
+            with self.subTest(state=state):
+                page = rr.beat_html(beat(state=state), [], True, live=True)
+                self.assertIn('data-action="question">Ask question</button>', page)
+                self.assertIn('data-action="note">Save note</button>', page)
+                self.assertNotIn('data-action="question"', rr.beat_html(beat(state=state), [], True))
+
+    def test_old_notes_are_not_reclassified(self):
+        page = rr.beat_html(beat(call="Is this proven?"), [], True)
+        self.assertIn("Your call", page)
+        self.assertNotIn("Your question", page)
 
 
 class TheBeatCard(unittest.TestCase):
@@ -2177,6 +2237,150 @@ class RenderCli(unittest.TestCase):
 
         self.assertEqual(done.returncode, 0)
         self.assertIn("authoritative", self.page())
+
+    def question_export(self, mode):
+        if mode == "review":
+            store = self.frozen_store(state="open")
+        else:
+            self.session({"repo": "acme/widget", "audience": {"mode": "branch"}})
+            store = rr.SessionStore(self.root)
+        store.put_beat(beat())
+        note = store.produce("call", 1, "note", "Keep the current policy.")
+        store.ack(note["seq"])
+        answered = store.produce("answered", 1, "question", "What is proven?")
+        store.apply(answered["seq"], {
+            "kind": "question", "answer": "The source check is proven.",
+            "evidence": "a.ts:1, runtime remains unchecked.",
+        })
+        store.ack(answered["seq"])
+        closed = store.produce("closed", 1, "question", "Can this be rechecked?")
+        store.abandon_head(closed["seq"], "reviewer", "Withdrawn by the reviewer.")
+        applied = store.produce("applied", 1, "question", "Was runtime tested?")
+        store.apply(applied["seq"], {
+            "kind": "question", "answer": "Runtime was not tested.",
+            "evidence": "No-exec forbids running the PR code." if mode == "review"
+                        else "Only source was inspected.",
+        })
+        store.produce("pending", 1, "question", "What should happen next?")
+        original_session, original_beats = store.snapshot()
+        store.export_json()
+        (self.root / "session.sqlite3").unlink()
+        return original_session, original_beats
+
+    def assert_question_export_renders(self, mode):
+        original_session, original_beats = self.question_export(mode)
+        done = self.run_cli("--final")
+        self.assertEqual(done.returncode, 0, done.stderr)
+        page = self.page()
+        questions = [
+            "What is proven?", "Can this be rechecked?",
+            "Was runtime tested?", "What should happen next?",
+        ]
+        positions = [page.index(question) for question in questions]
+        self.assertEqual(positions, sorted(positions))
+        for question in questions:
+            self.assertIn(question, done.stderr)
+        for text in (
+            "The source check is proven.", "a.ts:1, runtime remains unchecked.",
+            "Runtime was not tested.", "Question closed without an answer",
+            "Awaiting an answer", "Keep the current policy.",
+        ):
+            self.assertIn(text, page)
+        self.assertNotIn('data-action="question"', page)
+        session, beats, _css, _by_n, _problems = rr.load(self.root, rr.default_css(), final=True)
+        self.assertEqual(session, original_session)
+        self.assertEqual(
+            [{key: value for key, value in item.items() if key != "questions"} for item in beats],
+            original_beats,
+        )
+        self.assertEqual(
+            [question["state"] for question in beats[0]["questions"]],
+            ["acked", "abandoned", "applied", "produced"],
+        )
+        self.assertFalse(rr.stored(self.root))
+        self.assertNotIn('href="https://github.com/acme/widget/', page)
+        if mode == "review":
+            self.assertEqual(session["execution_policy"]["mode"], "no_exec")
+            self.assertIn("No-exec forbids running the PR code.", page)
+
+    def test_json_only_branch_exports_render_question_receipts(self):
+        self.assert_question_export_renders("branch")
+
+    def test_json_only_review_exports_render_question_receipts(self):
+        self.assert_question_export_renders("review")
+
+    def test_json_only_question_exports_use_the_store_result_validation(self):
+        self.question_export("branch")
+        path = self.root / "decisions.jsonl"
+        records = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+        records[1]["result"]["call"] = "This must not become the reviewer call."
+        path.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+
+        done = self.run_cli("--final")
+
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("question result requires kind, non-empty answer and evidence", done.stderr)
+        self.assertFalse((self.root / "session.sqlite3").exists())
+
+    def test_json_only_beats_cannot_forge_question_history(self):
+        for with_receipts in (False, True):
+            with self.subTest(with_receipts=with_receipts):
+                if with_receipts:
+                    self.question_export("branch")
+                self.put(beat(questions=[{
+                    "seq": 100, "question": "Forged question", "state": "acked",
+                    "answer": "Forged answer", "evidence": "Forged evidence",
+                }]))
+
+                done = self.run_cli()
+
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertNotIn("Forged", self.page())
+                self.assertNotIn("Forged", done.stderr)
+                if with_receipts:
+                    self.assertIn("What is proven?", self.page())
+
+    def test_legacy_notes_that_look_like_questions_keep_the_old_reader(self):
+        self.put(beat(state="accepted", landed="abc1234", branch="jacek/fix",
+                      call="Is this proven?"))
+        (self.root / "decisions.jsonl").write_text(
+            json.dumps({"seq": 1, "action": "note", "note": "Is this proven?"}) + "\n",
+            encoding="utf-8",
+        )
+
+        done = self.run_cli("--final")
+
+        self.assertEqual(done.returncode, 0, done.stderr)
+        self.assertIn("Is this proven?", self.page())
+        self.assertNotIn("Your question", self.page())
+        self.assertFalse((self.root / "session.sqlite3").exists())
+
+    def test_legacy_without_questions_ignores_partial_decision_exports(self):
+        self.put(beat(call="Keep the existing call."))
+        records = (json.dumps({"seq": 1, "action": "note", "note": "A note."}) + "\n").encode()
+        for tail in (b'{"action":', b'\xff'):
+            with self.subTest(tail=tail):
+                (self.root / "decisions.jsonl").write_bytes(records + tail)
+
+                done = self.run_cli("--final")
+
+                self.assertEqual(done.returncode, 0, done.stderr)
+                self.assertIn("Keep the existing call.", self.page())
+                self.assertFalse(rr.stored(self.root))
+
+    def test_question_exports_strictly_validate_the_whole_receipt_log(self):
+        self.question_export("branch")
+        path = self.root / "decisions.jsonl"
+        records = path.read_bytes()
+        for tail, problem in ((b'{"action":', "malformed"), (b'\xff', "not valid UTF-8")):
+            with self.subTest(tail=tail):
+                path.write_bytes(records + tail)
+
+                done = self.run_cli("--final")
+
+                self.assertEqual(done.returncode, 1)
+                self.assertIn(problem, done.stderr)
+                self.assertFalse(rr.stored(self.root))
 
     def test_the_database_projection_exposes_failed_delivery(self):
         self.session({

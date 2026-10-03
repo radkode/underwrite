@@ -153,6 +153,11 @@ LIVE_JS = """<script>
     accept: 'decision', drop: 'decision', decide: 'decision', next: 'next item',
   };
   function held(kind, headState) {
+    if (kind === 'question') {
+      return headState === 'applied'
+        ? 'the answer is recorded; waiting for the walk to acknowledge it'
+        : 'your question is saved; waiting for the walk to answer it';
+    }
     const noun = NOUNS[kind] || kind || 'call';
     return headState === 'applied'
       ? 'your ' + noun + ' is recorded; if the walk has stopped, tell it in the terminal'
@@ -429,8 +434,9 @@ LIVE_JS = """<script>
     disarm();
     // Ask for the decision before asking them to confirm it, or the second click is
     // the one that discovers the row was never sendable.
-    if (button.dataset.action === 'decide' && !(note && note.value.trim())) {
-      msg.textContent = 'enter the decision first';
+    if (['decide', 'question'].includes(button.dataset.action) && !(note && note.value.trim())) {
+      msg.textContent = button.dataset.action === 'question'
+        ? 'enter the question first' : 'enter the decision first';
       if (note) note.focus();
       return;
     }
@@ -445,11 +451,6 @@ LIVE_JS = """<script>
       action: button.dataset.action,
       note: note ? note.value.trim() : '',
     };
-    if (fresh.action === 'decide' && !fresh.note) {
-      msg.textContent = 'enter the decision first';
-      if (note) note.focus();
-      return;
-    }
     if (pending && !sameAction(pending, fresh)) {
       msg.textContent = 'retry the saved ' + pending.action + ' first';
       restorePending();
@@ -815,6 +816,29 @@ def where_html(where, paths, target):
     return " ".join(out)
 
 
+def questions_html(questions):
+    parts = []
+    for question in questions:
+        parts.append(
+            '<div class="qa">'
+            f'<p><strong>Your question:</strong> {md(question["question"])}</p>'
+        )
+        if question["state"] in ("applied", "acked"):
+            parts.append(
+                f'<p><strong>Answer:</strong> {md(question["answer"])}</p>'
+                f'<p class="qa-evidence"><strong>Evidence and limits:</strong> '
+                f'{md(question["evidence"])}</p>'
+            )
+        else:
+            message = (
+                "Question closed without an answer"
+                if question["state"] == "abandoned" else "Awaiting an answer"
+            )
+            parts.append(f'<p class="qa-pending">{message}</p>')
+        parts.append('</div>')
+    return '<div class="questions" aria-label="Questions and answers">' + ''.join(parts) + '</div>'
+
+
 def beat_html(
     beat,
     problems,
@@ -876,6 +900,9 @@ def beat_html(
             '<div class="call"><span class="lbl">Your call · item '
             f'{n}</span><q>{md(beat["call"])}</q></div>'
         )
+    questions = beat.get("questions") or []
+    if questions:
+        body.append(questions_html(questions))
     delivery = delivery_html(beat, mode, replacement, untrusted_pr)
     if delivery:
         body.append(delivery)
@@ -964,6 +991,7 @@ def beat_html(
         others = (
             '<span class="acts-else">'
             '<button class="act" data-action="note">Save note</button>'
+            '<button class="act" data-action="question">Ask question</button>'
             f'{advance}</span>'
         )
         # The note comes first so Tab lands on the primary right after typing.
@@ -983,6 +1011,8 @@ def beat_html(
         f'<span class="b-path">'
         f'{where_html(beat.get("where", ""), paths, target or {})}</span>'
         + (f'<span class="b-call">“{md(beat["call"])}”</span>' if beat.get("call") else "")
+        + (f'<span class="b-questions">Q&amp;A · {len(questions)} question'
+           f'{"s" if len(questions) != 1 else ""}</span>' if questions else "")
         + f"</summary>"
         f'<div class="b-body">{"".join(body)}</div>'
         f"</details>"
@@ -1447,15 +1477,30 @@ def load(root, css_path, final=False):
     legacy = not (root / "session.sqlite3").exists()
     if legacy:
         session = json.loads((root / "session.json").read_text(encoding="utf-8"))
+        decisions = root / "decisions.jsonl"
+        has_questions = False
+        if decisions.exists():
+            for line in decisions.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(record, dict) and record.get("action") == "question":
+                    has_questions = True
+                    break
         if session_mode(session) == "report":
             session, beats = SessionStore(root).presentation_snapshot()
             legacy = False
+        elif has_questions:
+            session, beats = SessionStore.legacy_presentation_snapshot(root)
         else:
             # The store canonicalizes these keys on the way in. A legacy session
             # never went through it, and an unread slot renders as an empty beat.
             beats = []
             for path in sorted((root / "beats").glob("*.json")):
                 stored_beat = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(stored_beat, dict):
+                    stored_beat.pop("questions", None)
                 if isinstance(stored_beat, dict) and isinstance(
                     stored_beat.get("slots"), dict
                 ):
@@ -1580,6 +1625,16 @@ def main():
     print(f"{owed} decision{'s' if owed != 1 else ''} owed", file=sys.stderr)
     for limit in limits:
         print(limit, file=sys.stderr)
+    for beat in beats:
+        for question in beat.get("questions") or []:
+            print(f'Question (item {beat["n"]}): {question["question"]}', file=sys.stderr)
+            if question["state"] in ("applied", "acked"):
+                print(f'Answer: {question["answer"]}', file=sys.stderr)
+                print(f'Evidence and limits: {question["evidence"]}', file=sys.stderr)
+            elif question["state"] == "abandoned":
+                print("Question closed without an answer", file=sys.stderr)
+            else:
+                print("Awaiting an answer", file=sys.stderr)
 
     if all_problems:
         print("render-report: rendered with problems", file=sys.stderr)

@@ -204,6 +204,37 @@ class ActionDeliveryContract(unittest.TestCase):
         self.assertIn("do not apply this one again", text)
 
 
+class QuestionContract(unittest.TestCase):
+    def question_rule(self):
+        text = " ".join(SKILL.read_text(encoding="utf-8").split())
+        return text.split("**Answering a question.**", 1)[1].split(
+            "A `next` on the last planned beat", 1
+        )[0]
+
+    def test_questions_have_a_distinct_evidence_qualified_application(self):
+        rule = self.question_rule()
+
+        self.assertIn('"kind":"question"', rule)
+        self.assertIn('"answer":"Not proven at runtime."', rule)
+        self.assertIn('"evidence":', rule)
+        self.assertIn("`answer` and `evidence` must be nonempty text", rule)
+        self.assertIn("inferred or insufficient", rule)
+        self.assertIn("a question never authorizes executing its head", rule)
+        self.assertIn("Do not include `session` or `beats`", rule)
+
+    def test_answer_receipts_are_durable_before_the_terminal_handoff(self):
+        rule = self.question_rule()
+
+        self.assertLess(rule.index("Persist it"), rule.index("acknowledge its exact"))
+        self.assertLess(rule.index("acknowledge its exact"), rule.index("in the terminal"))
+        self.assertIn("already-applied `result` is the stored answer", rule)
+        self.assertIn("Questions do not change the beat's state, `call`, delivery, cursor", rule)
+        self.assertIn("do not advance the walk", rule)
+        self.assertIn("visible pending status", rule)
+        self.assertIn("Save note and Record decision are not question shortcuts", rule)
+        self.assertNotIn("After answering a question, go straight to the next beat", SKILL.read_text())
+
+
 class DelegatedActionContract(unittest.TestCase):
     def skill(self):
         return SKILL.read_text(encoding="utf-8")
