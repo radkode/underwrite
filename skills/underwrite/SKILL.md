@@ -331,8 +331,11 @@ The page streams beats over SSE as you write them and carries mode-specific cont
 ordinary flag shows Implement for local `branch` targets or Include in review in `review`
 mode, or Include in report in `report` mode, plus Drop. A legacy or malformed PR in branch
 mode shows that implementation is blocked instead. A decision-only flag with top-level
-`resolution_kind: "decision"` shows Record decision. Save note remains available on any
-beat, and Next item works anywhere. The page writes its URL to `$R/serve.json`.
+`resolution_kind: "decision"` shows Record decision. Save note and Ask question remain
+available on any beat, and Next item works anywhere. The page writes its URL to
+`$R/serve.json`. Type in the shared field, then choose Save note to record an observation
+or Ask question to request an answer. Enter keeps its existing note or decision
+behavior; use Ask question explicitly.
 
 Those labels name the effect while the durable protocol remains stable. Implement,
 Include in review, and Include in report all post the canonical `accept` action.
@@ -434,8 +437,9 @@ curl -fsS "$(python3 -c "import json;print(json.load(open('$R/serve.json'))['url
 
 `/await` always returns the oldest action that has not been acknowledged. The reply is
 `{id, seq, n, action, note, state, result}` where action is `accept`, `drop`, `decide`,
-`note`, `next`, `back`, or `skip`. `state` is `produced` until a navigation result is
-applied, then `applied`. Beat actions arrive already applied. A reply of
+`note`, `question`, `next`, `back`, or `skip`. `state` is `produced` until a navigation
+result or question answer is applied, then `applied`. Other beat actions arrive already
+applied. A reply of
 `{"timeout": true}` means nobody acted; say so and park again. The terminal accepts the
 same answers in words, so a closed browser never strands the walk.
 
@@ -453,6 +457,31 @@ complete resulting session object read through `get-session`, and `beats` contai
 new beat objects first presented by that move. Navigation cannot replace an existing
 beat; reviewer-owned state would otherwise be vulnerable to a stale snapshot.
 `cursor` remains the number of persisted beats; do not use it as the navigation position.
+
+**Answering a question.** A `question` action carries the reviewer's question in `note`.
+Read the beat and the available evidence, then apply an envelope containing only this
+absolute result:
+
+```json
+{"result":{"kind":"question","answer":"Not proven at runtime.","evidence":"Static inspection of a.py:1 only; no test was run."}}
+```
+
+Use the same `sessionctl.py apply "$R" <seq>` command. `answer` and `evidence` must be
+nonempty text. Cite what you actually inspected or ran; say plainly when the evidence is
+inferred or insufficient. A PR source remains `no_exec`: a question never authorizes
+executing its head. Do not include `session` or `beats` in a question application.
+
+The returned receipt is the authoritative answer. Persist it, acknowledge its exact
+`seq`, then show that receipt's question, answer, and evidence in the terminal and park
+again. After a restart, an already-applied `result` is the stored answer, not permission
+to answer differently. Questions do not change the beat's state, `call`, delivery,
+cursor, or decisions owed, and do not advance the walk. The page keeps each question
+with its answer or visible pending status, including in the static report.
+
+A question asked in the terminal follows the same path: first read `/state` and handle
+any older queued action, then POST `/act` with a stable ID, that `session_id`, the beat's
+`n`, `action: "question"`, and the question in `note`. Save note and Record decision are
+not question shortcuts.
 
 A `next` on the last planned beat ends the walk. There is no beat to present, so apply it
 with `beats` empty and a result that says so, for example
@@ -487,7 +516,7 @@ durable report. All three clicks have already posted the canonical `accept` acti
 flips the beat's `state` and records the reviewer's words as `call`.
 
 For a PR source, the page and store always refuse branch acceptance. Include in review,
-Include in report, Drop, notes, navigation, and decision-only answers remain available
+Include in report, Drop, notes, questions, navigation, and decision-only answers remain available
 because they do not execute the head. Direct PR execution is not supported. The only PR
 implementation path is the separately approved linked child described below; it never
 changes the source audience or `no_exec` policy. Local branch and working-tree targets
@@ -712,8 +741,8 @@ open a PR unasked.
 Infer what the reviewer wants from what they type. Do not make them learn a vocabulary: an
 observation becomes an anchored note, a question gets answered and the beat stays open,
 "next" or "ok" advances, "skip follow-through" drops a tier, "back" returns to an earlier
-beat. After answering a question, go straight to the next beat. Do not ask "shall I
-continue?"
+beat. Route a question through `question`, not `note` or `decide`, and wait after its
+answer. Advance only when the reviewer asks to move on.
 
 ## Phase 4: finish
 
@@ -967,6 +996,11 @@ two nonempty text fields, `question` and `recommendation`. These describe existi
 not new actions. Write both for every new review; older sessions without them stay readable
 and visibly say the recommendation was not recorded. An accepted report freezes its
 decision wording with the finding.
+
+Question history is a read-only projection of ordered action receipts, separate from
+`call` and finding text. Each entry has `seq`, `question`, `state`, `answer`, and
+`evidence`; unanswered entries have no answer or evidence. Never write a beat's
+`questions` by hand. Older sessions without question actions show no question history.
 
 `landed` names what an accepted beat became: a commit SHA in `branch` mode, the review URL
 in `review` mode, with `branch` beside it when there is one. A frozen PR records the full
