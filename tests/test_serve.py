@@ -46,11 +46,11 @@ def load(stem):
 serve = load("serve")
 
 FLAG = {
-    "n": 1, "tier": "core", "state": "flag", "claim": "unpinned", "where": "a.py:1",
+    "n": 1, "tier": "core", "state": "flag", "proof_kind": "read", "claim": "unpinned", "where": "a.py:1",
     "slots": {"what": "x", "proof": "a.py:1", "risk": "r", "fix": "pin it"},
 }
 CLEAN = {
-    "n": 2, "tier": "core", "state": "clean", "claim": "load-bearing", "where": "b.py:1",
+    "n": 2, "tier": "core", "state": "clean", "proof_kind": "ran", "claim": "load-bearing", "where": "b.py:1",
     "slots": {"what": "x", "proof": "b.py:1"},
 }
 FROZEN_DIFF = b"diff\n"

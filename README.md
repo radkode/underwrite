@@ -4,8 +4,10 @@ Read a pull request closely enough to stand behind it. One beat at a time, drive
 ending in a delivered result.
 
 Most review tooling hands you a wall of findings and leaves the work of deciding to you.
-This walks a change in causal order, one coherent unit per turn, and stops after each one
-so you steer. When something is worth flagging, the action names what happens next:
+This walks a change in causal order, one coherent unit at a time, and stops on each one
+that needs you: a flag, or a claim it could only read and not check. Clean beats land on
+the page and the walk moves on. When something is worth flagging, the action names what
+happens next:
 Implement applies and verifies a branch fix, Include in review queues a finding for the
 GitHub review, and Include in report records a finding in the durable report.
 Record decision stores an answer whose words complete the work.
@@ -52,7 +54,7 @@ tiered wrong. Both decisions arrive as named options, not as a question you have
 Your answers are kept in your words beside the reconstruction and claim check: the
 finished page opens on them, and a live walk folds them to one line above the facts.
 
-**Walk.** One beat per turn, opening with a verdict token and running on fixed lines:
+**Walk.** One beat at a time, opening with a verdict token and running on fixed lines:
 
 ```
 BEAT 5/7  enabling  .github/workflows/ci.yml:22
@@ -66,11 +68,15 @@ FIX    npx --yes @arethetypeswrong/cli@0.18.5
 ```
 
 `PROOF` names a command run under the session's execution policy, or a file that was read.
-`inferred` is a legal value. A claim with neither does not ship.
+`inferred` is a legal value. A claim with neither does not ship. The beat says which it
+was: `CLEAN` is reserved for a command whose output would have differed were the claim
+false, and a claim that was read or inferred opens `UNVERIFIED`, which is where your own
+reading goes. A risk appears only on a flag, with a decision beside it.
 
 Beats stay that size because the store makes them. A slot over 25 words, a claim over 20,
 a fourth filled slot on a clean beat, or an eleventh quoted line is refused at write time,
-with the offending slot and its count named. The example above sits at nine or ten words a
+with the offending slot and its count named, as is a clean verdict on a read proof or a
+risk on a beat that is not a flag. The example above sits at nine or ten words a
 line, which is the target; the budget is the ceiling. Nothing already recorded is
 re-judged, so a session written before the budget still opens and still renders.
 

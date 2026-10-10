@@ -113,6 +113,7 @@ def flag(n, claim, line, fix):
         "n": n,
         "tier": "core",
         "state": "flag",
+        "proof_kind": "read",
         "claim": claim,
         "where": f"app.py:{line}",
         "slots": {
