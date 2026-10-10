@@ -457,9 +457,13 @@ owed (`state: "flag"` only). Accepted findings and pending delivery are not new 
 **Moving past a clean beat.** A `CLEAN` beat asks nothing, so do not park on it. Store
 it, post `working` naming the beat you are moving to, then read `/state`: `seq` above
 `handled_seq` means an action is queued, so take it through `/await` and handle it as
-below before anything else. Otherwise go straight to the next beat in the same turn. A
-`next` that arrives for a beat the walk has already left is applied with the position the
-walk already reached and `beats` empty; navigation never re-presents a beat.
+below before anything else. Otherwise go straight to the next beat in the same turn.
+
+`next` is walk-global: the page sends it with no beat number, so apply it from the walk's
+current position whatever beat the reviewer was looking at. One found queued at that
+`/state` check moves exactly one beat, the beat you were about to present, and that beat
+is then treated by its own verdict. A `next` can therefore pass a beat presented in the
+instant before the click; the ledger keeps the beat, and `back` returns to it.
 
 **Waiting on the reviewer.** After presenting a `FLAG` or `UNVERIFIED` beat, park on the
 server rather than ending the turn silently. Run this in the background too, so the
@@ -508,7 +512,7 @@ executing its head. Do not include `session` or `beats` in a question applicatio
 
 The returned receipt is the authoritative answer. Persist it, acknowledge its exact
 `seq`, then show that receipt's question, answer, and evidence in the terminal and park
-again. After a restart, an already-applied `result` is the stored answer, not permission
+again on the beat the question was asked about. After a restart, an already-applied `result` is the stored answer, not permission
 to answer differently. Questions do not change the beat's state, `call`, delivery,
 cursor, or decisions owed, and do not advance the walk. The page keeps each question
 with its answer or visible pending status, including in the static report.
@@ -529,7 +533,8 @@ After the local effect and any required external effect are durable, acknowledge
 exact reply, and do it before you write anything the reviewer will read. Until the ack the
 page holds every control for that action, so a beat narrated first leaves the reviewer
 facing a page that died one click after they used it. For a navigation reply the order is
-apply, ack, present the beat, then park. The terminal message is the part that can wait:
+apply, ack, present the beat, then park on a `FLAG` or `UNVERIFIED` beat or move on from
+a `CLEAN` one. The terminal message is the part that can wait:
 
 ```bash
 $S/scripts/sessionctl.py ack "$R" <seq>
@@ -777,7 +782,8 @@ Infer what the reviewer wants from what they type. Do not make them learn a voca
 observation becomes an anchored note, a question gets answered and the beat stays open,
 "next" or "ok" advances, "skip follow-through" drops a tier, "back" returns to an earlier
 beat. Route a question through `question`, not `note` or `decide`, and wait after its
-answer. Advance only when the reviewer asks to move on.
+answer. Past a `FLAG` or `UNVERIFIED` beat, advance only when the reviewer asks to move
+on; past a `CLEAN` beat, advance on your own.
 
 ## Phase 4: finish
 

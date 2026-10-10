@@ -3061,6 +3061,22 @@ class TheBeatBudget(StoreCase):
                                        slots=dict(risky, fix="f")))
         self.assertEqual(self.beat(3)["state"], "flag")
 
+    def test_rewriting_a_beat_answers_to_the_same_rule(self):
+        # the review of #100 rewrote a clean/ran beat as read with a risk and the store
+        # took it, because only the first write of a beat number was judged
+        self.store.put_beat(self.wordy(5))
+        with self.assertRaisesRegex(session_store.StoreError, r"clean on a read proof"):
+            self.store.put_beat(self.wordy(5, proof_kind="read"))
+        with self.assertRaisesRegex(session_store.StoreError, r"clean carries a risk"):
+            self.store.put_beat(self.wordy(5, slots={"what": "w", "proof": "c.py:1", "risk": "r"}))
+        nameless = self.wordy(5)
+        del nameless["proof_kind"]
+        with self.assertRaisesRegex(session_store.StoreError, r"proof_kind must be one of"):
+            self.store.put_beat(nameless)
+        self.store.put_beat(self.wordy(6))
+        self.assertEqual(self.beat(3)["slots"]["what"], " ".join(["word"] * 6))
+        self.assertEqual(self.beat(3)["proof_kind"], "ran")
+
     def test_a_beat_stored_before_proof_kinds_keeps_its_verdict(self):
         root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, root, True)
@@ -3071,10 +3087,18 @@ class TheBeatBudget(StoreCase):
             "slots": {"what": "w", "proof": "c.py:1", "risk": "already happened"},
         }
         (root / "beats" / "01.json").write_text(json.dumps(before), encoding="utf-8")
-        stored = session_store.SessionStore(root).snapshot()[1][0]
+        store = session_store.SessionStore(root)
+        stored = store.snapshot()[1][0]
         self.assertEqual(stored["state"], "clean")
         self.assertNotIn("proof_kind", stored)
         self.assertEqual(session_store.validate_beat(stored), [])
+        # a rewrite that does not adopt the field is still the legacy beat
+        rewritten = store.put_beat(dict(before, claim="still sound"))
+        self.assertEqual(rewritten["claim"], "still sound")
+        self.assertEqual(rewritten["slots"]["risk"], "already happened")
+        # adopting the field brings the rule with it
+        with self.assertRaisesRegex(session_store.StoreError, r"clean on a read proof"):
+            store.put_beat(dict(before, proof_kind="read"))
         self.assertEqual(
             session_store.validate_beat(dict(stored, proof_kind="checked")),
             ["beat 1: proof_kind 'checked' is not one of ran, read, inferred"],

@@ -185,8 +185,8 @@ Decisions happen there too. Review mode uses Include in review and Drop. Report 
 Include in report and Drop. Local branch and working-tree sessions retain Implement. A
 policy question whose answer completes the work carries Record decision.
 Each has a field for putting the call in your own words, and Next item advances the walk
-from anywhere. Clicking is what unblocks the terminal side, which parks on the server
-between beats rather than spinning. The terminal still takes the same answers in words,
+from anywhere. Clicking is what unblocks the terminal side, which parks on the server at
+every flag and unverified beat rather than spinning. The terminal still takes the same answers in words,
 so closing the tab never strands a session.
 
 The labels describe the delegated effect without changing the durable protocol. Implement,

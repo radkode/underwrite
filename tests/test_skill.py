@@ -141,6 +141,16 @@ class CleanMeansChecked(unittest.TestCase):
         self.assertNotIn("One beat per turn", text)
         self.assertNotIn("One beat per turn", self.readme())
         self.assertIn("Clean beats land on the page and the walk moves on", self.readme())
+        # the older instructions that parked after every beat, found by the #100 review
+        self.assertNotIn("present the beat, then park.", text)
+        self.assertNotIn("Advance only when the reviewer asks to move on.", text)
+        self.assertNotIn("parks on the server between beats", self.readme())
+        self.assertIn("past a `CLEAN` beat, advance on your own", text)
+
+    def test_next_is_walk_global_because_the_page_sends_no_beat_number(self):
+        text = self.skill()
+        self.assertIn("`next` is walk-global", text)
+        self.assertIn("apply it from the walk's current position", text)
 
     def test_the_exemplars_show_both_verdicts(self):
         text = self.skill()

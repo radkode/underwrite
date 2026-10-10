@@ -3545,6 +3545,12 @@ class SessionStore:
                         beat[field] = current[field]
                     else:
                         beat.pop(field, None)
+                if "proof_kind" in current or "proof_kind" in beat:
+                    # Written under the proof-kind rule, so a rewrite answers to it too;
+                    # a beat from before the field keeps its verdict untouched.
+                    over = proof_kind_problems(beat)
+                    if over:
+                        raise StoreError("; ".join(over))
                 if "resolution_kind" not in beat and "resolution_kind" in current:
                     beat["resolution_kind"] = current["resolution_kind"]
                 if current.get("state") not in OPEN_STATES:
