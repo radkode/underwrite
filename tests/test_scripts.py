@@ -42,6 +42,7 @@ def beat(**kw):
         "n": 1,
         "tier": "core",
         "state": "clean",
+        "proof_kind": "ran",
         "claim": "does what it says",
         "where": "a.ts:1",
         "slots": {"what": "adds a thing", "proof": "a.ts:1"},

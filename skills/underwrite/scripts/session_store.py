@@ -41,6 +41,9 @@ NAVIGATION = ("next", "back", "skip")
 RESOLVE = {"accept": "accepted", "drop": "dropped", "decide": "decided"}
 RESOLVABLE = {"accept": ("flag",), "drop": ("flag",), "decide": ("flag", "accepted")}
 OPEN_STATES = ("clean", "flag", "unverified")
+# What PROOF is: a command whose output would have read differently were the claim
+# false, a file or diff read, or an inference. Only `ran` earns CLEAN.
+PROOF_KINDS = ("ran", "read", "inferred")
 RESOLUTION_KINDS = ("delivery", "decision")
 STORE_OWNED_FIELDS = ("call", "landed", "branch", "delivery_kind", "delivery")
 # Rule 2's budget, in numbers. It binds what a walk writes now and never what is
@@ -225,7 +228,37 @@ def beat_budget_problems(beat):
         over.append(
             f"beat {n}: {len(quoted)} quoted lines, over {BEAT_BUDGET['diff_lines']}"
         )
+    over.extend(proof_kind_problems(beat))
     return over
+
+
+def proof_kind_problems(beat):
+    """Return the ways a beat about to be written misstates what its proof is.
+
+    Write-time only, like the budget: a stored beat written before proof kinds
+    existed keeps the verdict it landed with."""
+    n = beat.get("n", "?")
+    state = beat.get("state")
+    if state not in OPEN_STATES:
+        return []
+    problems = []
+    kind = beat.get("proof_kind")
+    if kind not in PROOF_KINDS:
+        problems.append(
+            f"beat {n}: proof_kind must be one of {', '.join(PROOF_KINDS)}"
+        )
+    elif state == "clean" and kind != "ran":
+        problems.append(
+            f"beat {n}: clean on a {kind} proof; write it unverified, "
+            "or name the command you ran"
+        )
+    slots = beat.get("slots")
+    if state in ("clean", "unverified") and isinstance(slots, dict) and slots.get("risk"):
+        problems.append(
+            f"beat {n}: {state} carries a risk; raise a flag with its decision, "
+            "or drop the slot"
+        )
+    return problems
 
 
 def decision_problems(beat):
@@ -325,6 +358,11 @@ def validate_beat(beat, mode="branch", final=False):
         problems.append(f"beat {n}: proof is {type(proof).__name__}, not text")
     elif proof and not PROOF_EVIDENCE.search(proof):
         problems.append(f"beat {n}: proof names no command or path:line")
+    if "proof_kind" in beat and beat["proof_kind"] not in PROOF_KINDS:
+        problems.append(
+            f"beat {n}: proof_kind {beat['proof_kind']!r} is not one of "
+            f"{', '.join(PROOF_KINDS)}"
+        )
     return problems
 
 
@@ -3507,6 +3545,12 @@ class SessionStore:
                         beat[field] = current[field]
                     else:
                         beat.pop(field, None)
+                if "proof_kind" in current or "proof_kind" in beat:
+                    # Written under the proof-kind rule, so a rewrite answers to it too;
+                    # a beat from before the field keeps its verdict untouched.
+                    over = proof_kind_problems(beat)
+                    if over:
+                        raise StoreError("; ".join(over))
                 if "resolution_kind" not in beat and "resolution_kind" in current:
                     beat["resolution_kind"] = current["resolution_kind"]
                 if current.get("state") not in OPEN_STATES:

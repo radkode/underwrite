@@ -105,6 +105,7 @@ class AttestedImplementationCase(unittest.TestCase):
             "n": 1,
             "tier": "core",
             "state": "flag",
+            "proof_kind": "read",
             "claim": "the value is not pinned",
             "where": "app.py:1",
             "slots": {
@@ -1008,7 +1009,7 @@ class AttestedImplementationCase(unittest.TestCase):
         """A session can hold one authorization per accepted finding, and the operator's
         question is which beat is spoken for."""
         self.source.put_beat({
-            "n": 2, "tier": "core", "state": "flag", "claim": "second",
+            "n": 2, "tier": "core", "state": "flag", "proof_kind": "read", "claim": "second",
             "where": "b.py:2",
             "slots": {"what": "y", "proof": "b.py:2", "risk": "r", "fix": "do it"},
         })

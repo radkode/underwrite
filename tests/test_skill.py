@@ -112,6 +112,52 @@ class TheHeadIsNotYourFinding(unittest.TestCase):
         self.assertIn("a slot you could have written without leaving the docstring", text)
 
 
+class CleanMeansChecked(unittest.TestCase):
+    """Across 22 real beats, 15 proofs were a file read and none opened UNVERIFIED, so
+    CLEAN told the reviewer nothing about where to look. The store now refuses the
+    spelling, and the walk only parks where the verdict asks something."""
+
+    def skill(self):
+        return " ".join(SKILL.read_text(encoding="utf-8").split())
+
+    def readme(self):
+        return " ".join(README.read_text(encoding="utf-8").split())
+
+    def test_only_a_proof_that_ran_earns_clean(self):
+        text = self.skill()
+        self.assertIn("Only `ran` earns `CLEAN`", text)
+        self.assertIn("`UNVERIFIED` is not a failure", text)
+        self.assertIn("`proof_kind` is `ran`, `read`, or `inferred` on every beat written now", text)
+
+    def test_a_risk_is_a_flag_or_nothing(self):
+        self.assertIn("A `RISK` belongs to a flag", self.skill())
+        self.assertIn("A risk appears only on a flag", self.readme())
+
+    def test_the_walk_parks_only_where_the_verdict_asks(self):
+        text = self.skill()
+        self.assertIn("A `FLAG` or `UNVERIFIED` beat stops and waits for the reviewer", text)
+        self.assertIn("Moving past a clean beat", text)
+        self.assertIn("`seq` above `handled_seq` means an action is queued", text)
+        self.assertNotIn("One beat per turn", text)
+        self.assertNotIn("One beat per turn", self.readme())
+        self.assertIn("Clean beats land on the page and the walk moves on", self.readme())
+        # the older instructions that parked after every beat, found by the #100 review
+        self.assertNotIn("present the beat, then park.", text)
+        self.assertNotIn("Advance only when the reviewer asks to move on.", text)
+        self.assertNotIn("parks on the server between beats", self.readme())
+        self.assertIn("past a `CLEAN` beat, advance on your own", text)
+
+    def test_next_is_walk_global_because_the_page_sends_no_beat_number(self):
+        text = self.skill()
+        self.assertIn("`next` is walk-global", text)
+        self.assertIn("apply it from the walk's current position", text)
+
+    def test_the_exemplars_show_both_verdicts(self):
+        text = self.skill()
+        self.assertIn("A clean beat, whose proof ran", text)
+        self.assertIn("An unverified beat, whose proof was read", text)
+
+
 class ReviewModeContract(unittest.TestCase):
     def skill(self):
         return SKILL.read_text(encoding="utf-8")

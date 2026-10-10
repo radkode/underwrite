@@ -32,6 +32,7 @@ FLAG = {
     "n": 1,
     "tier": "core",
     "state": "flag",
+    "proof_kind": "read",
     "claim": "unpinned",
     "where": "a.py:1",
     "slots": {"what": "x", "proof": "a.py:1", "risk": "r", "fix": "pin it"},
@@ -40,6 +41,7 @@ CLEAN = {
     "n": 2,
     "tier": "core",
     "state": "clean",
+    "proof_kind": "ran",
     "claim": "sound",
     "where": "b.py:1",
     "slots": {"what": "y", "proof": "b.py:1"},
@@ -2294,7 +2296,7 @@ class CreatingAndMigrating(StoreCase):
 
     def test_a_beat_written_in_upper_case_is_stored_as_the_contract_spells_it(self):
         self.store.put_beat(
-            {"n": 2, "state": "clean", "claim": "c",
+            {"n": 2, "state": "clean", "proof_kind": "ran", "claim": "c",
              "slots": {"WHAT": "does a thing", "PROOF": "a.ts:1"}}
         )
 
@@ -2304,7 +2306,7 @@ class CreatingAndMigrating(StoreCase):
 
     def test_a_key_that_is_no_slot_at_all_is_left_for_validation_to_report(self):
         self.store.put_beat(
-            {"n": 2, "state": "clean", "claim": "c",
+            {"n": 2, "state": "clean", "proof_kind": "ran", "claim": "c",
              "slots": {"WHAT": "does a thing", "BANANA": "x"}}
         )
 
@@ -2319,7 +2321,7 @@ class CreatingAndMigrating(StoreCase):
         """The canonical form keeps both keys rather than drop one, and then every reader
         takes the canonical spelling and the other one's prose reaches nothing."""
         colliding = {
-            "n": 3, "state": "clean", "claim": "c",
+            "n": 3, "state": "clean", "proof_kind": "ran", "claim": "c",
             "slots": {"WHAT": "the real finding", "what": "x", "proof": "b.py:1"},
         }
 
@@ -2340,7 +2342,7 @@ class CreatingAndMigrating(StoreCase):
         produced = self.store.produce("nav-1", None, "next", "")
         session, beats = self.store.snapshot()
         colliding = {
-            "n": 3, "state": "clean", "claim": "c",
+            "n": 3, "state": "clean", "proof_kind": "ran", "claim": "c",
             "slots": {"PROOF": "c.py:1", "proof": "d.py:2", "what": "x"},
         }
 
@@ -2984,7 +2986,7 @@ class TheBeatBudget(StoreCase):
 
     def wordy(self, words, **kw):
         beat = {
-            "n": 3, "tier": "core", "state": "clean", "claim": "sound",
+            "n": 3, "tier": "core", "state": "clean", "proof_kind": "ran", "claim": "sound",
             "where": "c.py:1",
             "slots": {"what": " ".join(["word"] * words), "proof": "c.py:1"},
         }
@@ -3018,6 +3020,89 @@ class TheBeatBudget(StoreCase):
     def test_a_claim_that_runs_on_is_refused(self):
         with self.assertRaisesRegex(session_store.StoreError, r"claim is 21 words, over 20"):
             self.store.put_beat(self.wordy(5, claim=" ".join(["word"] * 21)))
+
+    def test_clean_is_reserved_for_a_proof_that_ran(self):
+        # 15 of 22 real proofs were "read file:lines and saw"; none opened UNVERIFIED
+        with self.assertRaisesRegex(
+            session_store.StoreError,
+            r"clean on a read proof; write it unverified, or name the command you ran",
+        ):
+            self.store.put_beat(self.wordy(5, proof_kind="read"))
+        with self.assertRaisesRegex(session_store.StoreError, r"clean on a inferred proof"):
+            self.store.put_beat(self.wordy(5, proof_kind="inferred"))
+        self.store.put_beat(self.wordy(5, state="unverified", proof_kind="read"))
+        self.assertEqual(self.beat(3)["state"], "unverified")
+        self.assertEqual(self.beat(3)["proof_kind"], "read")
+
+    def test_a_new_beat_says_what_its_proof_is(self):
+        nameless = self.wordy(5)
+        del nameless["proof_kind"]
+        with self.assertRaisesRegex(
+            session_store.StoreError, r"proof_kind must be one of ran, read, inferred"
+        ):
+            self.store.put_beat(nameless)
+        with self.assertRaisesRegex(session_store.StoreError, r"proof_kind must be one of"):
+            self.store.put_beat(self.wordy(5, proof_kind="checked"))
+        flag = self.wordy(5, state="flag", proof_kind="inferred",
+                          slots={"what": "w", "proof": "inferred", "risk": "r", "fix": "f"})
+        self.store.put_beat(flag)
+        self.assertEqual(self.beat(3)["proof_kind"], "inferred")
+
+    def test_a_risk_belongs_to_a_flag(self):
+        risky = {"what": "w", "proof": "c.py:1", "risk": "r"}
+        with self.assertRaisesRegex(
+            session_store.StoreError,
+            r"clean carries a risk; raise a flag with its decision, or drop the slot",
+        ):
+            self.store.put_beat(self.wordy(5, slots=risky))
+        with self.assertRaisesRegex(session_store.StoreError, r"unverified carries a risk"):
+            self.store.put_beat(self.wordy(5, state="unverified", proof_kind="read", slots=risky))
+        self.store.put_beat(self.wordy(5, state="flag", proof_kind="read",
+                                       slots=dict(risky, fix="f")))
+        self.assertEqual(self.beat(3)["state"], "flag")
+
+    def test_rewriting_a_beat_answers_to_the_same_rule(self):
+        # the review of #100 rewrote a clean/ran beat as read with a risk and the store
+        # took it, because only the first write of a beat number was judged
+        self.store.put_beat(self.wordy(5))
+        with self.assertRaisesRegex(session_store.StoreError, r"clean on a read proof"):
+            self.store.put_beat(self.wordy(5, proof_kind="read"))
+        with self.assertRaisesRegex(session_store.StoreError, r"clean carries a risk"):
+            self.store.put_beat(self.wordy(5, slots={"what": "w", "proof": "c.py:1", "risk": "r"}))
+        nameless = self.wordy(5)
+        del nameless["proof_kind"]
+        with self.assertRaisesRegex(session_store.StoreError, r"proof_kind must be one of"):
+            self.store.put_beat(nameless)
+        self.store.put_beat(self.wordy(6))
+        self.assertEqual(self.beat(3)["slots"]["what"], " ".join(["word"] * 6))
+        self.assertEqual(self.beat(3)["proof_kind"], "ran")
+
+    def test_a_beat_stored_before_proof_kinds_keeps_its_verdict(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        (root / "beats").mkdir()
+        (root / "session.json").write_text(json.dumps(SESSION), encoding="utf-8")
+        before = {
+            "n": 1, "tier": "core", "state": "clean", "claim": "sound", "where": "c.py:1",
+            "slots": {"what": "w", "proof": "c.py:1", "risk": "already happened"},
+        }
+        (root / "beats" / "01.json").write_text(json.dumps(before), encoding="utf-8")
+        store = session_store.SessionStore(root)
+        stored = store.snapshot()[1][0]
+        self.assertEqual(stored["state"], "clean")
+        self.assertNotIn("proof_kind", stored)
+        self.assertEqual(session_store.validate_beat(stored), [])
+        # a rewrite that does not adopt the field is still the legacy beat
+        rewritten = store.put_beat(dict(before, claim="still sound"))
+        self.assertEqual(rewritten["claim"], "still sound")
+        self.assertEqual(rewritten["slots"]["risk"], "already happened")
+        # adopting the field brings the rule with it
+        with self.assertRaisesRegex(session_store.StoreError, r"clean on a read proof"):
+            store.put_beat(dict(before, proof_kind="read"))
+        self.assertEqual(
+            session_store.validate_beat(dict(stored, proof_kind="checked")),
+            ["beat 1: proof_kind 'checked' is not one of ran, read, inferred"],
+        )
 
     def test_a_refusal_inside_apply_leaves_the_action_replayable(self):
         # the hazard: apply carries new beats, so a refusal there could strand the

@@ -29,6 +29,7 @@ FLAG = {
     "n": 1,
     "tier": "core",
     "state": "flag",
+    "proof_kind": "read",
     "claim": "unpinned",
     "where": "a.py:1",
     "slots": {"what": "x", "proof": "a.py:1", "risk": "r", "fix": "pin it"},
