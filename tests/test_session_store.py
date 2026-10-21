@@ -3487,15 +3487,16 @@ class FlagAnchors(unittest.TestCase):
         self.store.put_beat(self.flag("src/a.py:13", n=2))
         self.assertEqual(len(self.store.snapshot()[1]), 2)
 
-    def test_the_number_reads_as_the_head_does_not_as_the_base_did(self):
-        """A pure deletion touches base lines 50 to 52 and no head line near them, so
-        head line 50 is untouched even though the base's 50 sat in a hunk."""
+    def test_a_removed_line_is_cited_in_the_base_numbering(self):
+        """A pure deletion touches base lines 50 to 52 and no head line near them; the
+        flag that says "you removed this" still has somewhere to land."""
         self.DIFF = self.DIFF + "@@ -50,3 +49,0 @@\n-a\n-b\n-c\n"
         self.setUp()
+        self.store.put_beat(self.flag("src/a.py:52"))
         with self.assertRaisesRegex(
-            session_store.StoreError, "nearest touched line is src/a.py:13"
+            session_store.StoreError, "nearest touched line is src/a.py:52"
         ):
-            self.store.put_beat(self.flag("src/a.py:50"))
+            self.store.put_beat(self.flag("src/a.py:60", n=2))
 
     def test_a_deleted_file_anchors_in_the_base_numbering(self):
         self.DIFF = (

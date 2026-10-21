@@ -79,8 +79,9 @@ makes it your comment wearing their name.
 engineer would genuinely stop at. Not style, not "consider extracting," not missing tests,
 not pre-existing issues. In a PR session the store holds you to the last one: a flag's
 `where` names a `path:line` inside the frozen diff's hunks, numbered as the head reads
-(as the base reads for a deleted file), context lines included, and a flag on a line the
-PR never put in front of the reviewer is refused with the nearest touched line named. A branch flag carries the smallest implementation intent
+(as the base read, for a line the PR removed), context lines included, and a flag on a
+line the PR never put in front of the reviewer is refused with the nearest touched line
+named. A branch flag carries the smallest implementation intent
 that could resolve it. When the same fix applies at several sites, `FIX` states the count
 and one example, so the class gets fixed rather than the one line you happened to quote. A PR flag carries a finding ready to include in the final review or
 durable report. A policy question carries a named decision with its options. Never claim

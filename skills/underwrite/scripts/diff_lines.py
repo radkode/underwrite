@@ -129,9 +129,9 @@ def untouched_anchor(where, files):
     """Why a flag's `where` does not land inside the diff, or None when it does.
 
     The first `path:line` is the anchor, tried on the whole string first so a path
-    with a space in it is not shattered. The number is in the head's coordinates, the
-    ones the page links to, or the base's for a file the PR deleted. Context lines
-    count: the question is whether the PR put this line in front of the reviewer.
+    with a space in it is not shattered. The number reads as the head does, or as the
+    base did for a line the PR removed; context lines count. The question is whether
+    the PR put this line in front of the reviewer, not whether it added it.
     """
     text = str(where or "")
     cited = LOCATION_LINE.match(text.strip().rstrip(",;+·"))
@@ -145,7 +145,7 @@ def untouched_anchor(where, files):
     path = resolve_path(candidate, sorted(files))
     if path is None:
         return f"flag names {candidate}, which the frozen diff does not touch"
-    touched = files[path]["RIGHT"] or files[path]["LEFT"]
+    touched = files[path]["LEFT"] | files[path]["RIGHT"]
     if line in touched:
         return None
     if not touched:
