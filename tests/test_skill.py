@@ -567,5 +567,40 @@ class ReviewGuide(unittest.TestCase):
         self.assertIn("This repository keeps one at its root", readme)
 
 
+class ClaimSections(unittest.TestCase):
+    """The claim check compared the body against the diff only, so a PR that never said
+    how it was tested produced no line anywhere. The requester answers Testing, Risk and
+    How to revert; the review names what they left out."""
+
+    TEMPLATE = Path(__file__).resolve().parent.parent / ".github" / "pull_request_template.md"
+
+    def skill(self):
+        return " ".join(SKILL.read_text(encoding="utf-8").split())
+
+    def claim(self):
+        return self.skill().split("**The claim check.**")[1].split("State the frozen audience")[0]
+
+    def test_the_claim_check_names_the_sections_the_body_lacks(self):
+        claim = self.claim()
+        self.assertIn("which of Testing, Risk and How to revert the body leaves unanswered", claim)
+        self.assertIn("rather than folding them into a mismatch", claim)
+
+    def test_a_missing_testing_answer_reaches_the_recommendation(self):
+        finish = self.skill().split("## Phase 4: finish")[1].split("Render the page first")[0]
+        claim = self.claim()
+        self.assertIn("the body states no testing", claim)
+        self.assertIn("the body states no testing", finish)
+        self.assertIn("keeps that line through Phase 4", claim)
+        self.assertIn("goes beside that line and never in its place", claim)
+        self.assertNotIn("author states no testing", self.skill())
+
+    def test_this_repository_asks_for_the_three_in_its_template(self):
+        text = self.TEMPLATE.read_text(encoding="utf-8")
+        for heading in ("## Testing", "## Risk", "## How to revert"):
+            self.assertIn(heading, text)
+        readme = " ".join(README.read_text(encoding="utf-8").split())
+        self.assertIn("which of Testing, Risk and How to revert", readme)
+
+
 if __name__ == "__main__":
     unittest.main()
