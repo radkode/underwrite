@@ -290,6 +290,14 @@ not see that anywhere." Say so explicitly when the claims hold up. When a frozen
 and report a body that is silent on a failure the owners named for that path as a gap,
 distinct from a mismatch: the claim may hold and still leave the owners' question open.
 
+Then name which of Testing, Risk and How to revert the body leaves unanswered. A body that
+never says how the change was exercised, what breaks if it is wrong, or how to back it out
+leaves those open for the reviewer; name each one it lacks rather than folding them into a
+mismatch. When Testing is missing, the recommendation says in those words that the body
+states no testing, and keeps that line through Phase 4. Evidence the walk gathers, or a
+passing check on the head, goes beside that line and never in its place: neither is the
+author's account of how they tested.
+
 State the frozen audience and lifecycle in one line here. Correct a bad capture with a
 supervised replacement, never an in-session audience change.
 
@@ -819,7 +827,8 @@ on; past a `CLEAN` beat, advance on your own.
 Refresh `recommendation` against the evidence before rendering, then lead the terminal
 handoff with the same assessment and count of decisions owed as the page. Say what was not
 reviewed or verified; clean counts and included findings alone do not establish merge
-readiness. The renderer qualifies incomplete coverage, unverified items, and static
+readiness. A body that never answered Testing keeps its line from the claim check: the
+body states no testing. The renderer qualifies incomplete coverage, unverified items, and static
 inspection instead of turning a delivery-complete page into a verified review.
 For every included finding, say in the recommendation whether it blocks the merge and who
 acts on it; a finished page that says "safe to merge" above a finding leaves the reviewer

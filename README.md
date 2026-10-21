@@ -44,9 +44,10 @@ is read back under a one-million-byte ceiling (`--max-bytes`); a change past tha
 refused rather than truncated.
 
 **Orient.** A short reconstruction of what the change is for, plus a claim check comparing
-the PR description against what the diff actually does. This is the first of two decisions
+the PR description against what the diff actually does and naming which of Testing, Risk
+and How to revert the description leaves unanswered. This is the first of two decisions
 before the page opens: confirm it, or correct either half, and your correction frames the
-rest.
+rest. This repository's pull request template asks for the three.
 
 **Plan.** Every changed file is tiered into core, enabling, follow-through, and risk. The
 second decision: walk it in that order, reorder it, skip a tier, or move a file that got
