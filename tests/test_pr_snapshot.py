@@ -719,6 +719,50 @@ class Capturing(SnapshotCase):
         self.assertNotIn("target", self.store.snapshot()[0])
         self.assertFalse((self.session / "trusted-context.json").exists())
 
+    def test_a_guide_an_instruction_imports_still_follows_its_own_imports(self):
+        (self.work / "AGENTS.md").write_text("Review per @REVIEW.md\n", encoding="utf-8")
+        (self.work / "REVIEW.md").write_text("Owner rules in @policy.txt\n", encoding="utf-8")
+        (self.work / "policy.txt").write_text("owner rules\n", encoding="utf-8")
+        self.git("-C", self.work, "add", "AGENTS.md", "REVIEW.md", "policy.txt")
+        self.git("-C", self.work, "commit", "-m", "imported guide")
+        self.base = self.rev("HEAD")
+        self.git("-C", self.work, "push", "origin", "main")
+        metadata = self.metadata()
+
+        pr_snapshot.capture(
+            self.store,
+            "acme/widget",
+            7,
+            self.work,
+            api=mock.Mock(side_effect=[metadata, metadata]),
+        )
+
+        context = json.loads((self.session / "trusted-context.json").read_text("utf-8"))
+        self.assertEqual(
+            [entry["path"] for entry in context["files"]],
+            ["AGENTS.md", "REVIEW.md", "policy.txt"],
+        )
+
+    def test_a_guide_an_instruction_imports_keeps_failing_closed_on_a_bad_import(self):
+        (self.work / "AGENTS.md").write_text("Review per @REVIEW.md\n", encoding="utf-8")
+        (self.work / "REVIEW.md").write_text("See @missing.txt\n", encoding="utf-8")
+        self.git("-C", self.work, "add", "AGENTS.md", "REVIEW.md")
+        self.git("-C", self.work, "commit", "-m", "broken guide import")
+        self.base = self.rev("HEAD")
+        self.git("-C", self.work, "push", "origin", "main")
+        metadata = self.metadata()
+
+        with self.assertRaisesRegex(pr_snapshot.SnapshotError, "import is missing"):
+            pr_snapshot.capture(
+                self.store,
+                "acme/widget",
+                7,
+                self.work,
+                api=mock.Mock(side_effect=[metadata, metadata]),
+            )
+
+        self.assertNotIn("target", self.store.snapshot()[0])
+
     def test_instruction_import_cycles_fail_closed(self):
         (self.work / "AGENTS.md").write_text("Read @first\n", encoding="utf-8")
         (self.work / "first").write_text("Then @second\n", encoding="utf-8")
