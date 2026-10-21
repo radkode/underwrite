@@ -526,5 +526,46 @@ class FlagAnchors(unittest.TestCase):
         self.assertIn("refuses one on a line the PR never put in front of you", text)
 
 
+class ReviewGuide(unittest.TestCase):
+    """REVIEW.md was absent from the frozen governing set, so owner review guidance never
+    reached the walk. This repository keeps one as the first consumer."""
+
+    REVIEW = Path(__file__).resolve().parent.parent / "REVIEW.md"
+
+    def skill(self):
+        return " ".join(SKILL.read_text(encoding="utf-8").split())
+
+    def test_ingest_freezes_every_review_guide_from_the_base(self):
+        self.assertIn("every `REVIEW.md` at any depth", self.skill())
+
+    def test_the_claim_check_reads_what_failure_looks_like(self):
+        text = self.skill()
+        claim = text.split("**The claim check.**")[1].split("State the frozen audience")[0]
+        self.assertIn("report a body that is silent on a failure the owners named", claim)
+        self.assertIn("distinct from a mismatch", claim)
+
+    def test_the_plan_batches_paths_the_guide_skips_and_says_so(self):
+        text = self.skill()
+        plan = text.split("## Phase 2: plan the walk")[1].split("## Phase 3")[0]
+        self.assertIn("A file whose every hunk is what the frozen `REVIEW.md` covering it calls not worth walking goes to follow-through", plan)
+        self.assertIn("the reviewer can pull it back", plan)
+
+    def test_the_guide_is_not_a_license_to_skip_rule_four(self):
+        text = self.skill()
+        self.assertIn("the paths under its directory", text)
+        self.assertIn("it is not a license to skip rule 4", text)
+
+    def test_this_repository_keeps_a_guide_with_the_three_sections(self):
+        text = self.REVIEW.read_text(encoding="utf-8")
+        for heading in (
+            "## What failure looks like here",
+            "## Paths not worth walking",
+            "## What counts as evidence",
+        ):
+            self.assertIn(heading, text)
+        readme = " ".join(README.read_text(encoding="utf-8").split())
+        self.assertIn("This repository keeps one at its root", readme)
+
+
 if __name__ == "__main__":
     unittest.main()

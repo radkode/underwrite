@@ -686,6 +686,10 @@ def _rule_path(path):
     return path.startswith(b".claude/rules/") and path.lower().endswith(b".md")
 
 
+def _review_guide_path(path):
+    return path.rsplit(b"/", 1)[-1] == b"REVIEW.md"
+
+
 def _base_tree(repo):
     tree = _git(
         ["ls-tree", "-r", "-z", "--full-tree", "refs/underwrite/base", "--"],
@@ -747,6 +751,8 @@ def _initial_context_paths(entries):
     if b"CONTRIBUTING.md" in entries:
         selected[b"CONTRIBUTING.md"] = False
     for path in entries:
+        if _review_guide_path(path):
+            selected[path] = False
         if path.rsplit(b"/", 1)[-1] in _GOVERNING_NAMES:
             selected[path] = True
         if _rule_path(path):
@@ -809,30 +815,36 @@ def _trusted_context(repo, base_sha, destination):
         for path, follows_imports in initial.items()
     ]
     loaded = {}
+    followed = set()
     total_bytes = 0
     while pending:
         path, depth, chain, follows_imports = pending.pop()
-        if path in loaded:
+        # A guide selected on its own loads without its imports; the same file reached
+        # through an instruction's import still owes its bounded chain.
+        if path in loaded and (not follows_imports or path in followed):
             continue
-        entry = entries.get(path)
-        if entry is None:
-            raise SnapshotError("trusted base instruction import is missing")
-        mode, _kind, blob_sha = entry
-        try:
-            text_path = path.decode("utf-8")
-            raw, content = _tree_text(repo, path, entry)
-        except UnicodeError as error:
-            raise SnapshotError("trusted base context must be UTF-8") from error
-        total_bytes += len(raw)
-        if len(loaded) + 1 > _MAX_TRUSTED_FILES or total_bytes > _MAX_TRUSTED_BYTES:
-            raise SnapshotError("trusted base context exceeds its safety limit")
-        loaded[path] = {
-            "blob_sha": blob_sha.decode("ascii"),
-            "content": content,
-            "mode": mode.decode("ascii"),
-            "path": text_path,
-        }
+        if path not in loaded:
+            entry = entries.get(path)
+            if entry is None:
+                raise SnapshotError("trusted base instruction import is missing")
+            mode, _kind, blob_sha = entry
+            try:
+                text_path = path.decode("utf-8")
+                raw, content = _tree_text(repo, path, entry)
+            except UnicodeError as error:
+                raise SnapshotError("trusted base context must be UTF-8") from error
+            total_bytes += len(raw)
+            if len(loaded) + 1 > _MAX_TRUSTED_FILES or total_bytes > _MAX_TRUSTED_BYTES:
+                raise SnapshotError("trusted base context exceeds its safety limit")
+            loaded[path] = {
+                "blob_sha": blob_sha.decode("ascii"),
+                "content": content,
+                "mode": mode.decode("ascii"),
+                "path": text_path,
+            }
         if follows_imports:
+            followed.add(path)
+            text_path, content = loaded[path]["path"], loaded[path]["content"]
             imports = list(_imported_paths(text_path, content))
             if imports and depth >= _MAX_IMPORT_DEPTH:
                 raise SnapshotError("trusted base instruction import exceeds max depth")
