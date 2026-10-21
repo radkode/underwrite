@@ -867,6 +867,37 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
 /* Its own line, like the key hints. Inline it competed with the note for row width,
    so an arm prompt appearing shifted every button left, out from under the cursor
    that is about to click again. */
+/* Drop asks which kind of miss it was. The chips stay quiet until one is picked, when
+   it borrows the armed-Drop removal palette so the pick and the button read as one act. */
+.acts-why { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+.why-lbl {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--ink-3);
+}
+.why {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--ink-2);
+  background: transparent;
+  border: 1px solid var(--rule);
+  border-radius: 999px;
+  padding: 4px 10px 5px;
+  cursor: pointer;
+}
+.why:hover:not(:disabled) { background: var(--sunk); }
+.why:focus-visible { outline: 2px solid var(--flag); outline-offset: 2px; }
+.why:disabled { opacity: 0.45; cursor: default; }
+.why[aria-pressed="true"] {
+  color: var(--del-ink);
+  background: var(--del-bg);
+  border-color: var(--del-ink);
+}
+.b-why { color: var(--ink-3); }
+
 .act-msg {
   flex-basis: 100%;
   min-height: 1.4em;

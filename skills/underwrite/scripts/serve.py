@@ -236,11 +236,11 @@ class Session:
 
     # ---- actions -------------------------------------------------------
 
-    def act(self, n, action, note, action_id=None, session_id=None):
+    def act(self, n, action, note, action_id=None, session_id=None, reason=None):
         """Produce one idempotent reviewer action and wake the parked walk."""
         with self.cond:
             record = self.store.produce(
-                action_id or str(uuid.uuid4()), n, action, note, session_id
+                action_id or str(uuid.uuid4()), n, action, note, session_id, reason=reason
             )
             self.store.export_json()
             self.cond.notify_all()
@@ -467,6 +467,9 @@ class Handler(BaseHTTPRequestHandler):
                 note = ""
             if not isinstance(note, str):
                 raise ValueError("note must be text")
+            reason = payload.get("reason")
+            if reason is not None and not isinstance(reason, str):
+                raise ValueError("reason must be text")
             action_id = payload.get("id")
             if not isinstance(action_id, str) or not action_id.strip():
                 raise ValueError("id must be non-empty text")
@@ -479,6 +482,7 @@ class Handler(BaseHTTPRequestHandler):
                 note.strip(),
                 action_id,
                 session_id,
+                reason=reason,
             )
         except Conflict as err:
             return self.send(409, str(err), "text/plain")
