@@ -3510,6 +3510,26 @@ class FlagAnchors(unittest.TestCase):
         ):
             self.store.put_beat(self.flag("gone.py:3", n=2))
 
+    def test_one_landing_citation_is_enough_when_where_cites_several(self):
+        self.store.put_beat(self.flag("src/a.py:11 and src/a.py:12"))
+        self.store.put_beat(self.flag("src/b.py:1, src/a.py:12", n=2))
+        with self.assertRaisesRegex(
+            session_store.StoreError, "nearest touched line is src/a.py:13"
+        ):
+            self.store.put_beat(self.flag("src/a.py:20 and src/b.py:1", n=3))
+
+    def test_navigation_cannot_introduce_a_flag_off_the_diff(self):
+        """apply is the other door a new beat comes through, and it was unguarded."""
+        action = self.store.produce("nav-1", None, "next", "")
+        session = dict(self.store.snapshot()[0], cursor=1, current_beat=1)
+        result = {"kind": "walk", "cursor": 1, "current_beat": 1, "tier": "core"}
+        with self.assertRaisesRegex(session_store.StoreError, "outside the frozen diff"):
+            self.store.apply(action["seq"], result, session, beats=[self.flag("src/a.py:20")])
+        self.assertEqual(self.store.snapshot()[1], [])
+        self.assertEqual(self.store.head()["state"], "produced")
+        self.store.apply(action["seq"], result, session, beats=[self.flag("src/a.py:11")])
+        self.assertEqual(self.store.snapshot()[1][0]["where"], "src/a.py:11")
+
     def test_a_path_with_a_space_is_tried_whole_before_being_split(self):
         self.DIFF = (
             "diff --git a/src/my file.py b/src/my file.py\n--- a/src/my file.py\n"

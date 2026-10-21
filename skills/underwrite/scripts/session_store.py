@@ -4126,6 +4126,7 @@ class SessionStore:
                         )
                 else:
                     self._validate_new_beat(beat)
+                    self._refuse_untouched_flag(normalized_session, beat)
                     beat_changed, _revision, _state, _detail = self._save_beat(db, beat)
                     changed = beat_changed or changed
             if changed:

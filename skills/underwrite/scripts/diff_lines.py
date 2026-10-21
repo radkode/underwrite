@@ -128,26 +128,35 @@ def resolve_path(candidate, paths):
 def untouched_anchor(where, files):
     """Why a flag's `where` does not land inside the diff, or None when it does.
 
-    The first `path:line` is the anchor, tried on the whole string first so a path
-    with a space in it is not shattered. The number reads as the head does, or as the
+    Every `path:line` in the prose is a citation, and one that lands is enough. The
+    whole string is tried first so a path with a space in it is not shattered, but only
+    counts when it resolves to a diff path; otherwise the citations are read token by
+    token, the way the page links them. The number reads as the head does, or as the
     base did for a line the PR removed; context lines count. The question is whether
     the PR put this line in front of the reviewer, not whether it added it.
     """
-    text = str(where or "")
-    cited = LOCATION_LINE.match(text.strip().rstrip(",;+·"))
-    for token in () if cited else text.split(" "):
-        cited = LOCATION_LINE.match(token.rstrip(",;+·"))
-        if cited:
-            break
-    if not cited:
+    paths = sorted(files)
+    text = str(where or "").strip()
+    whole = LOCATION_LINE.match(text.rstrip(",;+\u00b7"))
+    if whole and resolve_path(whole["path"], paths):
+        citations = [whole]
+    else:
+        citations = [
+            cited
+            for cited in (LOCATION_LINE.match(t.rstrip(",;+\u00b7")) for t in text.split(" "))
+            if cited
+        ]
+    if not citations:
         return "flag needs a path:line anchor inside the frozen diff"
-    candidate, line = cited["path"], int(cited["line"])
-    path = resolve_path(candidate, sorted(files))
+    for cited in citations:
+        path = resolve_path(cited["path"], paths)
+        if path is not None and int(cited["line"]) in files[path]["LEFT"] | files[path]["RIGHT"]:
+            return None
+    candidate, line = citations[0]["path"], int(citations[0]["line"])
+    path = resolve_path(candidate, paths)
     if path is None:
         return f"flag names {candidate}, which the frozen diff does not touch"
     touched = files[path]["LEFT"] | files[path]["RIGHT"]
-    if line in touched:
-        return None
     if not touched:
         return f"flag names {path}, which the frozen diff touches with no lines"
     nearest = min(touched, key=lambda v: (abs(v - line), v))
