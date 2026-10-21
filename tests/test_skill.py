@@ -506,5 +506,25 @@ class DropReasons(unittest.TestCase):
         self.assertIn("wrong, intentional, not worth it or pre-existing", text)
 
 
+class FlagAnchors(unittest.TestCase):
+    """Rule 4 said no pre-existing flags and nothing checked; now the store does, and
+    the FIX names the class when one fix applies in several places."""
+
+    def test_rule_four_names_the_store_check_and_the_nearest_line(self):
+        text = " ".join(SKILL.read_text(encoding="utf-8").split())
+        rule = text.split("**4. One flag per beat")[1].split("**5.")[0]
+        self.assertIn("inside the frozen diff's hunks, numbered as the head reads", rule)
+        self.assertIn("context lines included", rule)
+        self.assertIn("refused with the nearest touched line named", rule)
+
+    def test_a_fix_that_applies_in_several_places_names_the_count(self):
+        text = " ".join(SKILL.read_text(encoding="utf-8").split())
+        self.assertIn("`FIX` states the count and one example", text)
+
+    def test_the_readme_says_a_flag_lands_on_a_touched_line(self):
+        text = " ".join(README.read_text(encoding="utf-8").split())
+        self.assertIn("refuses one on a line the PR never put in front of you", text)
+
+
 if __name__ == "__main__":
     unittest.main()

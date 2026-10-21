@@ -318,7 +318,11 @@ class TargetCommands(SessionCtlCase):
         diff = self.root / "captured.diff"
         metadata = self.root / "captured.json"
         trusted_context = self.root / "trusted-context-input.json"
-        diff.write_text("diff\n", encoding="utf-8")
+        # a hunk on a.py:1, where FLAG anchors
+        diff.write_text(
+            "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-was\n+now\n",
+            encoding="utf-8",
+        )
         metadata.write_text(json.dumps(self.metadata), encoding="utf-8")
         trusted_context.write_text(
             json.dumps(

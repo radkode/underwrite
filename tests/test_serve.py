@@ -53,7 +53,8 @@ CLEAN = {
     "n": 2, "tier": "core", "state": "clean", "proof_kind": "ran", "claim": "load-bearing", "where": "b.py:1",
     "slots": {"what": "x", "proof": "b.py:1"},
 }
-FROZEN_DIFF = b"diff\n"
+# a hunk on a.py:1, where FLAG anchors
+FROZEN_DIFF = b"diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-was\n+now\n"
 REPORT_TARGET = {
     "version": 1,
     "kind": "github_pr",

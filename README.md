@@ -67,6 +67,9 @@ PRIOR  #2 pinned break-check to 0.6.0 citing this exact failure mode
 FIX    npx --yes @arethetypeswrong/cli@0.18.5
 ```
 
+A flag in a PR session has to land on a line the diff touches: the store refuses one on a
+line the PR never put in front of you, naming the nearest touched line. That holds a flag
+to the change without proving the change caused what it flags.
 `PROOF` names a command run under the session's execution policy, or a file that was read.
 `inferred` is a legal value. A claim with neither does not ship. The beat says which it
 was: `CLEAN` is reserved for a command whose output would have differed were the claim

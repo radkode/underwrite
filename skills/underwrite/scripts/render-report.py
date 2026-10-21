@@ -30,6 +30,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
+from diff_lines import LOCATION_LINE, resolve_path  # noqa: E402
 from session_store import (
     AUDIENCE_MODES,
     BEAT_SLOTS as SLOTS,
@@ -801,7 +802,6 @@ def delivery_html(beat, mode, replacement=False, untrusted_pr=False):
     )
 
 
-LOCATION_LINE = re.compile(r"^(?P<path>.+?):(?P<line>\d+)(?:[-,]\d+)*$")
 # owner/name as GitHub spells it. A dot-led segment is one a browser resolves away.
 PULL_REPO = re.compile(r"(?!\.)[A-Za-z0-9_.-]+/(?!\.)[A-Za-z0-9_.-]+")
 FULL_SHA = re.compile(r"[0-9a-f]{40}")
@@ -825,19 +825,6 @@ def changed_paths(root, session):
     if not stored(root):
         return ()
     return tuple(SessionStore(root).changed_paths())
-
-
-def resolve_path(candidate, paths):
-    """Resolve a cited location against the frozen diff, exactly or by unique suffix.
-
-    A beat cites `scopes.test.ts` for a path three directories deep, so the suffix leg
-    earns its keep; an ambiguous suffix resolves to nothing rather than to a guess.
-    """
-    if not candidate or candidate in paths:
-        return candidate or None
-    tail = "/" + candidate
-    found = [path for path in paths if path.endswith(tail)]
-    return found[0] if len(found) == 1 else None
 
 
 def where_html(where, paths, target):
