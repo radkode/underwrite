@@ -686,6 +686,10 @@ def _rule_path(path):
     return path.startswith(b".claude/rules/") and path.lower().endswith(b".md")
 
 
+def _review_guide_path(path):
+    return path.rsplit(b"/", 1)[-1] == b"REVIEW.md"
+
+
 def _base_tree(repo):
     tree = _git(
         ["ls-tree", "-r", "-z", "--full-tree", "refs/underwrite/base", "--"],
@@ -747,6 +751,8 @@ def _initial_context_paths(entries):
     if b"CONTRIBUTING.md" in entries:
         selected[b"CONTRIBUTING.md"] = False
     for path in entries:
+        if _review_guide_path(path):
+            selected[path] = False
         if path.rsplit(b"/", 1)[-1] in _GOVERNING_NAMES:
             selected[path] = True
         if _rule_path(path):
