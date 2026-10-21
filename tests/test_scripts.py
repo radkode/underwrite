@@ -1227,6 +1227,12 @@ class DroppedRendering(unittest.TestCase):
         self.assertNotIn("Dropped as", page)
         self.assertNotIn("b-why", rr.beat_html(beat(state="dropped", call="no"), [], False))
 
+    def test_picking_a_reason_disarms_an_armed_drop(self):
+        """A chip is another button, so it answers no to an armed Drop; otherwise the
+        second click would send a reason the confirmation never asked about."""
+        page = rr.render({"repo": "r", "audience": {"mode": "branch"}}, [beat()], "", {}, live=True)
+        self.assertIn("function pick(button) {\n    disarm();", page)
+
     def test_a_reason_on_a_beat_that_is_not_dropped_is_ignored(self):
         page = rr.beat_html(beat(state="accepted", call="yes", reason="wrong"), [], True)
         self.assertIn("Your call · item 1", page)

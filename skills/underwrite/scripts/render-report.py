@@ -236,12 +236,14 @@ LIVE_JS = """<script>
     });
   }
 
-  // One reason per row, radio-style, and picking one sends nothing: Drop still asks twice.
+  // One reason per row, radio-style, and picking one sends nothing: Drop still asks twice,
+  // and a pick after arming is another button, so it answers no like any other.
   const reasonOf = row => {
     const picked = row.querySelector('.why[aria-pressed="true"]');
     return picked ? picked.dataset.reason : '';
   };
   function pick(button) {
+    disarm();
     const row = button.closest('.acts');
     const on = button.getAttribute('aria-pressed') !== 'true';
     row.querySelectorAll('.why').forEach(b => b.setAttribute('aria-pressed', 'false'));
