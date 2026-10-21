@@ -1010,8 +1010,8 @@ class AttestedImplementationCase(unittest.TestCase):
         question is which beat is spoken for."""
         self.source.put_beat({
             "n": 2, "tier": "core", "state": "flag", "proof_kind": "read", "claim": "second",
-            "where": "b.py:2",
-            "slots": {"what": "y", "proof": "b.py:2", "risk": "r", "fix": "do it"},
+            "where": "app.py:1",
+            "slots": {"what": "y", "proof": "app.py:1", "risk": "r", "fix": "do it"},
         })
         second = self.source.produce("accept-2", 2, "accept", "include it too")
         self.source.ack(second["seq"])

@@ -11,10 +11,17 @@ import secrets
 import shutil
 import sqlite3
 import stat
+import sys
 import tempfile
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+HERE = str(Path(__file__).resolve().parent)
+if HERE not in sys.path:
+    sys.path.insert(0, HERE)
+
+from diff_lines import parse_diff, untouched_anchor  # noqa: E402
 
 
 DB_SCHEMA_VERSION = 7
@@ -3421,14 +3428,31 @@ class SessionStore:
                 target = session.get("target")
                 if target is None:
                     raise Conflict("session has no frozen target")
-            try:
-                data = (self.root / "pr.diff").read_bytes()
-            except FileNotFoundError as error:
-                raise Conflict("frozen target projection pr.diff is missing") from error
-            digest = hashlib.sha256(data).hexdigest()
-            if len(data) != target["diff_bytes"] or digest != target["diff_sha256"]:
-                raise Conflict("frozen target projection pr.diff does not match")
-            return target, data
+            return target, self._verified_diff_bytes(target)
+
+    def _verified_diff_bytes(self, target):
+        try:
+            data = (self.root / "pr.diff").read_bytes()
+        except FileNotFoundError as error:
+            raise Conflict("frozen target projection pr.diff is missing") from error
+        digest = hashlib.sha256(data).hexdigest()
+        if len(data) != target["diff_bytes"] or digest != target["diff_sha256"]:
+            raise Conflict("frozen target projection pr.diff does not match")
+        return data
+
+    def _refuse_untouched_flag(self, session, beat):
+        """Rule 4's last clause, enforced: a PR flag lands on a line the diff touches.
+
+        Only a frozen target has a diff to check against; a branch walk's diff is
+        whatever the agent ran, so it is held to the rule by prose alone.
+        """
+        target = session.get("target")
+        if beat.get("state") != "flag" or not isinstance(target, dict):
+            return
+        files = parse_diff(self._verified_diff_bytes(target).decode("utf-8", "replace"))
+        problem = untouched_anchor(beat.get("where"), files)
+        if problem:
+            raise StoreError(f"beat {beat['n']}: {problem}")
 
     def changed_paths(self):
         """The paths the frozen diff touches, read only after its digest verifies.
@@ -3586,6 +3610,7 @@ class SessionStore:
                             raise StoreError(f"beat {beat['n']} slots must be an object")
                         slots["fix"] = current_slots["fix"]
                 self._hold_authorized_finding(db, beat, current)
+            self._refuse_untouched_flag(session, beat)
             changed, _revision, _state, _detail = self._save_beat(db, beat)
             if changed:
                 self._bump_render(db)
@@ -4101,6 +4126,7 @@ class SessionStore:
                         )
                 else:
                     self._validate_new_beat(beat)
+                    self._refuse_untouched_flag(normalized_session, beat)
                     beat_changed, _revision, _state, _detail = self._save_beat(db, beat)
                     changed = beat_changed or changed
             if changed:

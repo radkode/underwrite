@@ -473,10 +473,17 @@ class FrozenTargets(unittest.TestCase):
             "changed_files": 1,
         }
 
+    def diff_text(self, suffix="1"):
+        """A real hunk on a.py:1, where FLAG anchors; the suffix keeps two captures apart."""
+        return (
+            "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n"
+            f"@@ -1 +1 @@\n-was\n+capture {suffix}\n"
+        )
+
     def inputs(self, suffix="1"):
         diff = self.root / f"capture-{suffix}.diff"
         metadata = self.root / f"capture-{suffix}.json"
-        diff.write_bytes(f"diff {suffix}\n".encode())
+        diff.write_bytes(self.diff_text(suffix).encode())
         metadata.write_text(json.dumps({"capture": suffix}), encoding="utf-8")
         return diff, metadata
 
@@ -521,7 +528,7 @@ class FrozenTargets(unittest.TestCase):
 
         self.assertEqual(self.store.snapshot()[0]["target"], target)
         self.assertEqual(self.store.verify_target_files(), target)
-        self.assertEqual((self.root / "pr.diff").read_bytes(), b"diff 1\n")
+        self.assertEqual((self.root / "pr.diff").read_bytes(), self.diff_text().encode())
         self.assertEqual(json.loads((self.root / "pr.json").read_text()), {"capture": "1"})
 
     def test_generic_mutations_cannot_add_remove_or_change_a_target(self):
@@ -1535,7 +1542,7 @@ class FrozenTargets(unittest.TestCase):
         (self.root / "pr.diff").write_bytes(b"changed\n")
 
         self.assertEqual(read_target, target)
-        self.assertEqual(data, b"diff 1\n")
+        self.assertEqual(data, self.diff_text().encode())
         with self.assertRaisesRegex(session_store.Conflict, "does not match"):
             self.store.read_verified_target_diff()
 
@@ -1604,7 +1611,7 @@ class FrozenTargets(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(len(errors), 1)
         frozen = self.store.verify_target_files()
-        expected = b"diff 1\n" if frozen["base_sha"] == "a" * 40 else b"diff 2\n"
+        expected = self.diff_text("1" if frozen["base_sha"] == "a" * 40 else "2").encode()
         self.assertEqual((self.root / "pr.diff").read_bytes(), expected)
 
     def test_target_publication_serializes_with_the_first_beat(self):
@@ -3441,6 +3448,139 @@ class Dropping(StoreCase):
             self.store.put_beat({**FLAG, "n": 9, "reason": "wrong"})
 
 
+class FlagAnchors(unittest.TestCase):
+    """Rule 4 forbids flagging what the PR did not touch; the store now checks the
+    anchor against the frozen diff instead of trusting the prose."""
+
+    DIFF = (
+        "diff --git a/src/a.py b/src/a.py\n"
+        "--- a/src/a.py\n"
+        "+++ b/src/a.py\n"
+        "@@ -10,3 +10,4 @@\n"
+        " ctx10\n"
+        "-old11\n"
+        "+new11\n"
+        "+new12\n"
+        " ctx13\n"
+    )
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.store = session_store.SessionStore(self.root, create=True)
+        diff, metadata = self.root / "capture.diff", self.root / "capture.json"
+        diff.write_text(self.DIFF, encoding="utf-8")
+        metadata.write_text("{}", encoding="utf-8")
+        self.store.freeze_target(FrozenTargets.target(self), diff, metadata)
+
+    def flag(self, where, **kw):
+        beat = {**FLAG, "where": where, "slots": {**FLAG["slots"], "proof": where}}
+        beat.update(kw)
+        return beat
+
+    def test_a_flag_on_an_added_line_lands(self):
+        self.store.put_beat(self.flag("src/a.py:11"))
+        self.assertEqual(self.store.snapshot()[1][0]["where"], "src/a.py:11")
+
+    def test_context_lines_count_as_touched(self):
+        self.store.put_beat(self.flag("src/a.py:10"))
+        self.store.put_beat(self.flag("src/a.py:13", n=2))
+        self.assertEqual(len(self.store.snapshot()[1]), 2)
+
+    def test_a_removed_line_is_cited_in_the_base_numbering(self):
+        """A pure deletion touches base lines 50 to 52 and no head line near them; the
+        flag that says "you removed this" still has somewhere to land."""
+        self.DIFF = self.DIFF + "@@ -50,3 +49,0 @@\n-a\n-b\n-c\n"
+        self.setUp()
+        self.store.put_beat(self.flag("src/a.py:52"))
+        with self.assertRaisesRegex(
+            session_store.StoreError, "nearest touched line is src/a.py:52"
+        ):
+            self.store.put_beat(self.flag("src/a.py:60", n=2))
+
+    def test_a_deleted_file_anchors_in_the_base_numbering(self):
+        self.DIFF = (
+            "diff --git a/gone.py b/gone.py\n--- a/gone.py\n+++ /dev/null\n"
+            "@@ -1,2 +0,0 @@\n-x\n-y\n"
+        )
+        self.setUp()
+        self.store.put_beat(self.flag("gone.py:2"))
+        with self.assertRaisesRegex(
+            session_store.StoreError, "nearest touched line is gone.py:2"
+        ):
+            self.store.put_beat(self.flag("gone.py:3", n=2))
+
+    def test_one_landing_citation_is_enough_when_where_cites_several(self):
+        self.store.put_beat(self.flag("src/a.py:11 and src/a.py:12"))
+        self.store.put_beat(self.flag("src/b.py:1, src/a.py:12", n=2))
+        with self.assertRaisesRegex(
+            session_store.StoreError, "nearest touched line is src/a.py:13"
+        ):
+            self.store.put_beat(self.flag("src/a.py:20 and src/b.py:1", n=3))
+
+    def test_navigation_cannot_introduce_a_flag_off_the_diff(self):
+        """apply is the other door a new beat comes through, and it was unguarded."""
+        action = self.store.produce("nav-1", None, "next", "")
+        session = dict(self.store.snapshot()[0], cursor=1, current_beat=1)
+        result = {"kind": "walk", "cursor": 1, "current_beat": 1, "tier": "core"}
+        with self.assertRaisesRegex(session_store.StoreError, "outside the frozen diff"):
+            self.store.apply(action["seq"], result, session, beats=[self.flag("src/a.py:20")])
+        self.assertEqual(self.store.snapshot()[1], [])
+        self.assertEqual(self.store.head()["state"], "produced")
+        self.store.apply(action["seq"], result, session, beats=[self.flag("src/a.py:11")])
+        self.assertEqual(self.store.snapshot()[1][0]["where"], "src/a.py:11")
+
+    def test_a_path_with_a_space_is_tried_whole_before_being_split(self):
+        self.DIFF = (
+            "diff --git a/src/my file.py b/src/my file.py\n--- a/src/my file.py\n"
+            "+++ b/src/my file.py\n@@ -1 +1 @@\n-x\n+y\n"
+        )
+        self.setUp()
+        self.store.put_beat(self.flag("src/my file.py:1"))
+
+    def test_a_unique_suffix_resolves_and_prose_after_the_anchor_is_fine(self):
+        self.store.put_beat(self.flag("a.py:12 and its caller"))
+
+    def test_a_flag_on_an_untouched_line_is_refused_with_the_nearest_named(self):
+        with self.assertRaisesRegex(
+            session_store.StoreError,
+            r"beat 1: flag at src/a.py:20 is outside the frozen diff; "
+            r"nearest touched line is src/a.py:13",
+        ):
+            self.store.put_beat(self.flag("src/a.py:20"))
+        self.assertEqual(self.store.snapshot()[1], [])
+
+    def test_a_flag_on_an_untouched_file_is_refused(self):
+        with self.assertRaisesRegex(
+            session_store.StoreError, "flag names src/b.py, which the frozen diff does not touch"
+        ):
+            self.store.put_beat(self.flag("src/b.py:1"))
+
+    def test_a_flag_with_no_anchor_is_refused(self):
+        with self.assertRaisesRegex(
+            session_store.StoreError, "flag needs a path:line anchor inside the frozen diff"
+        ):
+            self.store.put_beat(self.flag("somewhere in the handler"))
+
+    def test_clean_and_unverified_beats_are_not_anchored(self):
+        self.store.put_beat({**CLEAN, "n": 1, "where": "src/a.py:40"})
+        self.store.put_beat({**CLEAN, "n": 2, "state": "unverified", "proof_kind": "read",
+                             "where": "src/zzz.py:1"})
+        self.assertEqual(len(self.store.snapshot()[1]), 2)
+
+    def test_moving_an_open_flag_off_the_diff_is_refused(self):
+        self.store.put_beat(self.flag("src/a.py:11"))
+        with self.assertRaisesRegex(session_store.StoreError, "outside the frozen diff"):
+            self.store.put_beat(self.flag("src/a.py:20"))
+        self.assertEqual(self.store.snapshot()[1][0]["where"], "src/a.py:11")
+
+
+class FlagAnchorsWithoutATarget(StoreCase):
+    def test_a_branch_walk_has_no_frozen_diff_to_check(self):
+        self.store.put_beat({**FLAG, "n": 3, "where": "nowhere.py:999"})
+        self.assertEqual(self.beat(3)["where"], "nowhere.py:999")
+
+
 class LinkedImplementations(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
@@ -3466,7 +3606,9 @@ class LinkedImplementations(unittest.TestCase):
         metadata = self.root / "pr.json"
         context = self.root / "trusted-context.json"
         bundle = self.root / "pr.bundle"
-        diff.write_bytes(b"diff --git a/a.py b/a.py\n")
+        diff.write_bytes(
+            b"diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-was\n+now\n"
+        )
         metadata.write_text('{"number":17}\n', encoding="utf-8")
         context.write_text(
             json.dumps(

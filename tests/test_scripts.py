@@ -1845,7 +1845,10 @@ class RenderCli(unittest.TestCase):
         (self.root / "beats" / ("%02d.json" % b["n"])).write_text(
             json.dumps(b), encoding="utf-8")
 
-    def frozen_store(self, state="closed", merged_at=None, diff="diff\n"):
+    # a hunk on a.ts:1, where the flag fixtures anchor
+    FROZEN_DIFF = "diff --git a/a.ts b/a.ts\n--- a/a.ts\n+++ b/a.ts\n@@ -1 +1 @@\n-was\n+now\n"
+
+    def frozen_store(self, state="closed", merged_at=None, diff=FROZEN_DIFF):
         (self.root / "session.json").unlink()
         source = self.root / "capture.diff"
         metadata = self.root / "capture.json"
