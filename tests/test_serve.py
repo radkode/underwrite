@@ -146,7 +146,7 @@ class ResolvingAFlag(SessionTest):
     def test_a_flag_resolves_only_once(self):
         self.session.act(1, "accept", "")
         with self.assertRaises(ValueError):
-            self.session.act(1, "drop", "")
+            self.session.act(1, "drop", "no", reason="wrong")
         self.assertEqual(self.beat(1)["state"], "accepted")
         self.assertEqual(self.session.seq, 1)
         self.assertEqual(len(self.decisions()), 1)
@@ -189,7 +189,7 @@ class Deciding(SessionTest):
         self.assertEqual(self.beat(1)["call"], "yes")
 
     def test_it_cannot_reopen_what_the_reviewer_dropped(self):
-        self.session.act(1, "drop", "no")
+        self.session.act(1, "drop", "no", reason="wrong")
         with self.assertRaises(ValueError):
             self.session.act(1, "decide", "actually yes")
         self.assertEqual(self.beat(1)["state"], "dropped")
@@ -215,7 +215,9 @@ class Concurrency(SessionTest):
         def go(action, i):
             ready.wait()
             try:
-                results[i] = self.session.act(1, action, "")
+                results[i] = self.session.act(
+                    1, action, "words", reason="wrong" if action == "drop" else None
+                )
             except ValueError as err:
                 results[i] = err
 
@@ -857,12 +859,40 @@ class Requests(Served):
         self.assertIn("names a different action", body)
 
     def test_resolving_an_already_resolved_beat_answers_409(self):
-        self.assertEqual(self.post("/act", {"n": 1, "action": "drop"})[0], 200)
+        self.assertEqual(self.post("/act", {"n": 1, "action": "drop", "note": "no", "reason": "wrong"})[0], 200)
 
         status, body = self.post("/act", {"n": 1, "action": "accept"})
 
         self.assertEqual(status, 409)
         self.assertIn("cannot become accepted", body)
+
+    def test_a_drop_without_a_reason_answers_400_naming_the_four(self):
+        status, body = self.post("/act", {"n": 1, "action": "drop", "note": "no"})
+        self.assertEqual(status, 400)
+        self.assertIn("wrong, intentional, not-worth-it, pre-existing", body)
+        self.assertEqual(self.beat(1)["state"], "flag")
+
+    def test_a_drop_without_words_answers_400(self):
+        status, body = self.post("/act", {"n": 1, "action": "drop", "reason": "wrong"})
+        self.assertEqual(status, 400)
+        self.assertIn("say why in your words", body)
+
+    def test_a_reason_that_is_not_text_answers_400(self):
+        status, body = self.post(
+            "/act", {"n": 1, "action": "drop", "note": "no", "reason": 3}
+        )
+        self.assertEqual(status, 400)
+        self.assertIn("reason must be text", body)
+
+    def test_a_drop_carries_its_reason_to_the_beat_and_the_page(self):
+        status, _ = self.post(
+            "/act",
+            {"n": 1, "action": "drop", "note": "predates the PR", "reason": "pre-existing"},
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(self.beat(1)["state"], "dropped")
+        self.assertEqual(self.beat(1)["reason"], "pre-existing")
+        self.assertIn("Dropped as pre-existing · item 1", self.get("/fragment")[1])
 
     def test_a_beat_number_that_is_not_a_number_answers_400(self):
         for value in ("abc", True, 1.5, [], {}):
@@ -906,6 +936,14 @@ class Requests(Served):
         status, page = self.get("/")
         self.assertEqual(status, 200)
         self.assertIn('data-action="accept">Implement</button>', page)
+
+    def test_the_live_page_asks_why_beside_drop(self):
+        status, page = self.get("/")
+        self.assertEqual(status, 200)
+        row = page.split('data-acts="1"')[1].split('<span class="acts-else">')[0]
+        self.assertIn('data-action="drop">Drop</button></span><span class="acts-why"', row)
+        for reason in ("wrong", "intentional", "not-worth-it", "pre-existing"):
+            self.assertIn(f'data-reason="{reason}"', row)
 
     def test_the_live_page_offers_the_explicit_decision_action(self):
         self.session.store.put_beat({**FLAG, "resolution_kind": "decision"})
@@ -1454,7 +1492,7 @@ class Fragment(Served):
         self.session.store.patch_session({"recommendation": "Pin the dependency before merging."})
         self.assertIn("Pin the dependency before merging.", self.get("/fragment")[1])
         self.assertIn("1 decision owed", self.get("/fragment")[1])
-        self.post("/act", {"n": 1, "action": "drop"})
+        self.post("/act", {"n": 1, "action": "drop", "note": "no", "reason": "wrong"})
         self.assertIn("0 decisions owed", self.get("/fragment")[1])
 
     def test_full_page_and_fragment_qualify_session_validation_errors(self):

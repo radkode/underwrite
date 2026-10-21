@@ -485,6 +485,20 @@ class TheWalk(unittest.TestCase):
         self.assertRegex(row, r'^[^>]*>\s*<input class="note"')
         self.assertRegex(row, r'<button class="act" data-action="next">Next item</button></span>\s*<span class="act-msg"')
 
+    def test_drop_asks_which_kind_of_miss_it_was(self):
+        open_flag = beat(n=4, state="flag",
+                         slots={"what": "x", "proof": "d.ts:4", "risk": "r", "fix": "f"})
+        html = self.live(self.beats() + [open_flag])
+        row = html.split('id="stage"')[1].split('<div class="acts"')[1].split("</div>")[0]
+        why = row.split('<span class="acts-why"')[1].split('<span class="acts-else">')[0]
+        self.assertIn('<span class="why-lbl">drop as</span>', why)
+        for key, label in (("wrong", "wrong"), ("intentional", "intentional"),
+                           ("not-worth-it", "not worth it"), ("pre-existing", "pre-existing")):
+            self.assertIn(f'data-reason="{key}" aria-pressed="false">{label}</button>', why)
+        # a chip is a pick, not a send: it is never an action button
+        self.assertNotIn('class="act"', why)
+        self.assertNotIn("acts-why", rr.beat_html(beat(), [], True, live=True))
+
     def test_the_decision_buttons_are_grouped_apart_from_note_and_next(self):
         open_flag = beat(n=4, state="flag",
                          slots={"what": "x", "proof": "d.ts:4", "risk": "r", "fix": "f"})
@@ -1193,6 +1207,35 @@ class ReviewRecommendation(unittest.TestCase):
         for tag in ("<img", "<script>", "<svg"):
             self.assertNotIn(tag, page)
         self.assertIn("&lt;img", page)
+
+
+class DroppedRendering(unittest.TestCase):
+    """A dropped beat says which kind of miss it was, open and folded; a beat dropped
+    before the field existed keeps reading as the reviewer's call."""
+
+    def test_the_reason_is_spelled_out_open_and_folded(self):
+        dropped = beat(state="dropped", call="the PR did not add this", reason="pre-existing")
+        self.assertIn("Dropped as pre-existing · item 1", rr.beat_html(dropped, [], True))
+        folded = rr.beat_html(dropped, [], False)
+        self.assertIn('<span class="b-why">· pre-existing</span>', folded)
+        self.assertIn("not worth it", rr.beat_html(
+            beat(state="dropped", call="x", reason="not-worth-it"), [], True))
+
+    def test_a_legacy_drop_without_a_reason_stays_the_reviewers_call(self):
+        page = rr.beat_html(beat(state="dropped", call="no"), [], True)
+        self.assertIn("Your call · item 1", page)
+        self.assertNotIn("Dropped as", page)
+        self.assertNotIn("b-why", rr.beat_html(beat(state="dropped", call="no"), [], False))
+
+    def test_picking_a_reason_disarms_an_armed_drop(self):
+        """A chip is another button, so it answers no to an armed Drop; otherwise the
+        second click would send a reason the confirmation never asked about."""
+        page = rr.render({"repo": "r", "audience": {"mode": "branch"}}, [beat()], "", {}, live=True)
+        self.assertIn("function pick(button) {\n    disarm();", page)
+
+    def test_a_reason_on_a_beat_that_is_not_dropped_is_ignored(self):
+        page = rr.beat_html(beat(state="accepted", call="yes", reason="wrong"), [], True)
+        self.assertIn("Your call · item 1", page)
 
 
 class QuestionRendering(unittest.TestCase):

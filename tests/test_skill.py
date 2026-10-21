@@ -472,5 +472,39 @@ class FrozenSnapshotContract(unittest.TestCase):
         self.assertIn("posted but stale", rule)
 
 
+class DropReasons(unittest.TestCase):
+    """The article's noise measure sorts findings by how the author answered. A drop
+    with no kind cannot be counted, so the skill, the store appendix and the README
+    all name the same four."""
+
+    FOUR = ("`wrong`", "`intentional`", "`not-worth-it`", "`pre-existing`")
+
+    def test_resolving_a_flag_names_the_four_reasons_and_their_meanings(self):
+        text = " ".join(SKILL.read_text(encoding="utf-8").split())
+        rule = text.split("Drop asks for two things")[1].split("An answer in words")[0]
+        for reason in self.FOUR:
+            self.assertIn(reason, rule)
+        self.assertIn("the PR did not introduce it", rule)
+        self.assertIn("refuses a drop without both", rule)
+        self.assertIn("ask which one when their words do not say", rule)
+
+    def test_the_terminal_path_carries_the_reason_beside_the_note(self):
+        text = " ".join(SKILL.read_text(encoding="utf-8").split())
+        self.assertIn('a drop carries `"reason"` beside its note', text)
+        self.assertIn("is a drop whose words name its reason", text)
+
+    def test_the_store_appendix_records_reason_as_a_new_field_only(self):
+        text = " ".join(SKILL.read_text(encoding="utf-8").split())
+        appendix = text.split("`state` is one of `clean`")[1]
+        for reason in self.FOUR:
+            self.assertIn(reason, appendix)
+        self.assertIn("a beat dropped before the field existed has none", appendix)
+
+    def test_the_readme_says_drop_asks_why(self):
+        text = " ".join(README.read_text(encoding="utf-8").split())
+        self.assertIn("Drop also asks which kind of miss it was", text)
+        self.assertIn("wrong, intentional, not worth it or pre-existing", text)
+
+
 if __name__ == "__main__":
     unittest.main()

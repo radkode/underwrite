@@ -180,6 +180,9 @@ and drop out of an open flag only, and refuses to re-decide a beat that carries 
 So Implement, Include, Record decision and Drop all arm on the first click and send on the
 second, with the prompt naming which beat. Anything else answers no, including three
 seconds of nothing. Save note and Next item go straight through.
+Drop also asks which kind of miss it was, wrong, intentional, not worth it or pre-existing,
+as a chip beside the button and in your own words, so a later session can count what the
+walk got wrong.
 
 Decisions happen there too. Review mode uses Include in review and Drop. Report mode uses
 Include in report and Drop. Local branch and working-tree sessions retain Implement. A

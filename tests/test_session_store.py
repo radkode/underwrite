@@ -2943,7 +2943,9 @@ class ProducingAndApplying(StoreCase):
         def resolve(store, action):
             ready.wait()
             try:
-                results.append(store.produce(action, 1, action, ""))
+                results.append(store.produce(
+                    action, 1, action, "words", reason="wrong" if action == "drop" else None
+                ))
             except session_store.Conflict as error:
                 results.append(error)
 
@@ -3393,6 +3395,50 @@ class RecoveringAndDelivering(StoreCase):
             (self.root / "session.json").read_text(encoding="utf-8")
         )
         self.assertEqual(exported["title"], "new")
+
+
+class Dropping(StoreCase):
+    """A drop says which kind of miss it was, in the reviewer's words and in a fixed set,
+    so a later session can count what the walk got wrong."""
+
+    def test_a_drop_without_words_is_refused(self):
+        with self.assertRaisesRegex(session_store.StoreError, "drop requires a non-empty note"):
+            self.store.produce("click-1", 1, "drop", "", reason="wrong")
+        self.assertEqual(self.beat(1)["state"], "flag")
+        self.assertIsNone(self.store.head())
+
+    def test_a_drop_without_a_reason_names_the_four(self):
+        with self.assertRaisesRegex(
+            session_store.StoreError, "wrong, intentional, not-worth-it, pre-existing"
+        ):
+            self.store.produce("click-1", 1, "drop", "no")
+        with self.assertRaisesRegex(session_store.StoreError, "one of"):
+            self.store.produce("click-1", 1, "drop", "no", reason="meh")
+        self.assertEqual(self.beat(1)["state"], "flag")
+
+    def test_a_drop_records_its_reason_on_the_beat_and_the_receipt(self):
+        action = self.store.produce(
+            "click-1", 1, "drop", "the PR did not add this", reason="pre-existing"
+        )
+        self.assertEqual(self.beat(1)["state"], "dropped")
+        self.assertEqual(self.beat(1)["reason"], "pre-existing")
+        self.assertEqual(self.beat(1)["call"], "the PR did not add this")
+        self.assertEqual(action["result"]["reason"], "pre-existing")
+
+    def test_a_retry_with_another_reason_is_a_different_action(self):
+        first = self.store.produce("click-1", 1, "drop", "no", reason="wrong")
+        self.assertEqual(self.store.produce("click-1", 1, "drop", "no", reason="wrong"), first)
+        with self.assertRaises(session_store.Conflict):
+            self.store.produce("click-1", 1, "drop", "no", reason="intentional")
+
+    def test_a_reason_belongs_to_drop_only(self):
+        with self.assertRaisesRegex(session_store.StoreError, "drop only"):
+            self.store.produce("click-1", 1, "accept", "yes", reason="wrong")
+        self.assertEqual(self.beat(1)["state"], "flag")
+
+    def test_a_beat_cannot_write_its_own_reason(self):
+        with self.assertRaisesRegex(session_store.StoreError, "store-owned field reason"):
+            self.store.put_beat({**FLAG, "n": 9, "reason": "wrong"})
 
 
 class LinkedImplementations(unittest.TestCase):

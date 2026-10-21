@@ -64,6 +64,15 @@ SECTIONS = (
 ACCEPTED_TOKEN = {"branch": "IMPLEMENTED", "review": "INCLUDED", "report": "INCLUDED"}
 
 
+# How the page spells a dropped beat's reason; the store keeps the key.
+REASON_LABEL = {
+    "wrong": "wrong",
+    "intentional": "intentional",
+    "not-worth-it": "not worth it",
+    "pre-existing": "pre-existing",
+}
+
+
 def state_token(state, mode, landed=True):
     suffix, token = STATE_STYLE.get(state, ("unver", "UNVERIFIED"))
     if state != "accepted":
@@ -219,7 +228,27 @@ LIVE_JS = """<script>
       const note = row.querySelector('.note');
       const saved = notes[row.dataset.acts];
       if (note && !note.value && saved) note.value = saved;
+      const why = notes[row.dataset.acts + '/why'];
+      if (why && !reasonOf(row)) {
+        const chip = row.querySelector(`.why[data-reason="${why}"]`);
+        if (chip) chip.setAttribute('aria-pressed', 'true');
+      }
     });
+  }
+
+  // One reason per row, radio-style, and picking one sends nothing: Drop still asks twice,
+  // and a pick after arming is another button, so it answers no like any other.
+  const reasonOf = row => {
+    const picked = row.querySelector('.why[aria-pressed="true"]');
+    return picked ? picked.dataset.reason : '';
+  };
+  function pick(button) {
+    disarm();
+    const row = button.closest('.acts');
+    const on = button.getAttribute('aria-pressed') !== 'true';
+    row.querySelectorAll('.why').forEach(b => b.setAttribute('aria-pressed', 'false'));
+    if (on) button.setAttribute('aria-pressed', 'true');
+    keepDraft(row.dataset.acts + '/why', on ? button.dataset.reason : '');
   }
 
   const beatIds = () => new Set([...document.querySelectorAll('.beat')].map(d => d.dataset.n));
@@ -228,7 +257,8 @@ LIVE_JS = """<script>
   const rowKey = value => value.n === null ? 'walk' : String(value.n);
   const sameAction = (left, right) => left.session_id === right.session_id
     && left.n === right.n
-    && left.action === right.action && left.note === right.note;
+    && left.action === right.action && left.note === right.note
+    && (left.reason || '') === (right.reason || '');
   const actionRow = value => [...document.querySelectorAll('.acts')]
     .find(row => row.dataset.acts === rowKey(value));
 
@@ -276,6 +306,7 @@ LIVE_JS = """<script>
     if (awaitingSeq !== null && observedSeq >= awaitingSeq) awaitingSeq = null;
     if (pending && state.head_id === pending.id) {
       keepDraft(rowKey(pending), '');
+      if (pending.action === 'drop') keepDraft(rowKey(pending) + '/why', '');
       remember(null);
     }
     // Done outranks away: a finished walk is not an unattended one, and its last
@@ -306,7 +337,7 @@ LIVE_JS = """<script>
     if (!sending) enable(connected && usable && awaitingSeq === null);
   }
 
-  const enable = on => document.querySelectorAll('.act, .note')
+  const enable = on => document.querySelectorAll('.act, .note, .why')
     .forEach(el => el.disabled = !on || (done && el.dataset.action === 'next'));
 
   async function swap(targetRev) {
@@ -318,6 +349,8 @@ LIVE_JS = """<script>
       const note = row.querySelector('.note');
       return [row.dataset.acts, note ? note.value : null];
     }));
+    const reasons = new Map([...document.querySelectorAll('.acts')]
+      .map(row => [row.dataset.acts, reasonOf(row)]));
     const focused = document.activeElement && document.activeElement.closest('.acts');
     const focusKey = focused ? focused.dataset.acts : null;
     const selection = document.activeElement && document.activeElement.classList.contains('note')
@@ -337,6 +370,8 @@ LIVE_JS = """<script>
         note.focus();
         if (selection) note.setSelectionRange(selection[0], selection[1]);
       }
+      const chip = row.querySelector(`.why[data-reason="${reasons.get(row.dataset.acts)}"]`);
+      if (chip) chip.setAttribute('aria-pressed', 'true');
     });
     known = beatIds();
     armed = null;
@@ -389,6 +424,7 @@ LIVE_JS = """<script>
         ? receipt.seq : null;
       remember(null);
       if (row !== undefined) keepDraft(row, '');
+      if (row !== undefined && payload.action === 'drop') keepDraft(row + '/why', '');
       showMessage(payload, payload.action === 'next' ? owedNote() : '');
     } catch (err) {
       showMessage(
@@ -440,6 +476,19 @@ LIVE_JS = """<script>
       if (note) note.focus();
       return;
     }
+    if (button.dataset.action === 'drop') {
+      if (!reasonOf(row)) {
+        msg.textContent = 'pick why first: wrong, intentional, not worth it, or pre-existing';
+        const first = row.querySelector('.why');
+        if (first) first.focus();
+        return;
+      }
+      if (!(note && note.value.trim())) {
+        msg.textContent = 'say why in your own words first';
+        if (note) note.focus();
+        return;
+      }
+    }
     if (ARMS.has(button.dataset.action) && !wasArmed) {
       msg.textContent = arm(button, n);
       return;
@@ -451,6 +500,7 @@ LIVE_JS = """<script>
       action: button.dataset.action,
       note: note ? note.value.trim() : '',
     };
+    if (fresh.action === 'drop') fresh.reason = reasonOf(row);
     if (pending && !sameAction(pending, fresh)) {
       msg.textContent = 'retry the saved ' + pending.action + ' first';
       restorePending();
@@ -461,6 +511,7 @@ LIVE_JS = """<script>
 
   const wire = () => {
     document.querySelectorAll('.act').forEach(b => b.onclick = () => act(b));
+    document.querySelectorAll('.why').forEach(b => b.onclick = () => pick(b));
     if (!/Mac|iPhone|iPad/.test(navigator.platform)) {
       document.querySelectorAll('[data-mod]').forEach(k => k.textContent = 'Ctrl+');
     }
@@ -839,6 +890,19 @@ def questions_html(questions):
     return '<div class="questions" aria-label="Questions and answers">' + ''.join(parts) + '</div>'
 
 
+def why_html(n):
+    """Drop asks which kind of miss it was, so a later session can count noise by kind."""
+    chips = "".join(
+        f'<button type="button" class="why" data-reason="{key}" aria-pressed="false">'
+        f"{label}</button>"
+        for key, label in REASON_LABEL.items()
+    )
+    return (
+        f'<span class="acts-why" role="group" aria-label="why drop item {attr(n)}">'
+        f'<span class="why-lbl">drop as</span>{chips}</span>'
+    )
+
+
 def beat_html(
     beat,
     problems,
@@ -855,6 +919,7 @@ def beat_html(
     raw_slots = beat.get("slots")
     slots = raw_slots if isinstance(raw_slots, dict) else {}
     n = beat.get("n", "?")
+    why = REASON_LABEL.get(beat.get("reason")) if beat.get("state") == "dropped" else None
 
     chip = '<span class="unproven">unproven</span>' if problems else ""
     rows = []
@@ -896,8 +961,9 @@ def beat_html(
         body.append(f'<dl class="slots fix-row">{"".join(fix_row)}</dl>')
     body.append(outcome_html(beat, mode))
     if beat.get("call"):
+        label = f"Dropped as {why}" if why else "Your call"
         body.append(
-            '<div class="call"><span class="lbl">Your call · item '
+            f'<div class="call"><span class="lbl">{label} · item '
             f'{n}</span><q>{md(beat["call"])}</q></div>'
         )
     questions = beat.get("questions") or []
@@ -939,6 +1005,7 @@ def beat_html(
                     f'<span class="execution-blocked">{message}</span>'
                     '<span class="acts-decide">'
                     '<button class="act" data-action="drop">Drop</button></span>'
+                    + why_html(n)
                 )
                 placeholder = (
                     "record a note before replacing this session"
@@ -956,6 +1023,7 @@ def beat_html(
                     '<span class="acts-decide">'
                     f'<button class="act primary" data-action="{action}">{label}</button>'
                     '<button class="act" data-action="drop">Drop</button></span>'
+                    + why_html(n)
                 )
                 placeholder = (
                     "record the decision in your own words"
@@ -1010,7 +1078,9 @@ def beat_html(
         f'{md(beat.get("claim", ""))}{chip}</span>'
         f'<span class="b-path">'
         f'{where_html(beat.get("where", ""), paths, target or {})}</span>'
-        + (f'<span class="b-call">“{md(beat["call"])}”</span>' if beat.get("call") else "")
+        + (f'<span class="b-call">“{md(beat["call"])}”'
+           + (f' <span class="b-why">· {why}</span>' if why else "")
+           + "</span>" if beat.get("call") else "")
         + (f'<span class="b-questions">Q&amp;A · {len(questions)} question'
            f'{"s" if len(questions) != 1 else ""}</span>' if questions else "")
         + f"</summary>"

@@ -555,6 +555,14 @@ the final GitHub review. In report mode, Include in report records the finding i
 durable report. All three clicks have already posted the canonical `accept` action, which
 flips the beat's `state` and records the reviewer's words as `call`.
 
+Drop asks for two things: the reviewer's words, and which kind of miss it was. `wrong`
+means the flag was not real, `intentional` means the behavior is deliberate,
+`not-worth-it` means real but not worth stopping for, and `pre-existing` means the PR did
+not introduce it. The store refuses a drop without both, so a later session can count what
+the walk got wrong by kind. The page offers the four as chips beside Drop. In the terminal,
+read the reason out of what the reviewer typed and post it as `reason`, or ask which one
+when their words do not say.
+
 For a PR source, the page and store always refuse branch acceptance. Include in review,
 Include in report, Drop, notes, questions, navigation, and decision-only answers remain available
 because they do not execute the head. Direct PR execution is not supported. The only PR
@@ -574,7 +582,8 @@ curl -fsS -X POST $URL/act -H 'Content-Type: application/json' \
   -d '{"id":"<new UUID, reused on retry>","session_id":"<from /state>","n":5,"action":"accept","note":"yes, pin it"}'
 ```
 
-The same goes for a note on any beat. The server owns `state` and `call` on both paths, so
+The same goes for a note on any beat, and a drop carries `"reason"` beside its note, one
+of the four above. The server owns `state` and `call` on both paths, so
 never write either by hand: a beat resolved in words and edited by hand stays `flag` on
 disk, and final validation never sees the intended accepted state. The reply carries its
 stable `id`, `seq`, applied state, and absolute result. Finish its effect and acknowledge
@@ -781,7 +790,9 @@ open a PR unasked.
 Infer what the reviewer wants from what they type. Do not make them learn a vocabulary: an
 observation becomes an anchored note, a question gets answered and the beat stays open,
 "next" or "ok" advances, "skip follow-through" drops a tier, "back" returns to an earlier
-beat. Route a question through `question`, not `note` or `decide`, and wait after its
+beat. "Not real" or "we meant that" is a drop whose words name its reason; when they do
+not, ask which of the four it is before posting. Route a question through `question`,
+not `note` or `decide`, and wait after its
 answer. Past a `FLAG` or `UNVERIFIED` beat, advance only when the reviewer asks to move
 on; past a `CLEAN` beat, advance on your own.
 
@@ -1025,7 +1036,9 @@ silently.
 `state` is one of `clean`, `flag`, `unverified`, `accepted`, `dropped`, `decided`. The
 first three are what a beat opens with; the last three are what a flag becomes after the
 reviewer answers. `accepted` is the durable state behind Implement, Include in review, and
-Include in report; `decided` is the outcome behind Record decision. Set top-level
+Include in report; `decided` is the outcome behind Record decision. A `dropped` beat
+written now carries `reason`, one of `wrong`, `intentional`, `not-worth-it`, `pre-existing`;
+a beat dropped before the field existed has none. Set top-level
 `resolution_kind` to `decision` only when the answer itself completes the work. New
 ordinary flags persist `delivery`; imported legacy beats may omit it. `slots` accepts only
 the six keys from rule 2, spelled lower case: `what`, `why`, `proof`, `risk`, `prior`,

@@ -40,12 +40,14 @@ ACTIONS = ("accept", "drop", "decide", "note", "question", "next", "back", "skip
 NAVIGATION = ("next", "back", "skip")
 RESOLVE = {"accept": "accepted", "drop": "dropped", "decide": "decided"}
 RESOLVABLE = {"accept": ("flag",), "drop": ("flag",), "decide": ("flag", "accepted")}
+# A dropped flag records which kind of miss it was, so noise can be counted across sessions.
+DROP_REASONS = ("wrong", "intentional", "not-worth-it", "pre-existing")
 OPEN_STATES = ("clean", "flag", "unverified")
 # What PROOF is: a command whose output would have read differently were the claim
 # false, a file or diff read, or an inference. Only `ran` earns CLEAN.
 PROOF_KINDS = ("ran", "read", "inferred")
 RESOLUTION_KINDS = ("delivery", "decision")
-STORE_OWNED_FIELDS = ("call", "landed", "branch", "delivery_kind", "delivery")
+STORE_OWNED_FIELDS = ("call", "reason", "landed", "branch", "delivery_kind", "delivery")
 # Rule 2's budget, in numbers. It binds what a walk writes now and never what is
 # already on disk: validate_beat stays the shippability contract for stored beats,
 # so tightening here cannot retroactively unship a session or an accepted finding.
@@ -3540,7 +3542,7 @@ class SessionStore:
                 if isinstance(current.get("slots"), dict):
                     # The incoming beat was canonicalized on the way in.
                     current["slots"] = canonical_slots(current["slots"])
-                for field in ("state", "call", "landed", "branch", "delivery_kind"):
+                for field in ("state", "call", "reason", "landed", "branch", "delivery_kind"):
                     if field in current:
                         beat[field] = current[field]
                     else:
@@ -3763,7 +3765,7 @@ class SessionStore:
             (head["seq"],),
         ).fetchone()[0]
 
-    def produce(self, action_id, n, kind, note, session_id=None):
+    def produce(self, action_id, n, kind, note, session_id=None, reason=None):
         if not isinstance(action_id, str) or not action_id.strip():
             raise StoreError("action_id must be non-empty text")
         action_id = action_id.strip()
@@ -3776,6 +3778,12 @@ class SessionStore:
         if not isinstance(note, str):
             raise StoreError("note must be text")
         note = note.strip()
+        if reason is not None:
+            if not isinstance(reason, str):
+                raise StoreError("reason must be text")
+            reason = reason.strip() or None
+        if reason is not None and kind != "drop":
+            raise StoreError("reason belongs to drop only")
         if session_id is not None and (
             not isinstance(session_id, str) or not session_id.strip()
         ):
@@ -3793,9 +3801,12 @@ class SessionStore:
                 "SELECT * FROM actions WHERE action_id = ?", (action_id,)
             ).fetchone()
             if existing is not None:
-                if (existing["beat_n"], existing["kind"], existing["note"]) != (n, kind, note):
+                recorded = self._action(existing)
+                if (recorded["n"], recorded["action"], recorded["note"]) != (n, kind, note) or (
+                    kind == "drop" and (recorded["result"] or {}).get("reason") != reason
+                ):
                     raise Conflict(f"action_id {action_id!r} names a different action")
-                return self._action(existing)
+                return recorded
             if kind == "accept" and execution_policy is not None:
                 replacement_reason = self._replacement_reason(
                     session, execution_policy
@@ -3814,6 +3825,13 @@ class SessionStore:
                     )
             if kind in ("decide", "question") and not note:
                 raise StoreError(f"{kind} requires a non-empty note")
+            if kind == "drop":
+                if not note:
+                    raise StoreError("drop requires a non-empty note: say why in your words")
+                if reason not in DROP_REASONS:
+                    raise StoreError(
+                        "drop requires a reason, one of " + ", ".join(DROP_REASONS)
+                    )
 
             seq = db.execute("SELECT COALESCE(MAX(seq), 0) + 1 FROM actions").fetchone()[0]
             if kind in NAVIGATION or kind == "question":
@@ -3882,6 +3900,8 @@ class SessionStore:
                             }
                     else:
                         delivery_state, delivery = "none", None
+                        if kind == "drop":
+                            beat["reason"] = reason
                 if note:
                     beat["call"] = note
                 changed, revision, delivery_state, delivery = self._save_beat(
@@ -3897,6 +3917,8 @@ class SessionStore:
                     "revision": revision,
                     "delivery": delivery_state,
                 }
+                if kind == "drop":
+                    result["reason"] = reason
                 application = self._application(result, None, (beat,))
                 timestamp = _now()
                 self._insert_action(
