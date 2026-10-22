@@ -402,7 +402,7 @@ class QuestionMigration(StoreCase):
 
         self.store = session_store.SessionStore(self.root)
 
-        self.assertEqual(self.database_state()[0], 7)
+        self.assertEqual(self.database_state()[0], 8)
         self.assertEqual(self.database_state()[2], actions)
         self.assertEqual(self.store.snapshot(), before)
         self.assertEqual(self.store.head(), pending)
@@ -433,7 +433,7 @@ class QuestionMigration(StoreCase):
         self.assertEqual(self.database_state(), before)
         restored = session_store.SessionStore(self.root)
         self.assertEqual(restored.head()["note"], "Reviewer words.")
-        self.assertEqual(self.database_state()[0], 7)
+        self.assertEqual(self.database_state()[0], 8)
 
     def test_v6_migration_rejects_orphaned_references_without_advancing_version(self):
         self.downgrade(self.store)
@@ -2040,7 +2040,7 @@ class CreatingAndMigrating(StoreCase):
 
     def test_the_database_and_export_format_are_versioned(self):
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 7)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 8)
             self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "delete")
         db = self.store._connect()
         try:
@@ -2060,7 +2060,7 @@ class CreatingAndMigrating(StoreCase):
 
         self.assertNotIn("execution_policy", upgraded.snapshot()[0])
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 7)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 8)
 
     def test_the_session_identity_survives_restart_but_not_recreation(self):
         first = self.store.delivery_state()["session_id"]
@@ -2085,7 +2085,7 @@ class CreatingAndMigrating(StoreCase):
         self.assertEqual(upgraded.head()["action_id"], action["action_id"])
         self.assertTrue(upgraded.delivery_state()["session_id"])
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 7)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 8)
             columns = {row[1] for row in db.execute("PRAGMA table_info(session)")}
         self.assertIn("session_id", columns)
 
@@ -2107,7 +2107,7 @@ class CreatingAndMigrating(StoreCase):
         failed = upgraded.presentation_snapshot()[1][0]["delivery"]
         self.assertEqual(failed["owed"], "retry with the fixture")
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 7)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 8)
 
     def test_a_v2_upgrade_strips_a_failure_injected_fix_written_in_upper_case(self):
         """The restore reads the six lowercase keys, so the slot repair has to run before
@@ -2271,7 +2271,7 @@ class CreatingAndMigrating(StoreCase):
 
         self.assertEqual({path: path.stat().st_mtime_ns for path in derived}, before)
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 7)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 8)
 
     def test_a_current_session_opens_in_a_directory_it_cannot_write(self):
         """Reading a published review out of a directory someone locked down."""
@@ -2396,13 +2396,13 @@ class CreatingAndMigrating(StoreCase):
         (self.root / "session.sqlite3").unlink()
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
             self.assertEqual(db.execute("PRAGMA journal_mode = WAL").fetchone()[0], "wal")
-            db.execute("PRAGMA user_version = 8")
+            db.execute("PRAGMA user_version = 9")
 
         with self.assertRaisesRegex(session_store.StoreError, "newer than supported"):
             session_store.SessionStore(self.root)
 
         with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 8)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 9)
             self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
 
     def test_legacy_actions_without_an_ack_migrate_as_handled(self):
@@ -3110,7 +3110,7 @@ class TheBeatBudget(StoreCase):
             store.put_beat(dict(before, proof_kind="read"))
         self.assertEqual(
             session_store.validate_beat(dict(stored, proof_kind="checked")),
-            ["beat 1: proof_kind 'checked' is not one of ran, read, inferred"],
+            ["beat 1: proof_kind 'checked' is not one of ran, read, inferred, attested"],
         )
 
     def test_a_refusal_inside_apply_leaves_the_action_replayable(self):
@@ -4240,7 +4240,7 @@ class LinkedImplementations(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
             }
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 7)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 8)
         self.assertIn("implementation_links", names)
         self.assertIn("implementation_attempts", names)
 

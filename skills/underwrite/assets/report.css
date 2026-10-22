@@ -994,3 +994,47 @@ footer {
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
 }
+
+/* A claim the gateway ran on the frozen head, from the signed receipt the store holds. */
+.attested {
+  background: var(--clean-bg);
+  padding: 9px 14px;
+  border-radius: 3px;
+  font-size: 13px;
+  color: var(--ink-2);
+  margin: 8px 0;
+}
+.attested .lbl {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+  color: var(--clean);
+}
+.attested p { margin: 4px 0; }
+.attested-cmd {
+  display: block;
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink);
+  overflow-wrap: anywhere;
+  margin: 4px 0;
+}
+.attested-out {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--ink);
+  background: var(--raised);
+  margin: 6px 0;
+  padding: 6px 8px;
+  border-left: 2px solid var(--clean);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  max-height: 14em;
+  overflow-y: auto;
+}
+.attested-id {
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--ink-2);
+}

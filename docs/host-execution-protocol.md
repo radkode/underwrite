@@ -273,6 +273,11 @@ execution attempt to the authoritative queued action and finding beat. A retry u
 attempt and a new challenge unless it is a byte-identical replay of an already recorded
 result.
 
+An attested proof uses the same coordinates differently. `action.seq` is the proof's
+number within the source session, `action.beat` is the beat the proof may back, and
+`action.attempt` is `1`. A proof never retries under the same number: after a definite
+failure the controller reserves a new proof with a new number and challenge.
+
 ### Job
 
 `job.argv` is a nonempty array of UTF-8 strings without NUL characters. `argv[0]` is
@@ -777,6 +782,16 @@ the output bundle or causing an external effect.
 The reference implementation supplies that supervised path only through a separate
 `gateway_attested` child. Protocol conformance alone remains insufficient, and no receipt
 authorizes a review publication or push.
+
+An attested proof is the one use a source session makes of a receipt, and it applies
+nothing. The request is the trusted profile's job with at most 16 bounded arguments
+appended and an exit code the controller predicts; a gateway accepts that shape only when
+its own configuration sets `proofArguments`. The controller verifies the receipt exactly
+as it verifies an implementation receipt, with the reserved request's job and exit code as
+the expected values, verifies the returned output bundle against the signed output tree,
+and then discards it. What it records is that one command exited as predicted on the
+frozen head and printed the signed streams. The source session stays `no_exec`, its
+audience and deliveries are untouched, and the receipt authorizes no effect.
 
 ## Limitations
 

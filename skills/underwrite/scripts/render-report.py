@@ -20,6 +20,7 @@ import argparse
 import html
 import json
 import re
+import shlex
 import sqlite3
 import sys
 import textwrap
@@ -859,6 +860,39 @@ def where_html(where, paths, target):
     return " ".join(out)
 
 
+def attestation_html(beat):
+    """What the gateway ran for this beat, from the verified receipt the store holds.
+
+    Written by the store from the proof row, never by the walk, so the command and exit
+    code here are the signed ones even when the PROOF slot paraphrases them."""
+    attestation = beat.get("attestation")
+    if beat.get("proof_kind") != "attested" or not isinstance(attestation, dict):
+        return ""
+    argv = attestation.get("argv")
+    command = shlex.join(argv) if isinstance(argv, list) and all(
+        isinstance(part, str) for part in argv
+    ) else ""
+    output = attestation.get("output") if isinstance(attestation.get("output"), dict) else {}
+    streams = [
+        f'<pre class="attested-out" aria-label="{name}">{html.escape(text)}</pre>'
+        for name in ("stderr", "stdout")
+        for text in [output.get(name)]
+        if isinstance(text, str) and text.strip()
+    ]
+    receipt = attestation.get("receipt_sha256")
+    receipt = receipt[:12] if isinstance(receipt, str) else "?"
+    return (
+        '<div class="attested"><span class="lbl">Ran in sandbox</span>'
+        f'<p>The gateway ran this on the frozen head and exited '
+        f'{md(attestation.get("exit_code"))}, as the claim predicted. '
+        'No head code ran on this machine.</p>'
+        f'<code class="attested-cmd">{html.escape(command, quote=False)}</code>'
+        + "".join(streams)
+        + f'<p class="attested-id">proof {md(attestation.get("proof"))} · '
+        f'signed receipt {md(receipt)}</p></div>'
+    )
+
+
 def questions_html(questions):
     parts = []
     for question in questions:
@@ -1010,6 +1044,9 @@ def beat_html(
             '<div class="unproven-why"><span class="lbl">Unproven</span>'
             f"<ul>{reasons}</ul></div>",
         )
+    attested = attestation_html(beat)
+    if attested:
+        body.append(attested)
     if beat.get("diff"):
         body.append(diff_html(beat["diff"]))
     if fix_row:
@@ -1303,7 +1340,18 @@ def assessment(session, beats, problems_by_n, validation_problems=(), walking=Fa
     else:
         label = "Recommendation" if owed or walking else "Final recommendation"
     if execution_mode(session) == "no_exec":
-        limits.append("Static inspection only; runtime behavior was not verified.")
+        attested = sum(
+            beat.get("proof_kind") == "attested"
+            and isinstance(beat.get("attestation"), dict)
+            for beat in beats
+        )
+        if attested:
+            limits.append(
+                f"{attested} item{'s' if attested != 1 else ''} ran in the gateway "
+                "sandbox with a signed receipt; everything else is static inspection."
+            )
+        else:
+            limits.append("Static inspection only; runtime behavior was not verified.")
     mode = session_mode(session)
     included = sum(beat.get("state") == "accepted" for beat in beats)
     if mode in ("review", "report") and included:

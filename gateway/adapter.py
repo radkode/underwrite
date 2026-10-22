@@ -63,6 +63,12 @@ _CONFIG_FIELDS = {
     "maxSourceBundleBytes",
     "profile",
 }
+# Opt-in: a proof deployment lets a request append at most this many arguments to the
+# profile's command and predict its own exit code. Without it, every request must be
+# the profile's job exactly, as an implementation deployment requires.
+_PROOF_FIELD = "proofArguments"
+_MAX_PROOF_ARGUMENTS = 16
+_MAX_PROOF_ARGUMENT_BYTES = 512
 _EVIDENCE_FILES = (
     "request.json",
     "capability.dsse.json",
@@ -423,9 +429,22 @@ def load_configuration(path):
         ),
         "gateway configuration",
     )
-    _exact(value, _CONFIG_FIELDS, "gateway configuration")
+    _exact(
+        value,
+        _CONFIG_FIELDS | ({_PROOF_FIELD} if _PROOF_FIELD in value else set()),
+        "gateway configuration",
+    )
     if type(value["version"]) is not int or value["version"] != 1:
         raise AdapterError("gateway configuration version must be 1")
+    if _PROOF_FIELD in value:
+        limit = value[_PROOF_FIELD]
+        if (
+            type(limit) is not int
+            or not 1 <= limit <= _MAX_PROOF_ARGUMENTS
+        ):
+            raise AdapterError(
+                f"{_PROOF_FIELD} must be an integer from 1 to {_MAX_PROOF_ARGUMENTS}"
+            )
     value["consumerGid"] = _consumer_gid(value["consumerGid"])
     try:
         value["profile"] = validate_execution_profile(value["profile"])
@@ -812,12 +831,50 @@ def publish_evidence(stored, content, destination, consumer_gid=None):
         os.close(parent)
 
 
-def _request(path, policy, profile):
+def _proof_request(request, profile, limit):
+    """A proof runs the profile's command with a bounded tail and its predicted exit.
+
+    Everything else stays the profile's: executable, environment, working directory,
+    stdin and sandbox. The broker signs only when the run exits as predicted."""
+    job = request.get("job")
+    if not isinstance(job, dict):
+        raise AdapterError("execution request job does not match the trusted profile")
+    for field in ("cwd", "environment", "executable", "stdin"):
+        if job.get(field) != profile["job"][field]:
+            raise AdapterError(
+                f"execution request job {field} does not match the trusted profile"
+            )
+    if request.get("sandbox") != profile["sandbox"]:
+        raise AdapterError("execution request sandbox does not match the trusted profile")
+    prefix = profile["job"]["argv"]
+    argv = job.get("argv")
+    if not isinstance(argv, list) or argv[: len(prefix)] != prefix:
+        raise AdapterError("proof command does not extend the trusted profile command")
+    tail = argv[len(prefix):]
+    if not 1 <= len(tail) <= limit:
+        raise AdapterError(f"proof appends 1 to {limit} arguments to the trusted command")
+    for argument in tail:
+        if (
+            not isinstance(argument, str)
+            or not argument
+            or any(ord(character) < 32 or ord(character) == 127 for character in argument)
+            or len(argument.encode("utf-8")) > _MAX_PROOF_ARGUMENT_BYTES
+        ):
+            raise AdapterError("proof argument is not bounded printable text")
+    exit_code = request.get("exitCode")
+    if type(exit_code) is not int or not 0 <= exit_code <= 255:
+        raise AdapterError("proof exit code must be an integer from 0 to 255")
+
+
+def _request(path, policy, profile, proof_arguments=None):
     request = _load_json(
         _read_regular_file(path, "execution request", _MAX_REQUEST_BYTES),
         "execution request",
     )
     ExecutionRequest(request, policy)
+    if proof_arguments is not None and request.get("job") != profile["job"]:
+        _proof_request(request, profile, proof_arguments)
+        return request
     for field in ("job", "sandbox", "exitCode"):
         if request.get(field) != profile[field]:
             raise AdapterError(
@@ -834,7 +891,9 @@ def run(config_path, request_path, source_bundle, evidence_dir):
     profile = configuration["profile"]
     if policy.executor_id != profile["executorId"]:
         raise AdapterError("gateway policy does not match the trusted profile")
-    request = _request(request_path, policy, profile)
+    request = _request(
+        request_path, policy, profile, configuration.get(_PROOF_FIELD)
+    )
     source_bundle = _inspect_regular_file(source_bundle, "source bundle")
     evidence_dir = _preflight_destination(
         evidence_dir,

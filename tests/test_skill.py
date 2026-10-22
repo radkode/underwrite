@@ -125,9 +125,25 @@ class CleanMeansChecked(unittest.TestCase):
 
     def test_only_a_proof_that_ran_earns_clean(self):
         text = self.skill()
-        self.assertIn("Only `ran` earns `CLEAN`", text)
+        self.assertIn("Only `ran` and `attested` earn `CLEAN`", text)
         self.assertIn("`UNVERIFIED` is not a failure", text)
-        self.assertIn("`proof_kind` is `ran`, `read`, or `inferred` on every beat written now", text)
+        self.assertIn(
+            "`proof_kind` is `ran`, `read`, `inferred`, or `attested` on every beat written now",
+            text,
+        )
+
+    def test_an_attested_proof_is_a_signed_prediction_the_store_holds(self):
+        text = self.skill()
+        self.assertIn("It signs a receipt only when the command exits with the code you predicted", text)
+        self.assertIn("$S/scripts/proofctl.py prove \"$R\" <beat> \"$G\" --exit-code 1 --", text)
+        self.assertIn("Never write `attestation`", text)
+        self.assertIn("A wrong prediction is information, not evidence", text)
+        self.assertIn("An exit code is coarse", text)
+        self.assertIn("cite it only when that output shows your claim", text)
+        self.assertIn("never `ran` for something you did not run", text)
+        self.assertIn("this machine never executes the head", text)
+        readme = self.readme()
+        self.assertIn("A proof never changes the session's `no_exec` policy", readme)
 
     def test_a_risk_is_a_flag_or_nothing(self):
         self.assertIn("A `RISK` belongs to a flag", self.skill())

@@ -654,29 +654,29 @@ def _stored_evidence_root(child, attempt):
     return child.root / "implementation-evidence" / str(attempt)
 
 
-def _verify_persisted_evidence(child, attempt, values):
-    destination = _stored_evidence_root(child, attempt)
+def _verify_persisted_files(destination, values, label):
     try:
         details = destination.lstat()
     except FileNotFoundError as error:
-        raise Conflict("persisted implementation evidence is missing") from error
+        raise Conflict(f"persisted {label} is missing") from error
     if not stat.S_ISDIR(details.st_mode) or stat.S_ISLNK(details.st_mode):
-        raise Conflict("stored implementation evidence is not a directory")
+        raise Conflict(f"stored {label} is not a directory")
     _require_exact_directory_names(
         destination,
         values,
-        "stored implementation evidence",
+        f"stored {label}",
         Conflict,
     )
     for name, expected in values.items():
         actual = _read_file(destination / name, f"stored {name}", len(expected))
         if actual != expected:
-            raise Conflict(f"stored implementation evidence {name} changed")
+            raise Conflict(f"stored {label} {name} changed")
     return destination
 
 
-def _persist_evidence(child, attempt, values):
-    parent = child.root / "implementation-evidence"
+def _persist_files(root, parent_name, name, values, label):
+    """Write one evidence set under root/parent_name/name, atomically and once."""
+    parent = root / parent_name
     created = False
     try:
         parent.mkdir(mode=0o700)
@@ -684,31 +684,47 @@ def _persist_evidence(child, attempt, values):
     except FileExistsError:
         details = parent.lstat()
         if not stat.S_ISDIR(details.st_mode) or stat.S_ISLNK(details.st_mode):
-            raise ImplementationError("implementation evidence root is not a directory")
+            raise ImplementationError(f"{label} root is not a directory")
     if created:
-        _fsync_directory(child.root)
-    destination = _stored_evidence_root(child, attempt)
+        _fsync_directory(root)
+    destination = parent / name
 
     if destination.exists():
-        _verify_persisted_evidence(child, attempt, values)
+        _verify_persisted_files(destination, values, label)
         return destination
-    temporary = Path(tempfile.mkdtemp(prefix=f".{attempt}.", dir=parent))
+    temporary = Path(tempfile.mkdtemp(prefix=f".{name}.", dir=parent))
     try:
-        for name, data in values.items():
-            _write_exact(temporary / name, data)
+        for file_name, data in values.items():
+            _write_exact(temporary / file_name, data)
         _fsync_directory(temporary)
         try:
             os.rename(temporary, destination)
         except OSError:
             if not destination.exists():
                 raise
-            _verify_persisted_evidence(child, attempt, values)
+            _verify_persisted_files(destination, values, label)
         _fsync_directory(parent)
-        _fsync_directory(child.root)
+        _fsync_directory(root)
     finally:
         if temporary.exists():
             shutil.rmtree(temporary)
     return destination
+
+
+def _verify_persisted_evidence(child, attempt, values):
+    return _verify_persisted_files(
+        _stored_evidence_root(child, attempt), values, "implementation evidence"
+    )
+
+
+def _persist_evidence(child, attempt, values):
+    return _persist_files(
+        child.root,
+        "implementation-evidence",
+        str(attempt),
+        values,
+        "implementation evidence",
+    )
 
 
 def _verified_replay(child, attempt, values):
