@@ -29,7 +29,8 @@ holds, the second read included. At each of the two decisions take the option yo
 recommend and record it in your own words as the call, marked as eval mode. Do not serve
 the page, post status, or park: write each beat and go straight to the next. Leave every
 flag open, deliver nothing, skip Phase 4, and end with the recommendation and the count of
-flags raised.
+flags raised. The runner allows writes only under `$UNDERWRITE_REVIEWS`, so write each
+document for `sessionctl.py` to a file in `$R` and pass its path instead of piping it.
 
 ## The six rules
 
@@ -166,8 +167,9 @@ $S/scripts/sessionctl.py link-predecessor "$R" "$P"
 ```
 
 The link is written once. It records the round, the lines this PR's diff touches whose
-content changed since the walked head (`moved`), and every finding the reviewer settled in
-any earlier round with its call (`carried`). Report it as one more ingest line, such as
+content changed since the walked head (`moved`), and every flag from any earlier round with
+its state and call (`carried`). A pure deletion counts the head lines on either side of it;
+a binary or mode-only change moves the whole file, listed with no lines. Report it as one more ingest line, such as
 `round 2   3 lines moved in 2 files, 4 findings carried`.
 
 Otherwise say what is about to happen before it does: you are freezing the target,
@@ -384,8 +386,9 @@ reconstruction, with its own named options:
 **A replacement plans only what moved.** Tier only the files in `predecessor.moved`, and
 plan beats over those lines alone. Everything else was walked last round: say so in the
 plan with the count, and the page carries the settled findings with their calls. An
-accepted finding from an earlier round already reached that round's review, so it is not
-included again.
+accepted finding that landed in an earlier round already reached that round's review, so it
+is not included again. A flag the earlier round left open, or accepted without delivering,
+is walked again wherever it sits, because nobody settled it.
 
 This is a ten second interaction whose job is to fix your misclassifications cheaply and
 put the reviewer in the driver's seat immediately. Once they answer, patch `plan_call`
@@ -515,11 +518,15 @@ checkout or any working tree, and writes nothing. In a branch or working-tree se
 it the diff text instead and let it read files without editing them. Do not pass your
 reasoning or your other beats: an agent handed your conclusion tends to return it.
 
-Three yeses keep the flag: write it with `second_read: {verdict: "confirmed", evidence}`,
-the evidence being the settling line in at most 25 words. Any no demotes it before it is
-written: store the beat `UNVERIFIED`, without its `RISK`, carrying `second_read:
+A no on whether this PR introduced it, or on whether it is real, demotes the flag before it
+is written: store the beat `UNVERIFIED`, without its `RISK`, carrying `second_read:
 {verdict: "disputed", evidence}` that names the question that failed and why. The reviewer
-still sees it, and a question can raise it again. A stored flag cannot be demoted by a
+still sees it, and a question can raise it again. A no on whether a senior engineer would
+stop does not demote it: write the flag with `second_read: {verdict: "confirmed",
+evidence}` and put that doubt in the evidence, because what is worth stopping for is the
+reviewer's call. Otherwise the evidence is the settling line. Either way it is at most 25
+words. The eval set settled this: a read that also demoted on worth demoted the one
+real defect in `underwrite-83-legacy-guard`. A stored flag cannot be demoted by a
 rewrite, which is why the read comes first. Where the harness has no subagent tool, write
 the flag without `second_read` and say in the terminal that it was not read twice.
 

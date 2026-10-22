@@ -3507,7 +3507,8 @@ class SessionStore:
         """Record the session this one replaces, and carry forward what the reviewer settled.
 
         Written once, before the first beat: what moved since the last walk scopes this one,
-        and a finding the reviewer dropped stays dropped while its line reads the same.
+        a finding the reviewer dropped stays dropped while its line reads the same, and a flag
+        still open is carried as open so the replacement raises it again.
         """
         prior_session, prior_beats = predecessor.snapshot()
         prior_target = prior_session.get("target")
@@ -3520,7 +3521,7 @@ class SessionStore:
         )
         carried = list(earlier.get("carried", ()))
         for beat in prior_beats:
-            if beat.get("state") not in ("accepted", "dropped", "decided"):
+            if beat.get("state") not in FLAG_STATES:
                 continue
             entry = {"round": prior_round, "state": beat["state"]}
             for field in ("n", "where", "claim", "reason", "call", "landed"):

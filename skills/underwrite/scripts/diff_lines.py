@@ -171,7 +171,8 @@ def anchor_line(where, files):
     """The first cited line that lands in the diff, as {path, text}, head side first.
 
     A line number moves when code above it does, so a finding is matched across heads by
-    the words on its line rather than by where they sit.
+    the words on its line rather than by where they sit. Words that appear on more than one
+    line of the file's diff identify nothing, so they yield None.
     """
     paths = sorted(files)
     text = str(where or "").strip()
@@ -185,6 +186,10 @@ def anchor_line(where, files):
             continue
         for side in ("RIGHT", "LEFT"):
             words = files[path]["text"].get((side, int(cited["line"])))
-            if words is not None and words.strip():
-                return {"path": path, "text": words.strip()}
+            if words is None or not words.strip():
+                continue
+            # Indentation can carry meaning, and words repeated in the diff name no one line.
+            words = words.rstrip()
+            twins = sum(1 for (s, _n), t in files[path]["text"].items() if s == side and t.rstrip() == words)
+            return {"path": path, "text": words} if twins == 1 else None
     return None

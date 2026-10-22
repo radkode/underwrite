@@ -70,9 +70,10 @@ FIX    npx --yes @arethetypeswrong/cli@0.18.5
 
 Before a flag is written, a fresh-context agent reads it against the frozen diff and blobs
 alone and answers three questions: did this PR introduce it, is it real, and would a senior
-engineer stop at it. Three yeses keep the flag and the page says a second read confirmed
-it. Any no demotes it to `UNVERIFIED` with the second reading beside it, so a wrong flag
-costs a glance rather than a decision.
+engineer stop at it. A flag the PR did not introduce, or that is not real, is demoted to
+`UNVERIFIED` with the second reading beside it, so a wrong flag costs a glance rather than a
+decision. A doubt about whether it is worth stopping for stays beside a confirmed flag
+instead, because that call is yours.
 
 A flag in a PR session has to land on a line the diff touches: the store refuses one on a
 line the PR never put in front of you, naming the nearest touched line. That holds a flag

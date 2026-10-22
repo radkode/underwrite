@@ -622,7 +622,8 @@ class ReviewerNoise(unittest.TestCase):
         self.assertIn("A flag gets a second read before you write it.", walk)
         self.assertIn("Did this PR introduce it? Is it real? Would a senior engineer stop at it?", walk)
         self.assertIn("Do not pass your reasoning or your other beats", walk)
-        self.assertIn("Any no demotes it before it is written", walk)
+        self.assertIn("on whether it is real, demotes the flag before it is written", walk)
+        self.assertIn("A no on whether a senior engineer would stop does not demote it", walk)
         self.assertIn("A stored flag cannot be demoted by a rewrite", walk)
 
     def test_a_replacement_links_its_predecessor_and_plans_only_what_moved(self):

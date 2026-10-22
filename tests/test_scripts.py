@@ -2834,7 +2834,8 @@ class SecondReadAndCarriedRounds(unittest.TestCase):
                     {"round": 1, "n": 1, "state": "dropped", "where": "a.py:2",
                      "reason": "intentional", "call": "pinned on purpose"},
                     {"round": 1, "n": 2, "state": "accepted", "where": "a.py:9",
-                     "claim": "missing guard", "call": "Include it."},
+                     "claim": "missing guard", "call": "Include it.",
+                     "landed": "https://github.com/acme/widget/pull/7#pullrequestreview-1"},
                 ],
             },
         }
@@ -2846,6 +2847,19 @@ class SecondReadAndCarriedRounds(unittest.TestCase):
         self.assertIn("<strong>Dropped as intentional.</strong>", page)
         self.assertIn("<strong>Included.</strong> missing guard.", page)
         self.assertIn("<q>pinned on purpose</q>", page)
+
+    def test_an_open_or_undelivered_carry_says_nobody_settled_it(self):
+        carried = [
+            {"round": 1, "n": 1, "state": "flag", "where": "a.py:2"},
+            {"round": 1, "n": 2, "state": "accepted", "where": "a.py:9", "call": "Include it."},
+        ]
+        session = {
+            "repo": "acme/widget", "number": 7, "audience": {"mode": "review", "why": "open"},
+            "predecessor": {"round": 2, "head_sha": "b" * 40, "moved": {}, "carried": carried},
+        }
+        page = rr.render(session, [], "", {})
+        self.assertIn("<strong>Still open, raised again here if it holds.</strong>", page)
+        self.assertIn("<strong>Accepted, never delivered.</strong>", page)
 
     def test_a_first_round_session_shows_neither(self):
         page = rr.render({"repo": "acme/widget", "number": 7}, [], "", {})

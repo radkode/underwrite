@@ -50,6 +50,8 @@ class Cases(unittest.TestCase):
             ({"expected": []}, "names what the walk should have flagged"),
             ({"kind": "clean"}, "expects no finding"),
             ({"expected": [{"path": "a.py", "lines": []}]}, "path, lines and class"),
+            ({"repo": ["acme/widget"]}, "repo must be nonempty text"),
+            ({"number": True}, "number must be a positive integer"),
         ):
             with self.subTest(change=change):
                 self.assertIn(message, "; ".join(score.case_problems(dict(good, **change))))
@@ -140,24 +142,52 @@ class Scoring(unittest.TestCase):
         self.assertTrue(result["pass"])
         self.assertEqual((result["flags"], result["demoted"]), (0, 1))
 
+    def test_a_walk_that_stored_nothing_passes_no_case(self):
+        result = score.score(self.case("clean"), self.root)
+        self.assertEqual(result["beats"], 0)
+        self.assertFalse(result["pass"])
+
     def test_a_standing_flag_fails_a_clean_case(self):
         self.store.put_beat(self.flag(1, 5))
         self.assertFalse(score.score(self.case("clean"), self.root)["pass"])
 
-    def test_a_session_for_another_head_is_refused(self):
-        with self.assertRaisesRegex(score.CaseError, "did not walk this case"):
-            score.score(dict(self.case(), head_sha="c" * 40), self.root)
+    def test_a_session_for_another_base_or_head_is_refused(self):
+        for field in ("base_sha", "head_sha"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(score.CaseError, "did not walk this case"):
+                    score.score(dict(self.case(), **{field: "c" * 40}), self.root)
+
+    def test_a_dropped_flag_no_longer_stands(self):
+        self.store.put_beat(self.flag(1, 5))
+        self.store.produce("drop-1", 1, "drop", "not this", reason="wrong")
+        result = score.score(self.case("clean"), self.root)
+        self.assertEqual(result["flags"], 0)
+        self.assertTrue(result["pass"])
+
+    def test_one_flag_answers_for_one_expected_finding(self):
+        self.store.put_beat(self.flag(1, 5))
+        case = dict(self.case(), expected=[
+            {"path": "a.py", "lines": [5], "class": "one"},
+            {"path": "a.py", "lines": [6], "class": "two"},
+        ])
+        result = score.score(case, self.root)
+        self.assertEqual((len(result["found"]), len(result["missed"])), (1, 1))
 
 
 class Runner(unittest.TestCase):
     def test_the_walk_runs_in_eval_mode_with_a_narrow_tool_list(self):
         args = argparse.Namespace(claude="claude", max_budget_usd=5.0, model=None, bare=False)
-        argv = run.command({"number": 83}, ROOT, args)
+        reviews = Path("/tmp/eval-reviews")
+        checkout = Path("/tmp/eval-checkout")
+        argv = run.command({"number": 83}, ROOT, reviews, checkout, args)
         self.assertIn("/underwrite:underwrite 83 --eval", argv)
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
-        tools = run.allowed_tools(ROOT / "skills" / "underwrite")
+        tools = run.allowed_tools(ROOT / "skills" / "underwrite", reviews, checkout)
         self.assertNotIn("Bash", tools)
-        self.assertFalse([tool for tool in tools if tool.startswith(("Edit", "Write"))])
+        self.assertFalse(set(tools) & {"Read", "Grep", "Glob"})
+        self.assertIn("Read(//tmp/eval-checkout/**)", tools)
+        writes = [tool for tool in tools if tool.startswith(("Edit", "Write"))]
+        self.assertEqual(writes, ["Write(//tmp/eval-reviews/**)", "Edit(//tmp/eval-reviews/**)"])
         self.assertTrue(all(tool.endswith("*)") for tool in tools if tool.startswith("Bash(")))
 
     def test_the_skill_documents_the_mode_and_the_scratch_reviews_root(self):
@@ -165,6 +195,7 @@ class Runner(unittest.TestCase):
         self.assertIn("An argument carrying `--eval` is a scored replay, not a review", text)
         self.assertIn("Leave every flag open, deliver nothing, skip Phase 4", text)
         self.assertIn("When `UNDERWRITE_REVIEWS` is set, it replaces `~/.claude/reviews`", text)
+        self.assertIn("pass its path instead of piping it", text)
 
 
 if __name__ == "__main__":

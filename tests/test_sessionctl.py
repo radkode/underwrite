@@ -819,7 +819,10 @@ class ReplacementRounds(unittest.TestCase):
         self.assertEqual(dropped["state"], "dropped")
         self.assertEqual(dropped["reason"], "intentional")
         self.assertEqual(dropped["anchor"], {"path": "a.py", "text": "TWO = unpinned"})
-        self.assertEqual([entry["n"] for entry in linked["carried"]], [1])
+        self.assertEqual(
+            [(entry["n"], entry["state"]) for entry in linked["carried"]],
+            [(1, "dropped"), (2, "flag")],
+        )
 
     def test_a_dropped_finding_is_refused_while_its_line_reads_the_same(self):
         prior = self.reviewed()
@@ -873,9 +876,46 @@ class ReplacementRounds(unittest.TestCase):
         linked = self.link(third, second)
 
         self.assertEqual(linked["round"], 3)
-        self.assertEqual([(entry["round"], entry["n"]) for entry in linked["carried"]], [(1, 1)])
+        self.assertEqual(
+            [(entry["round"], entry["n"]) for entry in linked["carried"]], [(1, 1), (1, 2)]
+        )
         with self.assertRaisesRegex(session_store.StoreError, "round 1"):
             session_store.SessionStore(third).put_beat(self.flag(1, 2))
+
+    def test_a_deletion_between_heads_moves_the_lines_around_it(self):
+        prior = self.reviewed()
+        trimmed = self.commit("one\nTWO = unpinned\nthree\nfive\n")
+        replacement = self.session("acme-widget-pr7-r2", trimmed)
+
+        linked = self.link(replacement, prior)
+
+        self.assertEqual(linked["moved"], {"a.py": [3, 4]})
+
+    def test_a_line_whose_words_repeat_in_the_diff_is_not_refused(self):
+        self.base = self.commit("one\nx = 1\nthree\nx = 1\nfive\n")
+        first = self.commit("one\nx = 2\nthree\nx = 2\nfive\n")
+        second = self.commit("one\nx = 2\nthree\nx = 2\nsix\n")
+        prior = self.session("acme-widget-pr7", first)
+        store = session_store.SessionStore(prior)
+        store.put_beat(self.flag(1, 2))
+        store.produce("drop-1", 1, "drop", "fine here", reason="intentional")
+        replacement = self.session("acme-widget-pr7-r2", second)
+
+        linked = self.link(replacement, prior)
+
+        self.assertNotIn("anchor", linked["carried"][0])
+        written = session_store.SessionStore(replacement).put_beat(self.flag(1, 4))
+        self.assertEqual(written["state"], "flag")
+
+    def test_history_names_a_session_it_could_not_read(self):
+        current = self.session("acme-widget-pr7-r2", self.second)
+        broken = self.reviews / "acme-widget-pr6"
+        broken.mkdir()
+        (broken / "session.sqlite3").write_bytes(b"not a database")
+
+        result = json.loads(self.run_ctl("history", current).stdout)
+
+        self.assertEqual([entry["session"] for entry in result["unreadable"]], ["acme-widget-pr6"])
 
     def test_history_lists_earlier_findings_on_the_paths_this_session_touches(self):
         self.reviewed()

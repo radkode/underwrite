@@ -161,7 +161,7 @@ def history(root):
     target = session.get("target") or {}
     repo = target.get("repo") or session.get("repo")
     paths = sorted(store.changed_paths()) if target else None
-    found = []
+    found, unreadable = [], []
     for sibling in sorted(path for path in root.parent.iterdir() if path.is_dir()):
         if sibling.resolve() == root.resolve() or not (
             (sibling / "session.sqlite3").exists() or (sibling / "session.json").exists()
@@ -169,7 +169,8 @@ def history(root):
             continue
         try:
             prior, beats = SessionStore.detached_presentation_snapshot(sibling)
-        except (OSError, sqlite3.Error, json.JSONDecodeError, StoreError):
+        except (OSError, sqlite3.Error, json.JSONDecodeError, StoreError) as error:
+            unreadable.append({"session": sibling.name, "error": str(error)})
             continue
         prior_target = prior.get("target") or {}
         if (prior_target.get("repo") or prior.get("repo")) != repo:
@@ -194,7 +195,7 @@ def history(root):
                 "round": (prior.get("predecessor") or {}).get("round", 1),
                 "findings": findings,
             })
-    return {"repo": repo, "sessions": found}
+    return {"repo": repo, "sessions": found, "unreadable": unreadable}
 
 
 def parser():

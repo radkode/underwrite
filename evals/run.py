@@ -22,10 +22,14 @@ sys.path.insert(0, str(HERE))
 from score import CaseError, load_case, score  # noqa: E402
 
 
-def allowed_tools(skill):
+def allowed_tools(skill, reviews, checkout):
     sessionctl = skill / "scripts" / "sessionctl.py"
+    scratch = f"/{reviews}/**"
+    reads = [f"{tool}(/{root}/**)" for root in (skill, reviews, checkout) for tool in ("Read", "Grep", "Glob")]
     return [
-        "Read", "Grep", "Glob", "Agent",
+        *reads, "Agent",
+        f"Write({scratch})",
+        f"Edit({scratch})",
         f"Bash({sessionctl} *)",
         f"Bash(python3 {sessionctl} *)",
         "Bash(gh pr view *)",
@@ -37,12 +41,12 @@ def allowed_tools(skill):
     ]
 
 
-def command(case, plugin, args):
+def command(case, plugin, reviews, checkout, args):
     argv = [
         args.claude, "-p", f"/underwrite:underwrite {case['number']} --eval",
         "--plugin-dir", str(plugin),
         "--permission-mode", "dontAsk",
-        "--allowedTools", *allowed_tools(plugin / "skills" / "underwrite"),
+        "--allowedTools", *allowed_tools(plugin / "skills" / "underwrite", reviews, checkout),
         "--output-format", "json",
         "--no-session-persistence",
         "--max-budget-usd", str(args.max_budget_usd),
@@ -55,7 +59,7 @@ def command(case, plugin, args):
 
 
 def run_case(case, args):
-    work = Path(tempfile.mkdtemp(prefix=f"underwrite-eval-{case['id']}-"))
+    work = Path(tempfile.mkdtemp(prefix=f"underwrite-eval-{case['id']}-")).resolve()
     checkout, reviews = work / "checkout", work / "reviews"
     reviews.mkdir()
     result = {"case": case["id"], "work": str(work)}
@@ -69,7 +73,7 @@ def run_case(case, args):
             check=True, capture_output=True, text=True,
         )
         walk = subprocess.run(
-            command(case, ROOT, args), cwd=checkout, capture_output=True, text=True,
+            command(case, ROOT, reviews, checkout, args), cwd=checkout, capture_output=True, text=True,
             env=dict(os.environ, UNDERWRITE_REVIEWS=str(reviews)), timeout=args.timeout,
             stdin=subprocess.DEVNULL,
         )

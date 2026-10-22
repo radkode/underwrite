@@ -929,8 +929,12 @@ def carried_html(session, mode, live):
         if state == "dropped":
             why = REASON_LABEL.get(entry.get("reason"))
             outcome = f"Dropped as {why}" if why else "Dropped"
+        elif state == "accepted" and mode != "report" and not entry.get("landed"):
+            outcome = "Accepted, never delivered"
         elif state == "accepted":
             outcome = ACCEPTED_TOKEN.get(mode, "INCLUDED").capitalize()
+        elif state == "flag":
+            outcome = "Still open, raised again here if it holds"
         else:
             outcome = "Decided"
         claim = f" {md(entry['claim'])}." if entry.get("claim") else ""

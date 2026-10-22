@@ -16,7 +16,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 
 from session_store import Conflict, StoreError
-from diff_lines import parse_diff
+from diff_lines import HUNK, clean_path, parse_diff
 
 
 _REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -1000,6 +1000,21 @@ def read_blob(store, side, path, max_bytes):
     }
 
 
+def _removal_points(text):
+    """Head lines either side of each pure removal, the only place a deletion can be read."""
+    points, path = {}, None
+    for line in text.split("\n"):
+        if line.startswith("+++ "):
+            target = line[4:].strip()
+            path = None if target == "/dev/null" else clean_path(target)
+            continue
+        match = HUNK.match(line)
+        if match and path and int(match.group(4) or 1) == 0:
+            start = int(match.group(3))
+            points.setdefault(path, set()).update({max(start, 1), start + 1})
+    return points
+
+
 def moved_lines(store, predecessor):
     """Head lines of this PR's diff whose content changed since the predecessor's head.
 
@@ -1025,29 +1040,28 @@ def moved_lines(store, predecessor):
             )
         if _commit(repo, "refs/underwrite/prior") != prior["head_sha"]:
             raise Conflict("predecessor object bundle head does not match its target")
+        between_args = ["refs/underwrite/prior", "refs/underwrite/head", "--", *sorted(files)]
+        safe_diff = ["diff", "--no-color", "--no-ext-diff", "--no-textconv"]
         raw = _git(
-            [
-                "diff",
-                "--no-color",
-                "--no-ext-diff",
-                "--no-textconv",
-                "--unified=0",
-                "--src-prefix=a/",
-                "--dst-prefix=b/",
-                "refs/underwrite/prior",
-                "refs/underwrite/head",
-                "--",
-                *sorted(files),
-            ],
+            [*safe_diff, "--unified=0", "--src-prefix=a/", "--dst-prefix=b/", *between_args],
             repo,
             safe=True,
         ) if files else b""
-    between = parse_diff(raw.decode("utf-8", "replace"))
+        names = _git([*safe_diff, "--name-only", "-z", *between_args], repo, safe=True) if files else b""
+    text = raw.decode("utf-8", "replace")
+    between = parse_diff(text)
+    changed = {name.decode("utf-8", "replace") for name in names.split(b"\0") if name}
+    removed = _removal_points(text)
     moved = {}
     for path, sides in sorted(files.items()):
-        lines = sides["RIGHT"] & between.get(path, {}).get("RIGHT", set())
+        lines = sides["RIGHT"] & (
+            between.get(path, {}).get("RIGHT", set()) | removed.get(path, set())
+        )
         if lines:
             moved[path] = sorted(lines)
+        elif path in changed and path not in between:
+            # A binary or mode-only change has no line to name, so the whole file moved.
+            moved[path] = []
     return {"prior_head_sha": prior["head_sha"], "head_sha": target["head_sha"], "lines": moved}
 
 

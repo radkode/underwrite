@@ -13,6 +13,9 @@ if str(SCRIPTS) not in sys.path:
 from diff_lines import LOCATION_LINE  # noqa: E402
 from session_store import FLAG_STATES, SessionStore  # noqa: E402
 
+# A dropped flag was put in front of the reviewer and refused, so it no longer stands.
+STANDING_STATES = tuple(state for state in FLAG_STATES if state != "dropped")
+
 KINDS = ("miss", "clean")
 WINDOW = 3
 SHA = set("0123456789abcdef")
@@ -37,6 +40,11 @@ def case_problems(case):
             problems.append(f"missing {field}")
     if problems:
         return problems
+    for field, kind in (("id", str), ("repo", str), ("evidence", str)):
+        if not isinstance(case[field], kind) or not case[field].strip():
+            problems.append(f"{field} must be nonempty text")
+    if isinstance(case["number"], bool) or not isinstance(case["number"], int) or case["number"] < 1:
+        problems.append("number must be a positive integer")
     if case["kind"] not in KINDS:
         problems.append(f"kind must be one of {', '.join(KINDS)}")
     for field in ("base_sha", "head_sha"):
@@ -75,24 +83,30 @@ def matches(item, path, line):
 
 
 def score(case, session_root):
-    """A standing flag is one the walk would put in front of a reviewer; a demoted one is not."""
+    """A standing flag is one the walk would put in front of a reviewer; a demoted one is not.
+    A walk that stored no beat walked nothing, so it passes no case."""
     session, beats = SessionStore.detached_presentation_snapshot(session_root)
     target = session.get("target") or {}
-    if (target.get("repo"), target.get("number"), target.get("head_sha")) != (
-        case["repo"], case["number"], case["head_sha"]
-    ):
-        raise CaseError("the session did not walk this case's pull request and head")
-    standing = [beat for beat in beats if beat.get("state") in FLAG_STATES]
+    if (
+        target.get("repo"), target.get("number"), target.get("base_sha"), target.get("head_sha")
+    ) != (case["repo"], case["number"], case["base_sha"], case["head_sha"]):
+        raise CaseError("the session did not walk this case's pull request, base and head")
+    standing = [beat for beat in beats if beat.get("state") in STANDING_STATES]
     demoted = [
         beat for beat in beats
         if (beat.get("second_read") or {}).get("verdict") == "disputed"
     ]
-    found, missed = [], []
+    found, missed, used = [], [], set()
     for item in case["expected"]:
-        hit = next((b for b in standing if matches(item, *cited(b.get("where")))), None)
-        (found if hit else missed).append(
-            dict(item, beat=hit["n"]) if hit else item
+        hit = next(
+            (b for b in standing if b["n"] not in used and matches(item, *cited(b.get("where")))),
+            None,
         )
+        if hit:
+            used.add(hit["n"])
+            found.append(dict(item, beat=hit["n"]))
+        else:
+            missed.append(item)
     false_alarms = [
         {"n": beat["n"], "where": beat.get("where"), "claim": beat.get("claim")}
         for beat in standing
@@ -107,7 +121,7 @@ def score(case, session_root):
         "found": found,
         "missed": missed,
         "false_alarms": false_alarms,
-        "pass": not missed and (case["kind"] == "miss" or not standing),
+        "pass": bool(beats) and not missed and (case["kind"] == "miss" or not standing),
     }
 
 

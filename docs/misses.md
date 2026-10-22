@@ -37,6 +37,20 @@ alarms on the clean cases.
   ai-kit #17. The PR body named the gap and deferred it, so a walk that stayed quiet was not
   wrong.
 
+## Runs
+
+| Date | Skill | Case | Result | Cost |
+|---|---|---|---|---|
+| 2026-10-21 | second read demotes on any no | `underwrite-17-sigterm` | fail: one confirmed flag on a weak race test | $1.64 |
+| 2026-10-21 | second read demotes on any no | `underwrite-83-legacy-guard` | fail: the walk flagged `:561`, the second read demoted it as not worth stopping | $1.89 |
+| 2026-10-21 | demotes only on not introduced or not real | `underwrite-83-legacy-guard` | pass: `:561` flagged and kept, worth doubt noted in its evidence | $2.20 |
+
+The second run is why the second read no longer demotes on worth. A replay of the six flags
+stored before the second read existed agreed: it disputed two on worth, and the reviewer had
+acted on one of them. The `underwrite-17-sigterm` flag is a fair question about a test that
+catches the old bug only about one run in seven; it stands as a false alarm because nothing
+later had to fix #17.
+
 ## Adding a miss
 
 1. Write `evals/cases/<repo>-<number>-<slug>.json` with the PR's base and head, the defect's
