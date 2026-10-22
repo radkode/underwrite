@@ -3703,6 +3703,25 @@ class SessionStore:
             beat["questions"] = questions.get(beat["n"], [])
         return session, beats
 
+    @classmethod
+    def detached_presentation_snapshot(cls, root):
+        """Read a session without writing to it: a schema upgrade lands on a backup copy."""
+        root = Path(root).expanduser()
+        source = root / "session.sqlite3"
+        if not source.exists():
+            if not (root / "session.json").exists():
+                raise StoreError(f"no session at {root}")
+            return cls.legacy_presentation_snapshot(root)
+        with tempfile.TemporaryDirectory(prefix="underwrite-read-") as scratch:
+            reader = sqlite3.connect(f"{source.resolve().as_uri()}?mode=ro", uri=True)
+            copy = sqlite3.connect(str(Path(scratch) / "session.sqlite3"))
+            try:
+                reader.backup(copy)
+            finally:
+                copy.close()
+                reader.close()
+            return cls(scratch).presentation_snapshot()
+
     # ---- action queue -------------------------------------------------
 
     def _application(self, result, session, beats):

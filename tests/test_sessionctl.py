@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -582,6 +583,122 @@ class Failures(SessionCtlCase):
         self.assertEqual(failed.returncode, 1)
         self.assertIn("at the head", failed.stderr)
         self.assertEqual(self.store().head()["seq"], first["seq"])
+
+
+class NoiseLedger(unittest.TestCase):
+    """Judging whether a skill change made the walk noisier meant opening each session by
+    hand. The ledger counts what every stored session raised and how the reviewer answered,
+    and reading it never upgrades a session in place."""
+
+    def setUp(self):
+        self.reviews = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.reviews, True)
+
+    def beat(self, n, state, **extra):
+        slots = {"what": f"beat {n}", "proof": f"a.py:{n}"}
+        if state == "flag":
+            slots.update(risk="r", fix="pin it")
+        return {
+            "n": n, "tier": "core", "state": state, "proof_kind": "read",
+            "claim": "c", "where": f"a.py:{n}", "slots": slots, **extra,
+        }
+
+    def walked(self):
+        root = self.reviews / "acme-widget-pr1"
+        store = session_store.SessionStore(root, create=True)
+        store.put_session(dict(SESSION, cursor=1))
+        for n in (1, 2, 3):
+            store.put_beat(self.beat(n, "flag"))
+        store.put_beat(self.beat(4, "unverified"))
+        store.produce("drop-1", 1, "drop", "the base already did this", reason="pre-existing")
+        store.ack(store.head()["seq"])
+        asked = store.produce("question-4", 4, "question", "Is this proven?")
+        store.apply(asked["seq"], {
+            "kind": "question",
+            "answer": "Not yet.",
+            "evidence": "Static inspection of a.py:4.",
+        })
+        store.ack(asked["seq"])
+        store.produce("accept-2", 2, "accept", "Implement it.")
+        return root
+
+    def legacy(self):
+        root = self.reviews / "acme-widget-pr2"
+        (root / "beats").mkdir(parents=True)
+        (root / "session.json").write_text(json.dumps(SESSION), encoding="utf-8")
+        dropped = dict(self.beat(1, "dropped"), call="noise")
+        (root / "beats" / "01.json").write_text(json.dumps(dropped), encoding="utf-8")
+        return root
+
+    def stats(self):
+        completed = subprocess.run(
+            [sys.executable, str(SESSIONCTL), "stats", str(self.reviews)],
+            text=True, capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return json.loads(completed.stdout)
+
+    def test_two_sessions_yield_counts_per_session_and_overall(self):
+        self.walked()
+        self.legacy()
+        (self.reviews / "acme-widget-pr3.diff").write_text("", encoding="utf-8")
+
+        ledger = self.stats()
+
+        names = [entry["session"] for entry in ledger["sessions"]]
+        self.assertEqual(names, ["acme-widget-pr1", "acme-widget-pr2"])
+        walked, legacy = ledger["sessions"]
+        self.assertEqual(
+            {key: walked[key] for key in ("beats", "flags", "open", "accepted", "dropped", "unverified", "questions")},
+            {"beats": 4, "flags": 3, "open": 1, "accepted": 1, "dropped": 1, "unverified": 1, "questions": 1},
+        )
+        self.assertEqual(walked["dropped_by_reason"]["pre-existing"], 1)
+        self.assertEqual(walked["unverified_share"], 0.25)
+        self.assertEqual(legacy["dropped_by_reason"]["unstated"], 1)
+        overall = ledger["overall"]
+        self.assertEqual((overall["beats"], overall["flags"], overall["dropped"]), (5, 4, 2))
+        self.assertEqual(overall["dropped_by_reason"]["pre-existing"], 1)
+        self.assertEqual(overall["dropped_by_reason"]["unstated"], 1)
+
+    def test_reading_the_ledger_never_writes_a_session(self):
+        root = self.walked()
+        legacy = self.legacy()
+        database = root / "session.sqlite3"
+        with sqlite3.connect(str(database)) as db:
+            db.execute("PRAGMA user_version = 6")
+        before = {
+            path: path.read_bytes()
+            for base in (root, legacy) for path in base.rglob("*") if path.is_file()
+        }
+
+        self.stats()
+
+        after = {
+            path: path.read_bytes()
+            for base in (root, legacy) for path in base.rglob("*") if path.is_file()
+        }
+        self.assertEqual(after, before)
+        self.assertFalse((legacy / "session.sqlite3").exists())
+
+    def test_an_unreadable_session_is_reported_and_the_rest_still_count(self):
+        self.walked()
+        broken = self.reviews / "acme-widget-pr9"
+        broken.mkdir()
+        (broken / "session.sqlite3").write_bytes(b"not a database")
+
+        ledger = self.stats()
+
+        entry = next(item for item in ledger["sessions"] if item["session"] == "acme-widget-pr9")
+        self.assertIn("error", entry)
+        self.assertEqual(ledger["overall"]["beats"], 4)
+
+    def test_a_missing_directory_is_refused(self):
+        completed = subprocess.run(
+            [sys.executable, str(SESSIONCTL), "stats", str(self.reviews / "typo")],
+            text=True, capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("no reviews directory", completed.stderr)
 
 
 if __name__ == "__main__":

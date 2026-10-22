@@ -1094,6 +1094,11 @@ mode is different: acceptance itself is the terminal durable outcome, with deliv
 `none`, no `landed` value, and no `lands[]` entry. A `decided` beat never carries one; its
 `call` is what it became.
 
+`$S/scripts/sessionctl.py stats ~/.claude/reviews` counts what every stored session raised
+and how the reviewer answered it, reading each one from a backup copy. Run it before and
+after a change to this skill: a change that raises the dropped share is a regression even
+when it finds more.
+
 These accumulate into a review history. When a later session touches the same paths, read
 the prior sessions for context.
 

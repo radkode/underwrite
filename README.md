@@ -306,6 +306,14 @@ moved target before the update blocks landing and requires a replacement source 
 A move detected after the local update preserves the landed commit and reports that a
 replacement is required, without causing another effect.
 
+`sessionctl.py stats ~/.claude/reviews` is the noise ledger. For every stored session and
+in total it counts beats, flags raised, flags still open, accepted, decided, dropped by
+reason, unverified beats and their share, flags a second read confirmed or disputed, and
+questions asked. A drop recorded before reasons existed counts as unstated. It reads each
+session from a backup copy, so counting never upgrades an old session in place. Read it
+before and after a change to the skill: a change that raises the dropped share is a
+regression even when it finds more.
+
 `render-report.py` turns a session into the page and validates it on the way through. A
 flag with no fix, a clean beat with no proof, or a proof naming no command gets an
 `UNPROVEN` chip and exit 2. During a live walk, pending and failed delivery are visible

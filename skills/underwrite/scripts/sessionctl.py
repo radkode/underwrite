@@ -14,7 +14,7 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from session_store import SessionStore, StoreError  # noqa: E402
+from session_store import DROP_REASONS, SessionStore, StoreError  # noqa: E402
 from pr_snapshot import (  # noqa: E402
     TargetMoved,
     capture,
@@ -82,6 +82,74 @@ def path_from_token(token):
     if path_token(path) != token:
         raise StoreError("blob path token is not canonical")
     return path
+
+
+FLAG_STATES = ("flag", "accepted", "dropped", "decided")
+LEDGER_COUNTS = (
+    "beats", "flags", "open", "accepted", "decided", "dropped", "unverified",
+    "confirmed", "disputed", "questions",
+)
+
+
+def noise_counts(beats):
+    counts = dict.fromkeys(LEDGER_COUNTS, 0)
+    counts["dropped_by_reason"] = dict.fromkeys((*DROP_REASONS, "unstated"), 0)
+    for beat in beats:
+        state = beat.get("state")
+        counts["beats"] += 1
+        counts["questions"] += len(beat.get("questions") or ())
+        if state in FLAG_STATES:
+            counts["flags"] += 1
+        if state == "flag":
+            counts["open"] += 1
+        elif state in ("accepted", "decided", "unverified"):
+            counts[state] += 1
+        elif state == "dropped":
+            counts["dropped"] += 1
+            reason = beat.get("reason")
+            counts["dropped_by_reason"][reason if reason in DROP_REASONS else "unstated"] += 1
+        verdict = (beat.get("second_read") or {}).get("verdict")
+        if verdict in ("confirmed", "disputed"):
+            counts[verdict] += 1
+    return counts
+
+
+def add_counts(total, counts):
+    for key in LEDGER_COUNTS:
+        total[key] += counts[key]
+    for reason, value in counts["dropped_by_reason"].items():
+        total["dropped_by_reason"][reason] += value
+
+
+def share(counts):
+    beats = counts["beats"]
+    counts["unverified_share"] = round(counts["unverified"] / beats, 3) if beats else None
+    return counts
+
+
+def ledger(reviews):
+    """Count what every stored session raised and how the reviewer answered it."""
+    reviews = Path(reviews).expanduser()
+    if not reviews.is_dir():
+        raise StoreError(f"no reviews directory at {reviews}")
+    sessions = []
+    overall = noise_counts(())
+    for root in sorted(path for path in reviews.iterdir() if path.is_dir()):
+        if not ((root / "session.sqlite3").exists() or (root / "session.json").exists()):
+            continue
+        entry = {"session": root.name}
+        try:
+            session, beats = SessionStore.detached_presentation_snapshot(root)
+        except (OSError, sqlite3.Error, json.JSONDecodeError, StoreError) as error:
+            entry["error"] = str(error)
+            sessions.append(entry)
+            continue
+        entry["repo"] = (session.get("target") or {}).get("repo") or session.get("repo")
+        counts = noise_counts(beats)
+        add_counts(overall, counts)
+        entry.update(share(counts))
+        sessions.append(entry)
+    return {"sessions": sessions, "overall": share(overall)}
 
 
 def parser():
@@ -201,6 +269,9 @@ def parser():
 
     export = commands.add_parser("export")
     export.add_argument("session")
+
+    stats = commands.add_parser("stats")
+    stats.add_argument("reviews")
     return ap
 
 
@@ -325,6 +396,8 @@ def run(args):
         result = store.abandon_head(args.seq, args.actor, args.reason)
     elif args.command == "export":
         return SessionStore(args.session).export_json()
+    elif args.command == "stats":
+        return ledger(args.reviews)
     else:
         raise StoreError(f"unknown command {args.command!r}")
 
