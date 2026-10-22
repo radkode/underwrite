@@ -2798,5 +2798,94 @@ class AnchorValidation(unittest.TestCase):
         self.assertIn("fold", report[0])
 
 
+class SecondReadAndCarriedRounds(unittest.TestCase):
+    """The page says when a flag survived a second read or was demoted by one, and a
+    replacement names its round and the calls it inherits."""
+
+    FLAG = {
+        "n": 1, "state": "flag", "claim": "unpinned", "where": "a.py:1",
+        "slots": {"what": "x", "proof": "a.py:1", "risk": "r", "fix": "pin it"},
+        "decision": {"question": "Include it?", "recommendation": "Include it."},
+    }
+
+    def test_a_confirmed_and_a_disputed_read_each_say_so_on_the_card(self):
+        confirmed = dict(self.FLAG, second_read={"verdict": "confirmed", "evidence": "new at a.py:1"})
+        disputed = {
+            "n": 2, "state": "unverified", "claim": "timeout", "where": "a.py:2",
+            "slots": {"what": "y", "proof": "a.py:2"},
+            "second_read": {"verdict": "disputed", "evidence": "the base had it"},
+        }
+        page = rr.render({"repo": "acme/widget", "number": 7}, [confirmed, disputed], "", {})
+        self.assertIn('<span class="lbl">Confirmed by a second read</span><span>new at a.py:1</span>', page)
+        self.assertIn('<span class="lbl">A second read disputed this flag</span><span>the base had it</span>', page)
+
+    def test_a_flag_that_was_not_read_twice_says_so(self):
+        unread = dict(self.FLAG, second_read={"verdict": "unread", "evidence": "no subagent tool"})
+        page = rr.render({"repo": "acme/widget", "number": 7}, [unread], "", {})
+        self.assertIn('<span class="lbl">Not read twice</span><span>no subagent tool</span>', page)
+
+    def test_a_flag_raised_over_a_drop_says_how_it_differs(self):
+        beat = dict(self.FLAG, over_drop="the pin holds; the name shadows a builtin")
+        page = rr.render({"repo": "acme/widget", "number": 7}, [beat], "", {})
+        self.assertIn('<span class="lbl">Raised over an earlier drop</span><span>the pin holds; the name shadows a builtin</span>', page)
+
+    def test_a_beat_with_no_second_read_shows_no_line(self):
+        page = rr.render({"repo": "acme/widget", "number": 7}, [self.FLAG], "", {})
+        self.assertNotIn("second-read", page)
+
+    def test_a_replacement_names_its_round_and_carries_the_settled_calls(self):
+        session = {
+            "repo": "acme/widget", "number": 7,
+            "audience": {"mode": "review", "why": "open PR"},
+            "predecessor": {
+                "session": "acme-widget-pr7", "round": 2, "base_sha": "a" * 40,
+                "head_sha": "b" * 40, "moved": {"a.py": [4, 5]},
+                "carried": [
+                    {"round": 1, "n": 1, "state": "dropped", "where": "a.py:2",
+                     "reason": "intentional", "call": "pinned on purpose"},
+                    {"round": 1, "n": 2, "state": "accepted", "where": "a.py:9",
+                     "claim": "missing guard", "call": "Include it.",
+                     "landed": "https://github.com/acme/widget/pull/7#pullrequestreview-1"},
+                ],
+            },
+        }
+        page = rr.render(session, [], "", {})
+        self.assertIn('<span class="sep">·</span><span>round 2</span>', page)
+        self.assertIn("Carried from earlier rounds", page)
+        self.assertIn("This round walks 2 lines in 1 file that moved since bbbbbbb.", page)
+        self.assertIn("Everything else was walked in round 1. These calls are not in the counts above.", page)
+        self.assertIn("<strong>Dropped as intentional.</strong>", page)
+        self.assertIn("<strong>Included.</strong> missing guard.", page)
+        self.assertIn("<q>pinned on purpose</q>", page)
+
+    def test_an_open_or_undelivered_carry_says_nobody_settled_it(self):
+        carried = [
+            {"round": 1, "n": 1, "state": "flag", "where": "a.py:2"},
+            {"round": 1, "n": 2, "state": "accepted", "where": "a.py:9", "call": "Include it."},
+        ]
+        session = {
+            "repo": "acme/widget", "number": 7, "audience": {"mode": "review", "why": "open"},
+            "predecessor": {"round": 2, "head_sha": "b" * 40, "moved": {}, "carried": carried},
+        }
+        page = rr.render(session, [], "", {})
+        self.assertIn("<strong>Still open, raised again here if it holds.</strong>", page)
+        self.assertIn("<strong>Accepted, never posted.</strong>", page)
+
+    def test_a_carried_open_flag_says_its_line_changed_and_nothing_more(self):
+        carried = [{"round": 1, "n": 2, "state": "flag", "where": "a.py:4", "line_changed": 2}]
+        session = {
+            "repo": "acme/widget", "number": 7, "audience": {"mode": "review", "why": "open"},
+            "predecessor": {"round": 3, "head_sha": "c" * 40, "moved": {}, "carried": carried},
+        }
+        page = rr.render(session, [], "", {})
+        self.assertIn("<strong>Still open, raised again here if it holds; its line has changed since round 2.</strong>", page)
+        self.assertNotIn("walked it again", page)
+
+    def test_a_first_round_session_shows_neither(self):
+        page = rr.render({"repo": "acme/widget", "number": 7}, [], "", {})
+        self.assertNotIn("Carried from earlier rounds", page)
+        self.assertNotIn("round 2", page)
+
+
 if __name__ == "__main__":
     unittest.main()

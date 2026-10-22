@@ -68,6 +68,14 @@ PRIOR  #2 pinned break-check to 0.6.0 citing this exact failure mode
 FIX    npx --yes @arethetypeswrong/cli@0.18.5
 ```
 
+Before a flag is written, a fresh-context agent reads it against the frozen diff and blobs
+alone and answers three questions: did this PR introduce it, is it real, and would a senior
+engineer stop at it. A flag the PR did not introduce, or that is not real, is demoted to
+`UNVERIFIED` with the second reading beside it, so a wrong flag costs a glance rather than a
+decision. A doubt about whether it is worth stopping for stays beside a confirmed flag
+instead, because that call is yours. A flag written where no second reader was available says
+"Not read twice" rather than passing for a checked one.
+
 A flag in a PR session has to land on a line the diff touches: the store refuses one on a
 line the PR never put in front of you, naming the nearest touched line. That holds a flag
 to the change without proving the change caused what it flags.
@@ -295,6 +303,16 @@ diff, trusted context, and object bundle are checked by byte count and SHA-256.
 Controller cleanliness is rechecked immediately before capture freezes the target. It is
 a point-in-time precondition, not an attestation against a concurrent local writer.
 
+When the PR moves, the old session stays as it was and a replacement starts beside it at
+`<session>-r2/`. `link-predecessor` records the round, the lines the PR touches that changed
+since the walked head, and every finding the reviewer settled in an earlier round. The
+replacement walks only those moved lines, the page carries the earlier calls forward, and
+the store refuses a flag the reviewer already dropped while its line reads the same. By the
+fourth round the recommendation says to reconsider the approach rather than fix again.
+`history` returns what earlier sessions on the same repository learned, their facts and
+recommendation and the findings they left on the paths a new one touches, so the second
+review of an area starts from the first.
+
 Linked creation is deterministic for one source action and refuses a conflicting second
 authorization. A complete child is atomically published at its deterministic path, so a
 crash cannot expose a partial final session. Request reservation reuses a nonfailed attempt;
@@ -305,6 +323,14 @@ the SQLite receipt. A
 moved target before the update blocks landing and requires a replacement source snapshot.
 A move detected after the local update preserves the landed commit and reports that a
 replacement is required, without causing another effect.
+
+`sessionctl.py stats ~/.claude/reviews` is the noise ledger. For every stored session and
+in total it counts beats, flags raised, flags still open, accepted, decided, dropped by
+reason, unverified beats and their share, flags a second read confirmed or disputed, and
+questions asked. A drop recorded before reasons existed counts as unstated. It reads each
+session from a backup copy, so counting never upgrades an old session in place. Read it
+before and after a change to the skill: a change that raises the dropped share is a
+regression even when it finds more.
 
 `render-report.py` turns a session into the page and validates it on the way through. A
 flag with no fix, a clean beat with no proof, or a proof naming no command gets an
@@ -320,6 +346,29 @@ unsnappable ones into the body rather than dropping them.
 
 Iterating on the page design means editing `skills/underwrite/assets/report.css`, or
 passing `--css` to try something without a commit.
+
+## Evals
+
+`evals/cases/` holds pull requests with a known answer: misses, where a defect shipped and a
+later PR fixed it, and clean PRs that nothing later had to fix. `evals/run.py` clones each at
+its base, walks it headlessly with this checkout's skill in eval mode, and scores the session
+with `evals/score.py`. A flag the second read demoted does not stand, so it counts neither
+for a miss nor against a clean case. Nothing is posted: every case is a merged PR, which freezes to report
+audience, and eval mode delivers nothing.
+
+```bash
+python3 evals/run.py                         # every case
+python3 evals/run.py underwrite-83-legacy-guard --keep --max-budget-usd 3
+```
+
+A case passes when every expected finding is found, by place and by the keywords of its class,
+and nothing else stands. `--baseline evals/baseline.json` fails only on a regression: a case
+that passed and now fails, or more misses or false alarms than the committed baseline. Keep a
+change to `SKILL.md` only when it passes that, and commit a new baseline when it improves. The
+`evals` workflow runs this on pull requests that touch the skill or the evals, but only once
+an `ANTHROPIC_API_KEY` secret is set, because each run spends model budget; CI checks the cases
+and the scorer either way. `--bare` keeps hooks and personal instructions
+out of the run and needs `ANTHROPIC_API_KEY`. `docs/misses.md` records what each miss lacked.
 
 ## License
 

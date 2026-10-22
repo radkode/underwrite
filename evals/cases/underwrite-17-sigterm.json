@@ -1,0 +1,10 @@
+{
+  "id": "underwrite-17-sigterm",
+  "kind": "clean",
+  "repo": "radkode/underwrite",
+  "number": 17,
+  "base_sha": "5c7bae2e6e0bb4600d688575b66a3cc811651239",
+  "head_sha": "22d4ab5440d5ec5c17e769fd6b4d7513994d3126",
+  "expected": [],
+  "evidence": "its SIGTERM block was later touched only by tests (#23) and a feature (#63)"
+}
