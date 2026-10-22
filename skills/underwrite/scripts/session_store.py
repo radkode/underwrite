@@ -21,7 +21,7 @@ HERE = str(Path(__file__).resolve().parent)
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-from diff_lines import parse_diff, untouched_anchor  # noqa: E402
+from diff_lines import anchor_line, parse_diff, untouched_anchor  # noqa: E402
 
 
 DB_SCHEMA_VERSION = 7
@@ -53,6 +53,8 @@ OPEN_STATES = ("clean", "flag", "unverified")
 # What PROOF is: a command whose output would have read differently were the claim
 # false, a file or diff read, or an inference. Only `ran` earns CLEAN.
 PROOF_KINDS = ("ran", "read", "inferred")
+SECOND_READ_VERDICTS = ("confirmed", "disputed")
+FLAG_STATES = ("flag", "accepted", "dropped", "decided")
 RESOLUTION_KINDS = ("delivery", "decision")
 STORE_OWNED_FIELDS = ("call", "reason", "landed", "branch", "delivery_kind", "delivery")
 # Rule 2's budget, in numbers. It binds what a walk writes now and never what is
@@ -232,6 +234,14 @@ def beat_budget_problems(beat):
                 f"beat {n}: clean beat fills {len(filled)} slots, over "
                 f"{BEAT_BUDGET['clean_slots']} ({', '.join(filled)})"
             )
+    reading = beat.get("second_read")
+    if isinstance(reading, dict) and isinstance(reading.get("evidence"), str):
+        words = len(reading["evidence"].split())
+        if words > BEAT_BUDGET["slot_words"]:
+            over.append(
+                f"beat {n}: second_read evidence is {words} words, over "
+                f"{BEAT_BUDGET['slot_words']}"
+            )
     quoted = beat.get("diff")
     if isinstance(quoted, list) and len(quoted) > BEAT_BUDGET["diff_lines"]:
         over.append(
@@ -283,9 +293,37 @@ def decision_problems(beat):
     return []
 
 
+def second_read_problems(beat):
+    """A second read confirms a flag or demotes it; it never sits on a beat it did not judge."""
+    if "second_read" not in beat:
+        return []
+    n = beat.get("n", "?")
+    reading = beat["second_read"]
+    if (
+        not isinstance(reading, dict)
+        or set(reading) != {"verdict", "evidence"}
+        or reading["verdict"] not in SECOND_READ_VERDICTS
+        or not isinstance(reading["evidence"], str)
+        or not reading["evidence"].strip()
+    ):
+        return [
+            f"beat {n}: second_read requires verdict confirmed or disputed "
+            "and evidence as nonempty text"
+        ]
+    state = beat.get("state")
+    if reading["verdict"] == "confirmed" and state not in FLAG_STATES:
+        return [f"beat {n}: a confirmed second read belongs to a flag, not {state!r}"]
+    if reading["verdict"] == "disputed" and state != "unverified":
+        return [
+            f"beat {n}: a disputed second read demotes the flag; write it unverified "
+            "without its risk"
+        ]
+    return []
+
+
 def validate_beat(beat, mode="branch", final=False):
     """Return beat contract violations. Empty means the beat is shippable."""
-    problems = decision_problems(beat)
+    problems = decision_problems(beat) + second_read_problems(beat)
     n = beat.get("n", "?")
     state = beat.get("state")
     raw_slots = beat.get("slots")
@@ -1799,10 +1837,19 @@ class SessionStore:
         allow_new_branch=False,
         allow_new_execution_policy=False,
         allow_new_audience=False,
+        allow_new_predecessor=False,
     ):
         version, body = self._session_document(document)
         row = self._session_row(db)
         current = json.loads(row["body_json"])
+        current_predecessor = current.get("predecessor", _MISSING)
+        if current_predecessor != body.get("predecessor", _MISSING):
+            if current_predecessor is _MISSING and allow_new_predecessor:
+                pass
+            elif current_predecessor is _MISSING:
+                raise Conflict("session predecessor must be recorded through link-predecessor")
+            else:
+                raise Conflict("session predecessor cannot change once linked")
         current_target = current.get("target", _MISSING)
         incoming_target = body.get("target", _MISSING)
         if current_target != incoming_target:
@@ -1995,6 +2042,8 @@ class SessionStore:
             )
         if "legacy_pr" in patch:
             raise Conflict("session legacy PR identity cannot change")
+        if "predecessor" in patch:
+            raise Conflict("session predecessor must be recorded through link-predecessor")
         if "delivery_branch" in patch:
             raise Conflict(
                 "session delivery_branch must be changed through pin-branch"
@@ -3454,6 +3503,86 @@ class SessionStore:
         if problem:
             raise StoreError(f"beat {beat['n']}: {problem}")
 
+    def link_predecessor(self, predecessor, moved):
+        """Record the session this one replaces, and carry forward what the reviewer settled.
+
+        Written once, before the first beat: what moved since the last walk scopes this one,
+        and a finding the reviewer dropped stays dropped while its line reads the same.
+        """
+        prior_session, prior_beats = predecessor.snapshot()
+        prior_target = prior_session.get("target")
+        if not isinstance(prior_target, dict):
+            raise Conflict("predecessor has no frozen PR target")
+        earlier = prior_session.get("predecessor") or {}
+        prior_round = earlier.get("round", 1)
+        files = parse_diff(
+            predecessor.read_verified_target_diff()[1].decode("utf-8", "replace")
+        )
+        carried = list(earlier.get("carried", ()))
+        for beat in prior_beats:
+            if beat.get("state") not in ("accepted", "dropped", "decided"):
+                continue
+            entry = {"round": prior_round, "state": beat["state"]}
+            for field in ("n", "where", "claim", "reason", "call", "landed"):
+                if beat.get(field) is not None:
+                    entry[field] = beat[field]
+            if beat["state"] == "dropped":
+                anchor = anchor_line(beat.get("where"), files)
+                if anchor is not None:
+                    entry["anchor"] = anchor
+            carried.append(entry)
+        if not isinstance(moved, dict) or moved.get("prior_head_sha") != prior_target["head_sha"]:
+            raise StoreError("moved lines must be computed against the predecessor's head")
+        with self._first_work_write() as db:
+            session = json.loads(self._session_row(db)["body_json"])
+            target = session.get("target")
+            if not isinstance(target, dict):
+                raise Conflict("link-predecessor requires a frozen PR target")
+            if "predecessor" in session:
+                raise Conflict("session predecessor is already linked")
+            if db.execute("SELECT EXISTS(SELECT 1 FROM beats)").fetchone()[0]:
+                raise Conflict("link the predecessor before the first beat")
+            if predecessor.root.resolve() == self.root.resolve():
+                raise Conflict("a session cannot replace itself")
+            if (prior_target["repo"], prior_target["number"]) != (target["repo"], target["number"]):
+                raise Conflict("predecessor reviewed a different pull request")
+            if (prior_target["base_sha"], prior_target["head_sha"]) == (
+                target["base_sha"], target["head_sha"]
+            ):
+                raise Conflict("predecessor froze the same base and head; resume it instead")
+            if moved.get("head_sha") != target["head_sha"]:
+                raise StoreError("moved lines must be computed against this session's head")
+            session["predecessor"] = {
+                "session": predecessor.root.name,
+                "round": prior_round + 1,
+                "base_sha": prior_target["base_sha"],
+                "head_sha": prior_target["head_sha"],
+                "moved": moved["lines"],
+                "carried": carried,
+            }
+            if self._save_session(db, session, allow_new_predecessor=True):
+                self._bump_render(db)
+        return self.snapshot()[0]["predecessor"]
+
+    def _refuse_dropped_finding(self, session, beat):
+        """A finding the reviewer dropped is not raised again while its line reads the same."""
+        predecessor = session.get("predecessor")
+        target = session.get("target")
+        if beat.get("state") != "flag" or not predecessor or not isinstance(target, dict):
+            return
+        files = parse_diff(self._verified_diff_bytes(target).decode("utf-8", "replace"))
+        anchor = anchor_line(beat.get("where"), files)
+        if anchor is None:
+            return
+        for entry in predecessor.get("carried", ()):
+            if entry.get("state") == "dropped" and entry.get("anchor") == anchor:
+                raise StoreError(
+                    f"beat {beat['n']}: the reviewer dropped this finding in round "
+                    f"{entry['round']} as {entry.get('reason', 'unstated')} "
+                    f"({entry.get('call', 'no words')!r}); its line still reads the same, "
+                    "so it is not raised again"
+                )
+
     def changed_paths(self):
         """The paths the frozen diff touches, read only after its digest verifies.
 
@@ -3610,7 +3739,11 @@ class SessionStore:
                             raise StoreError(f"beat {beat['n']} slots must be an object")
                         slots["fix"] = current_slots["fix"]
                 self._hold_authorized_finding(db, beat, current)
+            problems = second_read_problems(beat)
+            if problems:
+                raise StoreError("; ".join(problems))
             self._refuse_untouched_flag(session, beat)
+            self._refuse_dropped_finding(session, beat)
             changed, _revision, _state, _detail = self._save_beat(db, beat)
             if changed:
                 self._bump_render(db)

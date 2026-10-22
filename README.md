@@ -68,6 +68,12 @@ PRIOR  #2 pinned break-check to 0.6.0 citing this exact failure mode
 FIX    npx --yes @arethetypeswrong/cli@0.18.5
 ```
 
+Before a flag is written, a fresh-context agent reads it against the frozen diff and blobs
+alone and answers three questions: did this PR introduce it, is it real, and would a senior
+engineer stop at it. Three yeses keep the flag and the page says a second read confirmed
+it. Any no demotes it to `UNVERIFIED` with the second reading beside it, so a wrong flag
+costs a glance rather than a decision.
+
 A flag in a PR session has to land on a line the diff touches: the store refuses one on a
 line the PR never put in front of you, naming the nearest touched line. That holds a flag
 to the change without proving the change caused what it flags.
@@ -294,6 +300,15 @@ before it returns anything.
 diff, trusted context, and object bundle are checked by byte count and SHA-256.
 Controller cleanliness is rechecked immediately before capture freezes the target. It is
 a point-in-time precondition, not an attestation against a concurrent local writer.
+
+When the PR moves, the old session stays as it was and a replacement starts beside it at
+`<session>-r2/`. `link-predecessor` records the round, the lines the PR touches that changed
+since the walked head, and every finding the reviewer settled in an earlier round. The
+replacement walks only those moved lines, the page carries the earlier calls forward, and
+the store refuses a flag the reviewer already dropped while its line reads the same. By the
+fourth round the recommendation says to reconsider the approach rather than fix again.
+`history` lists what earlier sessions on the same repository found on the paths a new one
+touches, so the second review of an area starts from the first.
 
 Linked creation is deterministic for one source action and refuses a conflicting second
 authorization. A complete child is atomically published at its deterministic path, so a

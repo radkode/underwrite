@@ -4297,5 +4297,61 @@ class LinkedImplementations(unittest.TestCase):
             session_store.SessionStore(child.root)
 
 
+class SecondRead(StoreCase):
+    """A flag is one model's opinion until a fresh-context read agrees with it. A
+    confirmed read rides on the flag; a disputed one demotes it before it is written."""
+
+    CONFIRMED = {"verdict": "confirmed", "evidence": "a.py:1 is new in this diff and unpinned"}
+    DISPUTED = {"verdict": "disputed", "evidence": "the base pins it at a.py:1; not introduced here"}
+
+    def demoted(self, **extra):
+        slots = {"what": "x", "proof": "a.py:1"}
+        return dict(FLAG, n=3, state="unverified", slots=slots, **extra)
+
+    def test_a_confirmed_read_rides_on_the_flag_through_its_drop(self):
+        self.store.put_beat(dict(FLAG, n=3, second_read=self.CONFIRMED))
+        self.store.produce("drop-3", 3, "drop", "not this time", reason="not-worth-it")
+
+        beat = self.beat(3)
+        self.assertEqual(beat["state"], "dropped")
+        self.assertEqual(beat["second_read"], self.CONFIRMED)
+        self.assertEqual(session_store.validate_beat(beat), [])
+
+    def test_a_disputed_read_is_written_as_an_unverified_beat(self):
+        written = self.store.put_beat(self.demoted(second_read=self.DISPUTED))
+
+        self.assertEqual(written["state"], "unverified")
+        self.assertEqual(written["second_read"], self.DISPUTED)
+
+    def test_a_disputed_read_on_a_flag_is_refused(self):
+        with self.assertRaisesRegex(session_store.StoreError, "demotes the flag"):
+            self.store.put_beat(dict(FLAG, n=3, second_read=self.DISPUTED))
+        self.assertNotIn(3, [beat["n"] for beat in self.store.snapshot()[1]])
+
+    def test_a_confirmed_read_on_a_beat_that_is_no_flag_is_refused(self):
+        with self.assertRaisesRegex(session_store.StoreError, "belongs to a flag"):
+            self.store.put_beat(self.demoted(second_read=self.CONFIRMED))
+
+    def test_a_misshapen_or_long_read_is_refused(self):
+        for reading in (
+            {"verdict": "agreed", "evidence": "x"},
+            {"verdict": "confirmed", "evidence": " "},
+            {"verdict": "confirmed"},
+            "confirmed",
+        ):
+            with self.subTest(reading=reading):
+                with self.assertRaisesRegex(session_store.StoreError, "second_read requires"):
+                    self.store.put_beat(dict(FLAG, n=3, second_read=reading))
+        long = {"verdict": "confirmed", "evidence": " ".join(["word"] * 26)}
+        with self.assertRaisesRegex(session_store.StoreError, "evidence is 26 words"):
+            self.store.put_beat(dict(FLAG, n=3, second_read=long))
+
+    def test_a_stored_flag_cannot_be_demoted_by_a_rewrite(self):
+        self.store.put_beat(dict(FLAG, n=3))
+        with self.assertRaisesRegex(session_store.StoreError, "demotes the flag"):
+            self.store.put_beat(self.demoted(second_read=self.DISPUTED))
+        self.assertEqual(self.beat(3)["state"], "flag")
+
+
 if __name__ == "__main__":
     unittest.main()

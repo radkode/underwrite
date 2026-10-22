@@ -52,14 +52,14 @@ def parse_diff(text):
                 continue
             tag = line[:1]
             if tag == " " or line == "":
-                mark(files[path], hunk, "LEFT", old_ln)
-                mark(files[path], hunk, "RIGHT", new_ln)
+                mark(files[path], hunk, "LEFT", old_ln, line[1:])
+                mark(files[path], hunk, "RIGHT", new_ln, line[1:])
                 old_ln, new_ln, rem_old, rem_new = old_ln + 1, new_ln + 1, rem_old - 1, rem_new - 1
             elif tag == "+":
-                mark(files[path], hunk, "RIGHT", new_ln)
+                mark(files[path], hunk, "RIGHT", new_ln, line[1:])
                 new_ln, rem_new = new_ln + 1, rem_new - 1
             elif tag == "-":
-                mark(files[path], hunk, "LEFT", old_ln)
+                mark(files[path], hunk, "LEFT", old_ln, line[1:])
                 old_ln, rem_old = old_ln + 1, rem_old - 1
             else:
                 rem_old = rem_new = 0  # malformed hunk, resync on the next header
@@ -84,14 +84,15 @@ def parse_diff(text):
             # because it carries the most risk, with nowhere to hang a comment.
             path = was if target == "/dev/null" else clean_path(target)
             if path:
-                files.setdefault(path, {"LEFT": set(), "RIGHT": set(), "hunks": []})
+                files.setdefault(path, {"LEFT": set(), "RIGHT": set(), "hunks": [], "text": {}})
 
     return files
 
 
-def mark(entry, hunk, side, line):
+def mark(entry, hunk, side, line, text=""):
     """Record a line on both the file-wide set and the hunk it came from."""
     entry[side].add(line)
+    entry["text"][(side, line)] = text
     if hunk is not None:
         hunk[side].add(line)
         hunk["pos"].setdefault((side, line), len(hunk["pos"]))
@@ -164,3 +165,26 @@ def untouched_anchor(where, files):
         f"flag at {path}:{line} is outside the frozen diff; "
         f"nearest touched line is {path}:{nearest}"
     )
+
+
+def anchor_line(where, files):
+    """The first cited line that lands in the diff, as {path, text}, head side first.
+
+    A line number moves when code above it does, so a finding is matched across heads by
+    the words on its line rather than by where they sit.
+    """
+    paths = sorted(files)
+    text = str(where or "").strip()
+    whole = LOCATION_LINE.match(text.rstrip(",;+\u00b7"))
+    tokens = [whole] if whole and resolve_path(whole["path"], paths) else [
+        LOCATION_LINE.match(t.rstrip(",;+\u00b7")) for t in text.split(" ")
+    ]
+    for cited in tokens:
+        path = resolve_path(cited["path"], paths) if cited else None
+        if path is None:
+            continue
+        for side in ("RIGHT", "LEFT"):
+            words = files[path]["text"].get((side, int(cited["line"])))
+            if words is not None and words.strip():
+                return {"path": path, "text": words.strip()}
+    return None

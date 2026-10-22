@@ -14,7 +14,8 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from session_store import DROP_REASONS, SessionStore, StoreError  # noqa: E402
+from session_store import DROP_REASONS, FLAG_STATES, SessionStore, StoreError  # noqa: E402
+from diff_lines import LOCATION_LINE, resolve_path  # noqa: E402
 from pr_snapshot import (  # noqa: E402
     TargetMoved,
     capture,
@@ -23,6 +24,7 @@ from pr_snapshot import (  # noqa: E402
     check_controller,
     check_worktree,
     context_log,
+    moved_lines,
     read_blob,
     review_identity,
     review_receipt,
@@ -84,7 +86,6 @@ def path_from_token(token):
     return path
 
 
-FLAG_STATES = ("flag", "accepted", "dropped", "decided")
 LEDGER_COUNTS = (
     "beats", "flags", "open", "accepted", "decided", "dropped", "unverified",
     "confirmed", "disputed", "questions",
@@ -150,6 +151,50 @@ def ledger(reviews):
         entry.update(share(counts))
         sessions.append(entry)
     return {"sessions": sessions, "overall": share(overall)}
+
+
+def history(root):
+    """Findings earlier sessions on this repository left on the paths this one touches."""
+    root = Path(root).expanduser()
+    store = SessionStore(root)
+    session, _beats = store.snapshot()
+    target = session.get("target") or {}
+    repo = target.get("repo") or session.get("repo")
+    paths = sorted(store.changed_paths()) if target else None
+    found = []
+    for sibling in sorted(path for path in root.parent.iterdir() if path.is_dir()):
+        if sibling.resolve() == root.resolve() or not (
+            (sibling / "session.sqlite3").exists() or (sibling / "session.json").exists()
+        ):
+            continue
+        try:
+            prior, beats = SessionStore.detached_presentation_snapshot(sibling)
+        except (OSError, sqlite3.Error, json.JSONDecodeError, StoreError):
+            continue
+        prior_target = prior.get("target") or {}
+        if (prior_target.get("repo") or prior.get("repo")) != repo:
+            continue
+        findings = []
+        for beat in beats:
+            if beat.get("state") not in FLAG_STATES:
+                continue
+            cited = LOCATION_LINE.match(str(beat.get("where") or "").strip())
+            if paths is not None and not (cited and resolve_path(cited["path"], paths)):
+                continue
+            findings.append({
+                key: beat[key]
+                for key in ("n", "where", "claim", "state", "reason", "call")
+                if beat.get(key) is not None
+            })
+        if findings:
+            found.append({
+                "session": sibling.name,
+                "number": prior_target.get("number"),
+                "head_sha": prior_target.get("head_sha"),
+                "round": (prior.get("predecessor") or {}).get("round", 1),
+                "findings": findings,
+            })
+    return {"repo": repo, "sessions": found}
 
 
 def parser():
@@ -272,6 +317,13 @@ def parser():
 
     stats = commands.add_parser("stats")
     stats.add_argument("reviews")
+
+    link = commands.add_parser("link-predecessor")
+    link.add_argument("session")
+    link.add_argument("predecessor")
+
+    prior = commands.add_parser("history")
+    prior.add_argument("session")
     return ap
 
 
@@ -398,6 +450,12 @@ def run(args):
         return SessionStore(args.session).export_json()
     elif args.command == "stats":
         return ledger(args.reviews)
+    elif args.command == "history":
+        return history(args.session)
+    elif args.command == "link-predecessor":
+        store = SessionStore(args.session)
+        predecessor = SessionStore(args.predecessor)
+        result = store.link_predecessor(predecessor, moved_lines(store, predecessor))
     else:
         raise StoreError(f"unknown command {args.command!r}")
 
