@@ -1015,6 +1015,11 @@ def beat_html(
     reading = second_read_html(beat.get("second_read"))
     if reading:
         body.append(reading)
+    if isinstance(beat.get("over_drop"), str) and beat["over_drop"].strip():
+        body.append(
+            '<div class="second-read over-drop"><span class="lbl">Raised over an earlier drop</span>'
+            f'<span>{md(beat["over_drop"])}</span></div>'
+        )
     body.append(outcome_html(beat, mode))
     if beat.get("call"):
         label = f"Dropped as {why}" if why else "Your call"

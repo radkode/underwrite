@@ -2824,6 +2824,11 @@ class SecondReadAndCarriedRounds(unittest.TestCase):
         page = rr.render({"repo": "acme/widget", "number": 7}, [unread], "", {})
         self.assertIn('<span class="lbl">Not read twice</span><span>no subagent tool</span>', page)
 
+    def test_a_flag_raised_over_a_drop_says_how_it_differs(self):
+        beat = dict(self.FLAG, over_drop="the pin holds; the name shadows a builtin")
+        page = rr.render({"repo": "acme/widget", "number": 7}, [beat], "", {})
+        self.assertIn('<span class="lbl">Raised over an earlier drop</span><span>the pin holds; the name shadows a builtin</span>', page)
+
     def test_a_beat_with_no_second_read_shows_no_line(self):
         page = rr.render({"repo": "acme/widget", "number": 7}, [self.FLAG], "", {})
         self.assertNotIn("second-read", page)

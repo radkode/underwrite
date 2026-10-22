@@ -876,9 +876,8 @@ class ReplacementRounds(unittest.TestCase):
         linked = self.link(third, second)
 
         self.assertEqual(linked["round"], 3)
-        self.assertEqual(
-            [(entry["round"], entry["n"]) for entry in linked["carried"]], [(1, 1), (1, 2)]
-        )
+        # Round 1's open flag sat on line 4, which round 2 re-walked when it moved.
+        self.assertEqual([(entry["round"], entry["n"]) for entry in linked["carried"]], [(1, 1)])
         with self.assertRaisesRegex(session_store.StoreError, "round 1"):
             session_store.SessionStore(third).put_beat(self.flag(1, 2))
 
@@ -943,6 +942,89 @@ class ReplacementRounds(unittest.TestCase):
         linked = self.link(replacement, prior)
 
         self.assertEqual(linked["moved"], {"a.py": []})
+
+    def test_navigation_cannot_raise_a_dropped_finding_either(self):
+        prior = self.reviewed()
+        replacement = self.session("acme-widget-pr7-r2", self.second)
+        self.link(replacement, prior)
+        store = session_store.SessionStore(replacement)
+        action = store.produce("nav-1", None, "next", "")
+        session = dict(store.snapshot()[0], current_beat=1)
+
+        with self.assertRaisesRegex(session_store.StoreError, "dropped this finding"):
+            store.apply(action["seq"], {"kind": "walk", "current_beat": 1}, session=session,
+                        beats=(self.flag(1, 2),))
+        self.assertEqual(store.snapshot()[1], [])
+
+    def test_over_drop_raises_a_different_finding_on_a_dropped_line(self):
+        prior = self.reviewed()
+        replacement = self.session("acme-widget-pr7-r2", self.second)
+        self.link(replacement, prior)
+        store = session_store.SessionStore(replacement)
+
+        written = store.put_beat(self.flag(1, 2, over_drop="the pin is fine; the name now shadows a builtin"))
+        self.assertEqual(written["state"], "flag")
+        with self.assertRaisesRegex(session_store.StoreError, "names no earlier drop"):
+            store.put_beat(self.flag(2, 4, over_drop="nothing was dropped here"))
+
+    def test_a_binary_change_between_heads_moves_the_file_whole(self):
+        (self.repo / "logo.bin").write_bytes(b"\x00\x01old")
+        self.git("add", "logo.bin")
+        self.git("commit", "-q", "-m", "binary")
+        first = self.git("rev-parse", "HEAD")
+        (self.repo / "logo.bin").write_bytes(b"\x00\x01new")
+        self.git("commit", "-q", "-am", "binary again")
+        second = self.git("rev-parse", "HEAD")
+        prior = self.session("acme-widget-pr7", first)
+        replacement = self.session("acme-widget-pr7-r2", second)
+
+        linked = self.link(replacement, prior)
+
+        self.assertEqual(linked["moved"], {"logo.bin": []})
+
+    def test_a_later_round_supersedes_what_an_earlier_round_left_open(self):
+        prior = self.reviewed()
+        second = self.session("acme-widget-pr7-r2", self.second)
+        self.link(second, prior)
+        store = session_store.SessionStore(second)
+        store.put_beat(self.flag(1, 4))
+        store.produce("drop-1", 1, "drop", "fast is intended", reason="intentional")
+        store.ack(store.head()["seq"])
+        third_head = self.commit("one\nTWO = unpinned\nthree\nFOUR = fast\nfive\nsix\n")
+        third = self.session("acme-widget-pr7-r3", third_head)
+
+        linked = self.link(third, second)
+
+        self.assertEqual(
+            [(entry["round"], entry["n"], entry["state"]) for entry in linked["carried"]],
+            [(1, 1, "dropped"), (2, 1, "dropped")],
+        )
+
+    def test_history_marks_order_unknown_where_creation_time_is_not_recorded(self):
+        self.reviewed()
+        current = self.session("acme-widget-pr7-r2", self.second)
+        spec = importlib.util.spec_from_file_location("sessionctl_module", SESSIONCTL)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.born = lambda root: None
+
+        result = module.history(current)
+
+        self.assertEqual([(e["session"], e["order"]) for e in result["sessions"]], [("acme-widget-pr7", "unknown")])
+
+    def test_confinement_refuses_a_session_outside_the_eval_root(self):
+        current = self.session("acme-widget-pr7-r2", self.second)
+        env = dict(os.environ, UNDERWRITE_CONFINE=str(self.reviews / "scratch"))
+        (self.reviews / "scratch").mkdir()
+        escape = self.reviews / "scratch" / ".." / "acme-widget-pr7-r2"
+        for target in (current, escape):
+            with self.subTest(target=str(target)):
+                completed = subprocess.run(
+                    [sys.executable, str(SESSIONCTL), "get-session", str(target)],
+                    text=True, capture_output=True, env=env, stdin=subprocess.DEVNULL,
+                )
+                self.assertEqual(completed.returncode, 1)
+                self.assertIn("outside UNDERWRITE_CONFINE", completed.stderr)
 
     def test_history_lists_earlier_findings_on_the_paths_this_session_touches(self):
         self.reviewed()

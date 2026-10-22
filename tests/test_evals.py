@@ -103,7 +103,7 @@ class Scoring(unittest.TestCase):
             },
             inputs / "pr.diff", inputs / "pr.json", inputs / "trusted.json", inputs / "pr.bundle",
         )
-        store.patch_session({"recommendation": "Eval mode: done."})
+        store.patch_session({"recommendation": "Eval mode: done.", "eval_complete": True})
         self.store = store
 
     def case(self, kind="miss", lines=(5,)):
@@ -158,6 +158,13 @@ class Scoring(unittest.TestCase):
         self.store.put_beat(self.flag(2, 15))
         result = score.score(self.case(), self.root)
         self.assertEqual(len(result["found"]), 1)
+        self.assertFalse(result["pass"])
+
+    def test_a_provisional_recommendation_without_the_marker_is_unfinished(self):
+        self.store.put_beat(self.flag(1, 5))
+        self.store.patch_session({"eval_complete": False})
+        result = score.score(self.case(), self.root)
+        self.assertFalse(result["finished"])
         self.assertFalse(result["pass"])
 
     def test_a_walk_with_no_recommendation_is_unfinished(self):
@@ -231,11 +238,29 @@ class Runner(unittest.TestCase):
             "results": [{"case": "a", "pass": True}, {"case": "b", "pass": False}],
         }
         same = {"summary": {"missed": 0, "false_alarms": 1},
-                "results": [{"case": "a", "pass": True}, {"case": "b", "pass": False}]}
+                "results": [{"case": "a", "pass": True, "finished": True},
+                            {"case": "b", "pass": False, "finished": True}]}
         self.assertEqual(run.regressions(baseline, same), [])
         worse = {"summary": {"missed": 1, "false_alarms": 2},
-                 "results": [{"case": "a", "pass": False}, {"case": "b", "pass": False}]}
+                 "results": [{"case": "a", "pass": False, "finished": True},
+                             {"case": "b", "pass": False, "finished": True}]}
         self.assertEqual(len(run.regressions(baseline, worse)), 3)
+
+    def test_an_unscored_case_never_holds_steady(self):
+        baseline = {
+            "summary": {"missed": 1, "false_alarms": 1},
+            "results": [{"case": "a", "pass": True}, {"case": "b", "pass": False},
+                        {"case": "c", "pass": False}],
+        }
+        report = {"summary": {"missed": 0, "false_alarms": 0}, "results": [
+            {"case": "a", "pass": True, "finished": True},
+            {"case": "b", "error": "walk exited 1; see walk.stderr"},
+        ]}
+        found = run.regressions(baseline, report)
+        self.assertIn("b errored: walk exited 1; see walk.stderr", found)
+        self.assertIn("c is in the baseline and was not run", found)
+        report["results"][1] = {"case": "b", "pass": False, "finished": False}
+        self.assertIn("b did not finish its walk", run.regressions(baseline, report))
 
     def test_the_skill_documents_the_mode_and_the_scratch_reviews_root(self):
         text = " ".join((ROOT / "skills" / "underwrite" / "SKILL.md").read_text(encoding="utf-8").split())
@@ -243,6 +268,7 @@ class Runner(unittest.TestCase):
         self.assertIn("Leave every flag open, deliver nothing, skip Phase 4", text)
         self.assertIn("When `UNDERWRITE_REVIEWS` is set, it replaces `~/.claude/reviews`", text)
         self.assertIn("pass its path instead of piping it", text)
+        self.assertIn("`eval_complete: true`", text)
 
 
 if __name__ == "__main__":

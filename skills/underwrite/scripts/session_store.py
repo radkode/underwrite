@@ -323,9 +323,24 @@ def second_read_problems(beat):
     return []
 
 
+def over_drop_problems(beat):
+    """A flag raised over an earlier drop says, in a line, how it differs from what was dropped."""
+    if "over_drop" not in beat:
+        return []
+    n = beat.get("n", "?")
+    text = beat["over_drop"]
+    if beat.get("state") not in FLAG_STATES:
+        return [f"beat {n}: over_drop belongs to a flag"]
+    if not isinstance(text, str) or not text.strip():
+        return [f"beat {n}: over_drop must be nonempty text"]
+    if len(text.split()) > BEAT_BUDGET["slot_words"]:
+        return [f"beat {n}: over_drop is {len(text.split())} words, over {BEAT_BUDGET['slot_words']}"]
+    return []
+
+
 def validate_beat(beat, mode="branch", final=False):
     """Return beat contract violations. Empty means the beat is shippable."""
-    problems = decision_problems(beat) + second_read_problems(beat)
+    problems = decision_problems(beat) + second_read_problems(beat) + over_drop_problems(beat)
     n = beat.get("n", "?")
     state = beat.get("state")
     raw_slots = beat.get("slots")
@@ -3521,7 +3536,7 @@ class SessionStore:
         files = parse_diff(
             predecessor.read_verified_target_diff()[1].decode("utf-8", "replace")
         )
-        carried = list(earlier.get("carried", ()))
+        fresh = []
         for beat in prior_beats:
             if beat.get("state") not in FLAG_STATES:
                 continue
@@ -3529,11 +3544,30 @@ class SessionStore:
             for field in ("n", "where", "claim", "reason", "call", "landed"):
                 if beat.get(field) is not None:
                     entry[field] = beat[field]
-            if beat["state"] == "dropped":
-                anchor = anchor_line(beat.get("where"), files)
-                if anchor is not None:
-                    entry["anchor"] = anchor
+            anchor = anchor_line(beat.get("where"), files)
+            if anchor is not None:
+                entry["anchor"] = anchor
+            fresh.append(entry)
+        # The latest round's word on a finding replaces what an earlier round carried for it,
+        # and an unsettled finding whose line changed was walked again in that round.
+        settled = [entry["anchor"] for entry in fresh if "anchor" in entry]
+
+        def still_reads(anchor):
+            texts = files.get(anchor["path"], {}).get("text", {})
+            return any(text.rstrip() == anchor["text"] for text in texts.values())
+
+        carried = []
+        for entry in earlier.get("carried", ()):
+            anchor = entry.get("anchor")
+            unsettled = entry.get("state") == "flag" or (
+                entry.get("state") == "accepted" and not entry.get("landed")
+            )
+            if anchor is not None and anchor in settled:
+                continue
+            if anchor is not None and unsettled and not still_reads(anchor):
+                continue
             carried.append(entry)
+        carried += fresh
         if not isinstance(moved, dict) or moved.get("prior_head_sha") != prior_target["head_sha"]:
             raise StoreError("moved lines must be computed against the predecessor's head")
         with self._first_work_write() as db:
@@ -3567,6 +3601,14 @@ class SessionStore:
                 self._bump_render(db)
         return self.snapshot()[0]["predecessor"]
 
+    def _guard_beat(self, session, beat):
+        """The checks every write of a beat answers to, whichever command carries it."""
+        problems = second_read_problems(beat) + over_drop_problems(beat)
+        if problems:
+            raise StoreError("; ".join(problems))
+        self._refuse_untouched_flag(session, beat)
+        self._refuse_dropped_finding(session, beat)
+
     def _refuse_dropped_finding(self, session, beat):
         """A finding the reviewer dropped is not raised again while its line reads the same."""
         predecessor = session.get("predecessor")
@@ -3575,16 +3617,23 @@ class SessionStore:
             return
         files = parse_diff(self._verified_diff_bytes(target).decode("utf-8", "replace"))
         anchor = anchor_line(beat.get("where"), files)
-        if anchor is None:
+        drops = [
+            entry for entry in predecessor.get("carried", ())
+            if anchor is not None and entry.get("state") == "dropped" and entry.get("anchor") == anchor
+        ]
+        if "over_drop" in beat and not drops:
+            raise StoreError(
+                f"beat {beat['n']}: over_drop names no earlier drop on this line; remove it"
+            )
+        if "over_drop" in beat:
             return
-        for entry in predecessor.get("carried", ()):
-            if entry.get("state") == "dropped" and entry.get("anchor") == anchor:
-                raise StoreError(
-                    f"beat {beat['n']}: the reviewer dropped this finding in round "
-                    f"{entry['round']} as {entry.get('reason', 'unstated')} "
-                    f"({entry.get('call', 'no words')!r}); its line still reads the same, "
-                    "so it is not raised again"
-                )
+        for entry in drops:
+            raise StoreError(
+                f"beat {beat['n']}: the reviewer dropped this finding in round "
+                f"{entry['round']} as {entry.get('reason', 'unstated')} "
+                f"({entry.get('call', 'no words')!r}); its line still reads the same, "
+                "so it is not raised again unless over_drop says how this finding differs"
+            )
 
     def changed_paths(self):
         """The paths the frozen diff touches, read only after its digest verifies.
@@ -3742,11 +3791,7 @@ class SessionStore:
                             raise StoreError(f"beat {beat['n']} slots must be an object")
                         slots["fix"] = current_slots["fix"]
                 self._hold_authorized_finding(db, beat, current)
-            problems = second_read_problems(beat)
-            if problems:
-                raise StoreError("; ".join(problems))
-            self._refuse_untouched_flag(session, beat)
-            self._refuse_dropped_finding(session, beat)
+            self._guard_beat(session, beat)
             changed, _revision, _state, _detail = self._save_beat(db, beat)
             if changed:
                 self._bump_render(db)
@@ -4281,7 +4326,7 @@ class SessionStore:
                         )
                 else:
                     self._validate_new_beat(beat)
-                    self._refuse_untouched_flag(normalized_session, beat)
+                    self._guard_beat(normalized_session, beat)
                     beat_changed, _revision, _state, _detail = self._save_beat(db, beat)
                     changed = beat_changed or changed
             if changed:

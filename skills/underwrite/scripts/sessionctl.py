@@ -5,6 +5,7 @@ import argparse
 import base64
 import binascii
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -156,12 +157,12 @@ def ledger(reviews):
 
 
 def born(root):
-    """When a session's store came to exist; the store keeps no creation time of its own."""
+    """When a session's store came to exist, where the filesystem records it. The store keeps
+    no creation time, and a modification time moves with every write, so it never stands in."""
     for name in ("session.sqlite3", "session.json"):
         path = root / name
         if path.exists():
-            stat = path.stat()
-            return getattr(stat, "st_birthtime", stat.st_mtime)
+            return getattr(path.stat(), "st_birthtime", None)
     return None
 
 
@@ -177,11 +178,14 @@ def history(root):
     found, unreadable = [], []
     now = born(root)
     for sibling in sorted(path for path in root.parent.iterdir() if path.is_dir()):
-        if sibling.resolve() == root.resolve():
+        if sibling.resolve() == root.resolve() or not (
+            (sibling / "session.sqlite3").exists() or (sibling / "session.json").exists()
+        ):
             continue
         started = born(sibling)
-        if started is None or (now is not None and started >= now):
+        if started is not None and now is not None and started >= now:
             continue
+        order = "earlier" if started is not None and now is not None else "unknown"
         try:
             prior, beats = SessionStore.detached_presentation_snapshot(sibling)
         except (OSError, sqlite3.Error, json.JSONDecodeError, StoreError) as error:
@@ -207,6 +211,7 @@ def history(root):
             "number": prior_target.get("number"),
             "head_sha": prior_target.get("head_sha"),
             "round": (prior.get("predecessor") or {}).get("round", 1),
+            "order": order,
             "recommendation": prior.get("recommendation"),
             "facts": list(prior.get("facts") or ()),
             "findings": findings,
@@ -344,7 +349,23 @@ def parser():
     return ap
 
 
+def confine(args):
+    """Under the eval runner every session path has to resolve inside its scratch root."""
+    root = os.environ.get("UNDERWRITE_CONFINE")
+    if not root:
+        return
+    boundary = Path(root).resolve()
+    for name in ("session", "predecessor", "reviews"):
+        value = getattr(args, name, None)
+        if value is None:
+            continue
+        target = Path(value).expanduser().resolve()
+        if target != boundary and boundary not in target.parents:
+            raise StoreError(f"{name} {value} is outside UNDERWRITE_CONFINE {boundary}")
+
+
 def run(args):
+    confine(args)
     if args.command == "init":
         store = SessionStore(
             args.session, handled_override=args.handled_seq, create=True

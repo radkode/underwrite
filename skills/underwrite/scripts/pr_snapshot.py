@@ -1022,6 +1022,8 @@ def moved_lines(store, predecessor):
     so a rebase that moved the base under unrelated code does not reopen the walk.
     """
     files = parse_diff(store.read_verified_target_diff()[1].decode("utf-8", "replace"))
+    # A binary or mode-only change has no text hunk, so the path list comes from the names.
+    paths = sorted(set(files) | set(store.changed_paths()))
     with _review_repo(store) as (repo, target):
         with tempfile.TemporaryDirectory(prefix="underwrite-prior-") as temporary:
             bundle = Path(temporary) / "prior.bundle"
@@ -1040,20 +1042,21 @@ def moved_lines(store, predecessor):
             )
         if _commit(repo, "refs/underwrite/prior") != prior["head_sha"]:
             raise Conflict("predecessor object bundle head does not match its target")
-        between_args = ["refs/underwrite/prior", "refs/underwrite/head", "--", *sorted(files)]
+        between_args = ["refs/underwrite/prior", "refs/underwrite/head", "--", *paths]
         safe_diff = ["diff", "--no-color", "--no-ext-diff", "--no-textconv"]
         raw = _git(
             [*safe_diff, "--unified=0", "--src-prefix=a/", "--dst-prefix=b/", *between_args],
             repo,
             safe=True,
-        ) if files else b""
-        names = _git([*safe_diff, "--name-only", "-z", *between_args], repo, safe=True) if files else b""
+        ) if paths else b""
+        names = _git([*safe_diff, "--name-only", "-z", *between_args], repo, safe=True) if paths else b""
     text = raw.decode("utf-8", "replace")
     between = parse_diff(text)
     changed = {name.decode("utf-8", "replace") for name in names.split(b"\0") if name}
     removed = _removal_points(text)
     moved = {}
-    for path, sides in sorted(files.items()):
+    for path in paths:
+        sides = files.get(path, {"RIGHT": set()})
         lines = sides["RIGHT"] & (
             between.get(path, {}).get("RIGHT", set()) | removed.get(path, set())
         )

@@ -99,7 +99,7 @@ def matches(item, beat):
 def score(case, session_root):
     """A standing flag is one the walk would put in front of a reviewer; a demoted one is not.
     A case passes when every expected finding is found and nothing else stands, and only for
-    a finished walk: at least one beat and a recorded recommendation."""
+    a finished walk: at least one beat, a recommendation, and the eval_complete marker."""
     session, beats = SessionStore.detached_presentation_snapshot(session_root)
     target = session.get("target") or {}
     if (
@@ -127,7 +127,13 @@ def score(case, session_root):
         for beat in standing
         if beat["n"] not in used
     ]
-    finished = bool(beats) and bool(str(session.get("recommendation") or "").strip())
+    # A recommendation is written provisionally before the walk, so only the marker eval mode
+    # writes last says the walk reached its end.
+    finished = (
+        bool(beats)
+        and bool(str(session.get("recommendation") or "").strip())
+        and session.get("eval_complete") is True
+    )
     return {
         "case": case["id"],
         "kind": case["kind"],

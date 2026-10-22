@@ -29,8 +29,9 @@ holds, the second read included. At each of the two decisions take the option yo
 recommend and record it in your own words as the call, marked as eval mode. Do not serve
 the page, post status, or park: write each beat and go straight to the next. Leave every
 flag open, deliver nothing, skip Phase 4, and end with the recommendation and the count of
-flags raised. Patch `recommendation` as the last write, because the scorer counts a walk
-without one as unfinished. The runner allows writes only under `$UNDERWRITE_REVIEWS`, so
+flags raised. The last write is one `patch-session` carrying the final `recommendation` and
+`eval_complete: true`; the scorer counts a walk without that marker as unfinished, because
+a provisional recommendation exists from Phase 1 onward. The runner allows writes only under `$UNDERWRITE_REVIEWS`, so
 write each document for `sessionctl.py` to a file in `$R` and pass its path instead of
 piping it.
 
@@ -94,8 +95,8 @@ not pre-existing issues. In a PR session the store holds you to the last one: a 
 line the PR never put in front of the reviewer is refused with the nearest touched line
 named. In a replacement, a flag on a line where an earlier round's reviewer dropped the
 same finding is refused while the line still reads the same. A genuinely different
-finding on that line goes in as an `UNVERIFIED` beat whose claim says how it differs, and
-the reviewer raises it with a question if they agree. A branch flag carries the smallest implementation intent
+finding on that line carries `over_drop`, one line saying how it differs from what was
+dropped, and the page shows that line beside the earlier call so the reviewer judges it. A branch flag carries the smallest implementation intent
 that could resolve it. When the same fix applies at several sites, `FIX` states the count
 and one example, so the class gets fixed rather than the one line you happened to quote. A PR flag carries a finding ready to include in the final review or
 durable report. A policy question carries a named decision with its options. Never claim
@@ -1143,6 +1144,9 @@ the six keys from rule 2, spelled lower case: `what`, `why`, `proof`, `risk`, `p
 requires `ran`. A beat stored before the field existed keeps the verdict it landed with.
 `lands[]` entries are `{state: landed|ready|open, what, where}`.
 
+`over_drop` is optional text of at most 25 words on a flag whose line carries an earlier
+round's drop; the store refuses it anywhere else.
+
 `second_read` holds exactly `verdict` and `evidence`. `confirmed` and `unread` sit only on a
 flag or what a flag became; `disputed` sits only on an `unverified` beat, the demoted flag.
 The evidence is at most 25 words. Beats from before the field carry none.
@@ -1179,9 +1183,11 @@ settled finding from earlier rounds with its round, state, call, reason, and for
 the words on its line. Only `link-predecessor` writes it.
 
 Sessions accumulate into a review history, and `history` is how a later session reads it:
-for every session on the same repository whose store predates this one, its facts, its
-recommendation, and the findings it left on the paths this one touches. Sessions it cannot
-read are listed as unreadable, never skipped silently.
+for every other session on the same repository, its facts, its recommendation, and the
+findings it left on the paths this one touches. Where the filesystem records when a store
+was created, only earlier sessions appear, marked `order: earlier`; elsewhere every other
+session appears marked `order: unknown`, so weigh it as context, not as the record. Sessions
+it cannot read are listed as unreadable, never skipped silently.
 
 ## Formatting
 

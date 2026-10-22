@@ -48,7 +48,7 @@ def allowed_tools(skill, reviews, checkout):
         "Bash(gh pr view *)",
         "Bash(git remote *)",
         "Bash(gh issue view *)",
-        "Bash(mkdir -p *)",
+        f"Bash(mkdir -p {reviews}/*)",
         "Bash(git status *)",
         "Bash(git rev-parse *)",
         "Bash(git log *)",
@@ -105,7 +105,8 @@ def run_case(case, args):
         )
         walk = subprocess.run(
             command(case, ROOT, reviews, checkout, args), cwd=checkout, capture_output=True, text=True,
-            env=dict(os.environ, UNDERWRITE_REVIEWS=str(reviews)), timeout=args.timeout,
+            env=dict(os.environ, UNDERWRITE_REVIEWS=str(reviews), UNDERWRITE_CONFINE=str(reviews)),
+            timeout=args.timeout,
             stdin=subprocess.DEVNULL,
         )
         (work / "walk.json").write_text(walk.stdout, encoding="utf-8")
@@ -166,13 +167,18 @@ def main(argv=None):
 
 
 def regressions(baseline, report):
-    """What got worse: a case that passed and now fails, or more misses or false alarms."""
+    """What got worse: a case that errored, did not finish, went missing, or passed and now
+    fails, or more misses or false alarms. An unscored case never counts as holding steady."""
     before = {r["case"]: r for r in baseline.get("results", ())}
-    worse = [
-        f"{r['case']} passed in the baseline and now fails"
-        for r in report["results"]
-        if before.get(r["case"], {}).get("pass") and not r.get("pass")
-    ]
+    now = {r["case"]: r for r in report["results"]}
+    worse = [f"{case} is in the baseline and was not run" for case in sorted(set(before) - set(now))]
+    for r in report["results"]:
+        if r.get("error"):
+            worse.append(f"{r['case']} errored: {r['error']}")
+        elif not r.get("finished"):
+            worse.append(f"{r['case']} did not finish its walk")
+        elif before.get(r["case"], {}).get("pass") and not r.get("pass"):
+            worse.append(f"{r['case']} passed in the baseline and now fails")
     for key in ("missed", "false_alarms"):
         if report["summary"][key] > baseline.get("summary", {}).get(key, 0):
             worse.append(f"{key} rose from {baseline['summary'].get(key, 0)} to {report['summary'][key]}")

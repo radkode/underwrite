@@ -787,6 +787,8 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
 .second-read.disputed .lbl { color: var(--unver); }
 .second-read.unread { background: var(--flag-bg); }
 .second-read.unread .lbl { color: var(--flag); }
+.second-read.over-drop { background: var(--flag-bg); }
+.second-read.over-drop .lbl { color: var(--flag); }
 
 /* Named .shipped, not .landed: .next-row.landed already exists in What lands,
    and a bare .landed rule silently overrode that section's grid. */

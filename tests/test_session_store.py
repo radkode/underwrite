@@ -4353,6 +4353,26 @@ class SecondRead(StoreCase):
         with self.assertRaisesRegex(session_store.StoreError, "belongs to a flag"):
             self.store.put_beat(dict(self.demoted(second_read=unread), n=4))
 
+    def test_navigation_answers_to_the_same_second_read_rule(self):
+        action = self.store.produce("nav-1", None, "next", "")
+        session = dict(self.store.snapshot()[0], current_beat=3)
+        result = {"kind": "walk", "current_beat": 3}
+        with self.assertRaisesRegex(session_store.StoreError, "demotes the flag"):
+            self.store.apply(
+                action["seq"], result, session=session,
+                beats=(dict(FLAG, n=3, second_read=self.DISPUTED),),
+            )
+        self.assertNotIn(3, [beat["n"] for beat in self.store.snapshot()[1]])
+
+    def test_over_drop_belongs_to_a_flag_and_has_words(self):
+        for beat, message in (
+            (self.demoted(over_drop="different"), "belongs to a flag"),
+            (dict(FLAG, n=3, over_drop=" "), "nonempty text"),
+        ):
+            with self.subTest(message=message):
+                with self.assertRaisesRegex(session_store.StoreError, message):
+                    self.store.put_beat(beat)
+
     def test_a_stored_flag_cannot_be_demoted_by_a_rewrite(self):
         self.store.put_beat(dict(FLAG, n=3))
         with self.assertRaisesRegex(session_store.StoreError, "demotes the flag"):
