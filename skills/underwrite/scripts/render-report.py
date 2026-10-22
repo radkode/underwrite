@@ -921,6 +921,7 @@ def carried_html(session, mode, live):
         f"This round walks {lines} line{'' if lines == 1 else 's'} in {files} that "
         f"moved since {html.escape(prior)}. Everything else was walked "
         + ("in round 1." if earlier == 1 else f"in rounds 1 to {earlier}.")
+        + " These calls are not in the counts above."
     )
     entries = [e for e in predecessor.get("carried") or () if isinstance(e, dict)]
     rows = []
@@ -930,7 +931,7 @@ def carried_html(session, mode, live):
             why = REASON_LABEL.get(entry.get("reason"))
             outcome = f"Dropped as {why}" if why else "Dropped"
         elif state == "accepted" and mode != "report" and not entry.get("landed"):
-            outcome = "Accepted, never delivered"
+            outcome = "Accepted, never implemented" if mode == "branch" else "Accepted, never posted"
         elif state == "accepted":
             outcome = ACCEPTED_TOKEN.get(mode, "INCLUDED").capitalize()
         elif state == "flag":

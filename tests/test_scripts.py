@@ -2843,7 +2843,7 @@ class SecondReadAndCarriedRounds(unittest.TestCase):
         self.assertIn('<span class="sep">·</span><span>round 2</span>', page)
         self.assertIn("Carried from earlier rounds", page)
         self.assertIn("This round walks 2 lines in 1 file that moved since bbbbbbb.", page)
-        self.assertIn("Everything else was walked in round 1.", page)
+        self.assertIn("Everything else was walked in round 1. These calls are not in the counts above.", page)
         self.assertIn("<strong>Dropped as intentional.</strong>", page)
         self.assertIn("<strong>Included.</strong> missing guard.", page)
         self.assertIn("<q>pinned on purpose</q>", page)
@@ -2859,7 +2859,7 @@ class SecondReadAndCarriedRounds(unittest.TestCase):
         }
         page = rr.render(session, [], "", {})
         self.assertIn("<strong>Still open, raised again here if it holds.</strong>", page)
-        self.assertIn("<strong>Accepted, never delivered.</strong>", page)
+        self.assertIn("<strong>Accepted, never posted.</strong>", page)
 
     def test_a_first_round_session_shows_neither(self):
         page = rr.render({"repo": "acme/widget", "number": 7}, [], "", {})
