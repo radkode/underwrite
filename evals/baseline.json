@@ -1,28 +1,9 @@
 {
   "results": [
     {
-      "beats": 5,
+      "beats": 4,
       "case": "ai-kit-5-core-deps",
-      "cost_usd": 1.6385114999999997,
-      "demoted": 0,
-      "false_alarms": [
-        {
-          "claim": null,
-          "n": 2,
-          "where": "scripts/check-core-deps.mjs:16"
-        }
-      ],
-      "finished": true,
-      "flags": 1,
-      "found": [],
-      "kind": "clean",
-      "missed": [],
-      "pass": false
-    },
-    {
-      "beats": 2,
-      "case": "underwrite-12-host-guard",
-      "cost_usd": 1.3789662,
+      "cost_usd": 1.5828408000000003,
       "demoted": 0,
       "false_alarms": [],
       "finished": true,
@@ -33,14 +14,27 @@
       "pass": true
     },
     {
-      "beats": 2,
+      "beats": 3,
+      "case": "underwrite-12-host-guard",
+      "cost_usd": 1.8406928000000002,
+      "demoted": 0,
+      "false_alarms": [],
+      "finished": true,
+      "flags": 0,
+      "found": [],
+      "kind": "clean",
+      "missed": [],
+      "pass": true
+    },
+    {
+      "beats": 1,
       "case": "underwrite-17-sigterm",
-      "cost_usd": 1.6863358000000002,
+      "cost_usd": 1.7215960000000001,
       "demoted": 0,
       "false_alarms": [
         {
-          "claim": "the startup-race regression test passes against the old ordering in most runs",
-          "n": 2,
+          "claim": "the race test passes on the old ordering most runs",
+          "n": 1,
           "where": "tests/test_serve.py:434"
         }
       ],
@@ -54,11 +48,17 @@
     {
       "beats": 5,
       "case": "underwrite-76-normalize-compare",
-      "cost_usd": 1.5025880000000003,
+      "cost_usd": 2.2239962,
       "demoted": 0,
-      "false_alarms": [],
+      "false_alarms": [
+        {
+          "claim": "a linked child seeded before v6 from an uppercase beat can no longer be resumed",
+          "n": 5,
+          "where": "skills/underwrite/scripts/session_store.py:2485"
+        }
+      ],
       "finished": true,
-      "flags": 0,
+      "flags": 1,
       "found": [],
       "kind": "miss",
       "missed": [
@@ -81,9 +81,9 @@
       "pass": false
     },
     {
-      "beats": 3,
+      "beats": 4,
       "case": "underwrite-83-legacy-guard",
-      "cost_usd": 1.5373973000000003,
+      "cost_usd": 1.8666264000000004,
       "demoted": 0,
       "false_alarms": [],
       "finished": true,
@@ -113,6 +113,6 @@
     "cases": 5,
     "false_alarms": 2,
     "missed": 1,
-    "passed": 2
+    "passed": 3
   }
 }

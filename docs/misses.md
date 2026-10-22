@@ -45,16 +45,23 @@ alarms on the clean cases.
 | 2026-10-21 | second read demotes on any no | `underwrite-83-legacy-guard` | fail: the walk flagged `:561`, the second read demoted it as not worth stopping | $1.89 |
 | 2026-10-21 | demotes only on not introduced or not real | `underwrite-83-legacy-guard` | pass: `:561` flagged and kept, worth doubt noted in its evidence | $2.20 |
 
-| 2026-10-21 | final skill, baseline in `evals/baseline.json` | all five | 2 of 5 pass, 1 miss, 2 false alarms | $7.74 |
+| 2026-10-21 | demotes only on not introduced or not real, before the completion marker | all five | 2 of 5 pass, 1 miss, 2 false alarms | $7.74 |
+| 2026-10-21 | final skill, baseline in `evals/baseline.json` | all five | 3 of 5 pass, 1 miss, 2 false alarms | $9.24 |
 
-In the final run `underwrite-83-legacy-guard` and `underwrite-12-host-guard` pass.
-`underwrite-76-normalize-compare` walked to the end and never flagged the defect, so it is a
-live miss for the next skill change to win back. `underwrite-17-sigterm` raised the same weak
-race test flag again. The `ai-kit-5-core-deps` alarm, that the guard never checks it parsed a
-dynamic import, is the class of finding the original reviewer accepted in the stored session
-of that PR, so that case may be mislabeled clean; it stays until someone decides, and the
-baseline counts it. Four walks of that run first stopped early because exploratory commands
-were denied, which is why the runner now tells the walk what it may run.
+In the baseline run `underwrite-83-legacy-guard`, `underwrite-12-host-guard` and
+`ai-kit-5-core-deps` pass. `underwrite-76-normalize-compare` raised the right class of finding,
+an upper-case slot read from before the repair, but at `session_store.py:2485`, far from the
+defect at `:907` and `:1550`, so it scores as one miss and one false alarm; it is the live
+miss for the next skill change to win back. `underwrite-17-sigterm` raised the same weak race
+test flag on every run. `ai-kit-5-core-deps` raised an alarm in the run before and none in
+this one; that alarm, that the guard never checks it parsed a dynamic import, is the class of
+finding the original reviewer accepted in the stored session of that PR, so the case may be
+mislabeled clean, and it stays until someone decides.
+
+Walks are not deterministic: the same skill moved `ai-kit-5-core-deps` between pass and fail
+across two runs. The baseline is one run, so a lone flip on a regression check is a reason to
+rerun that case before believing it. Four walks of one run first stopped early because
+exploratory commands were denied, which is why the runner now tells the walk what it may run.
 
 The second run in the table is why the second read no longer demotes on worth. A replay of the six flags
 stored before the second read existed agreed: it disputed two on worth, and the reviewer had
