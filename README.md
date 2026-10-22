@@ -352,9 +352,8 @@ passing `--css` to try something without a commit.
 `evals/cases/` holds pull requests with a known answer: misses, where a defect shipped and a
 later PR fixed it, and clean PRs that nothing later had to fix. `evals/run.py` clones each at
 its base, walks it headlessly with this checkout's skill in eval mode, and scores the session
-with `evals/score.py`. A miss passes when a standing flag lands within three lines of the
-defect. A clean case passes when no flag stands, so a flag the second read demoted does not
-count against it. Nothing is posted: every case is a merged PR, which freezes to report
+with `evals/score.py`. A flag the second read demoted does not stand, so it counts neither
+for a miss nor against a clean case. Nothing is posted: every case is a merged PR, which freezes to report
 audience, and eval mode delivers nothing.
 
 ```bash
@@ -362,9 +361,13 @@ python3 evals/run.py                         # every case
 python3 evals/run.py underwrite-83-legacy-guard --keep --max-budget-usd 3
 ```
 
-Each run spends model budget, so it is a local gate rather than a CI job; CI checks the cases
-and the scorer. Run it before and after a change to `SKILL.md` and keep the change only when
-no miss is lost and no false alarm is added. `--bare` keeps hooks and personal instructions
+A case passes when every expected finding is found, by place and by the keywords of its class,
+and nothing else stands. `--baseline evals/baseline.json` fails only on a regression: a case
+that passed and now fails, or more misses or false alarms than the committed baseline. Keep a
+change to `SKILL.md` only when it passes that, and commit a new baseline when it improves. The
+`evals` workflow runs this on pull requests that touch the skill or the evals, but only once
+an `ANTHROPIC_API_KEY` secret is set, because each run spends model budget; CI checks the cases
+and the scorer either way. `--bare` keeps hooks and personal instructions
 out of the run and needs `ANTHROPIC_API_KEY`. `docs/misses.md` records what each miss lacked.
 
 ## License

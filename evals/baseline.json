@@ -1,0 +1,118 @@
+{
+  "results": [
+    {
+      "beats": 5,
+      "case": "ai-kit-5-core-deps",
+      "cost_usd": 1.6385114999999997,
+      "demoted": 0,
+      "false_alarms": [
+        {
+          "claim": null,
+          "n": 2,
+          "where": "scripts/check-core-deps.mjs:16"
+        }
+      ],
+      "finished": true,
+      "flags": 1,
+      "found": [],
+      "kind": "clean",
+      "missed": [],
+      "pass": false
+    },
+    {
+      "beats": 2,
+      "case": "underwrite-12-host-guard",
+      "cost_usd": 1.3789662,
+      "demoted": 0,
+      "false_alarms": [],
+      "finished": true,
+      "flags": 0,
+      "found": [],
+      "kind": "clean",
+      "missed": [],
+      "pass": true
+    },
+    {
+      "beats": 2,
+      "case": "underwrite-17-sigterm",
+      "cost_usd": 1.6863358000000002,
+      "demoted": 0,
+      "false_alarms": [
+        {
+          "claim": "the startup-race regression test passes against the old ordering in most runs",
+          "n": 2,
+          "where": "tests/test_serve.py:434"
+        }
+      ],
+      "finished": true,
+      "flags": 1,
+      "found": [],
+      "kind": "clean",
+      "missed": [],
+      "pass": false
+    },
+    {
+      "beats": 5,
+      "case": "underwrite-76-normalize-compare",
+      "cost_usd": 1.5025880000000003,
+      "demoted": 0,
+      "false_alarms": [],
+      "finished": true,
+      "flags": 0,
+      "found": [],
+      "kind": "miss",
+      "missed": [
+        {
+          "class": "slots canonicalized on write but compared raw, so a pinned beat written back unchanged counts as a change",
+          "keywords": [
+            "canonical",
+            "spelling",
+            "upper",
+            "pinned",
+            "raw"
+          ],
+          "lines": [
+            907,
+            1550
+          ],
+          "path": "skills/underwrite/scripts/session_store.py"
+        }
+      ],
+      "pass": false
+    },
+    {
+      "beats": 3,
+      "case": "underwrite-83-legacy-guard",
+      "cost_usd": 1.5373973000000003,
+      "demoted": 0,
+      "false_alarms": [],
+      "finished": true,
+      "flags": 1,
+      "found": [
+        {
+          "beat": 1,
+          "class": "an existence guard keyed on the new storage format refuses a legacy session.json session",
+          "keywords": [
+            "legacy",
+            "session.json",
+            "pre-sqlite",
+            "migrat"
+          ],
+          "lines": [
+            561
+          ],
+          "path": "skills/underwrite/scripts/attested_implementation.py"
+        }
+      ],
+      "kind": "miss",
+      "missed": [],
+      "pass": true
+    }
+  ],
+  "summary": {
+    "cases": 5,
+    "false_alarms": 2,
+    "missed": 1,
+    "passed": 2
+  }
+}

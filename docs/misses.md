@@ -45,7 +45,18 @@ alarms on the clean cases.
 | 2026-10-21 | second read demotes on any no | `underwrite-83-legacy-guard` | fail: the walk flagged `:561`, the second read demoted it as not worth stopping | $1.89 |
 | 2026-10-21 | demotes only on not introduced or not real | `underwrite-83-legacy-guard` | pass: `:561` flagged and kept, worth doubt noted in its evidence | $2.20 |
 
-The second run is why the second read no longer demotes on worth. A replay of the six flags
+| 2026-10-21 | final skill, baseline in `evals/baseline.json` | all five | 2 of 5 pass, 1 miss, 2 false alarms | $7.74 |
+
+In the final run `underwrite-83-legacy-guard` and `underwrite-12-host-guard` pass.
+`underwrite-76-normalize-compare` walked to the end and never flagged the defect, so it is a
+live miss for the next skill change to win back. `underwrite-17-sigterm` raised the same weak
+race test flag again. The `ai-kit-5-core-deps` alarm, that the guard never checks it parsed a
+dynamic import, is the class of finding the original reviewer accepted in the stored session
+of that PR, so that case may be mislabeled clean; it stays until someone decides, and the
+baseline counts it. Four walks of that run first stopped early because exploratory commands
+were denied, which is why the runner now tells the walk what it may run.
+
+The second run in the table is why the second read no longer demotes on worth. A replay of the six flags
 stored before the second read existed agreed: it disputed two on worth, and the reviewer had
 acted on one of them. The `underwrite-17-sigterm` flag is a fair question about a test that
 catches the old bug only about one run in seven; it stands as a false alarm because nothing

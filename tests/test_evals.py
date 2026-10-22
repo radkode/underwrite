@@ -220,7 +220,7 @@ class Runner(unittest.TestCase):
         writes = [tool for tool in tools if tool.startswith(("Edit", "Write"))]
         self.assertEqual(writes, ["Write(//tmp/eval-reviews/**)", "Edit(//tmp/eval-reviews/**)"])
         bash = [tool for tool in tools if tool.startswith("Bash(")]
-        sessionctl = [tool for tool in bash if "sessionctl.py" in tool]
+        sessionctl = [tool for tool in bash if "sessionctl.py" in tool and not tool.endswith("--help)")]
         self.assertTrue(sessionctl)
         self.assertTrue(all(tool.endswith(f" {reviews}/*)") for tool in sessionctl))
         self.assertFalse([tool for tool in sessionctl if "sessionctl.py *" in tool])
