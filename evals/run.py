@@ -44,7 +44,9 @@ def allowed_tools(skill, reviews, checkout):
         f"Write({scratch})",
         f"Edit({scratch})",
         *store,
+        f"Bash({sessionctl} --help)",
         "Bash(gh pr view *)",
+        "Bash(git remote *)",
         "Bash(gh issue view *)",
         "Bash(mkdir -p *)",
         "Bash(git status *)",
@@ -53,12 +55,29 @@ def allowed_tools(skill, reviews, checkout):
     ]
 
 
+def briefing(skill, reviews, checkout):
+    """What the walk may do, said up front: a walk that meets an unexplained denial gives up."""
+    return (
+        "This is a headless eval run of underwrite in eval mode, with nobody to answer. "
+        f"The skill is at {skill}, the reviewed checkout at {checkout}, and "
+        f"UNDERWRITE_REVIEWS is {reviews}. Permissions match the literal command text, so "
+        "write absolute paths, never shell variables. Allowed: "
+        f"{skill / 'scripts' / 'sessionctl.py'} <command> {reviews}/<session> ...; "
+        "gh pr view and gh issue view; git status, rev-parse, log and remote; Read, Grep and "
+        "Glob inside those three directories; Write and Edit only under the reviews directory; "
+        "and the subagent tool for the second read. Anything else is denied by design and is "
+        "not a reason to stop: carry on with what is allowed."
+    )
+
+
 def command(case, plugin, reviews, checkout, args):
+    skill = plugin / "skills" / "underwrite"
     argv = [
         args.claude, "-p", f"/underwrite:underwrite {case['number']} --eval",
         "--plugin-dir", str(plugin),
         "--permission-mode", "dontAsk",
-        "--allowedTools", *allowed_tools(plugin / "skills" / "underwrite", reviews, checkout),
+        "--allowedTools", *allowed_tools(skill, reviews, checkout),
+        "--append-system-prompt", briefing(skill, reviews, checkout),
         "--output-format", "json",
         "--no-session-persistence",
         "--max-budget-usd", str(args.max_budget_usd),

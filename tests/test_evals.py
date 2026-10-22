@@ -210,6 +210,9 @@ class Runner(unittest.TestCase):
         argv = run.command({"number": 83}, ROOT, reviews, checkout, args)
         self.assertIn("/underwrite:underwrite 83 --eval", argv)
         self.assertEqual(argv[argv.index("--permission-mode") + 1], "dontAsk")
+        brief = argv[argv.index("--append-system-prompt") + 1]
+        self.assertIn("write absolute paths, never shell variables", brief)
+        self.assertIn(str(reviews), brief)
         tools = run.allowed_tools(ROOT / "skills" / "underwrite", reviews, checkout)
         self.assertNotIn("Bash", tools)
         self.assertFalse(set(tools) & {"Read", "Grep", "Glob"})
