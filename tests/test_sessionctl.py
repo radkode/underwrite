@@ -916,6 +916,13 @@ class ReplacementRounds(unittest.TestCase):
 
         self.assertEqual([entry["session"] for entry in result["unreadable"]], ["acme-widget-pr6"])
 
+    def history_module(self, born):
+        spec = importlib.util.spec_from_file_location("sessionctl_module", SESSIONCTL)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.born = born
+        return module
+
     def test_history_carries_earlier_facts_and_skips_later_sessions(self):
         prior = self.reviewed()
         session_store.SessionStore(prior).patch_session({
@@ -923,11 +930,14 @@ class ReplacementRounds(unittest.TestCase):
         })
         current = self.session("acme-widget-pr7-r2", self.second)
         self.session("acme-widget-pr9", self.second, number=9)
+        created = {"acme-widget-pr7": 1.0, "acme-widget-pr7-r2": 2.0, "acme-widget-pr9": 3.0}
+        module = self.history_module(lambda root: created[Path(root).name])
 
-        result = json.loads(self.run_ctl("history", current).stdout)
+        result = module.history(current)
 
         self.assertEqual([entry["session"] for entry in result["sessions"]], ["acme-widget-pr7"])
         entry = result["sessions"][0]
+        self.assertEqual(entry["order"], "earlier")
         self.assertEqual(entry["facts"], ["ADR-039 governs claims"])
         self.assertEqual(entry["recommendation"], "Fix the pin first.")
 
@@ -1003,12 +1013,7 @@ class ReplacementRounds(unittest.TestCase):
     def test_history_marks_order_unknown_where_creation_time_is_not_recorded(self):
         self.reviewed()
         current = self.session("acme-widget-pr7-r2", self.second)
-        spec = importlib.util.spec_from_file_location("sessionctl_module", SESSIONCTL)
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        module.born = lambda root: None
-
-        result = module.history(current)
+        result = self.history_module(lambda root: None).history(current)
 
         self.assertEqual([(e["session"], e["order"]) for e in result["sessions"]], [("acme-widget-pr7", "unknown")])
 
