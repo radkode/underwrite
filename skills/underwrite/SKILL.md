@@ -1179,8 +1179,11 @@ when it finds more.
 A replacement lives at `$P-r<k>/` beside the session it replaces, and its write-once
 `predecessor` holds `{session, round, base_sha, head_sha, moved, carried}`: `moved` maps
 each path to the head lines that changed since `head_sha`, and `carried` lists every
-settled finding from earlier rounds with its round, state, call, reason, and for a drop
-the words on its line. Only `link-predecessor` writes it.
+flag from earlier rounds with its round, state, call, reason, and the words on its line.
+A later round's call on the same line replaces an earlier one, except that a flag raised
+`over_drop` leaves the drop it overrode in place. An open or undelivered finding is never
+dropped from `carried`; when its line changed and the next round walked that file's moved
+lines, it gains `rewalked` with that round. Only `link-predecessor` writes it.
 
 Sessions accumulate into a review history, and `history` is how a later session reads it:
 for every other session on the same repository, its facts, its recommendation, and the

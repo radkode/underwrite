@@ -48,7 +48,6 @@ def allowed_tools(skill, reviews, checkout):
         "Bash(gh pr view *)",
         "Bash(git remote *)",
         "Bash(gh issue view *)",
-        f"Bash(mkdir -p {reviews}/*)",
         "Bash(git status *)",
         "Bash(git rev-parse *)",
         "Bash(git log *)",
@@ -65,8 +64,9 @@ def briefing(skill, reviews, checkout):
         f"{skill / 'scripts' / 'sessionctl.py'} <command> {reviews}/<session> ...; "
         "gh pr view and gh issue view; git status, rev-parse, log and remote; Read, Grep and "
         "Glob inside those three directories; Write and Edit only under the reviews directory; "
-        "and the subagent tool for the second read. Anything else is denied by design and is "
-        "not a reason to stop: carry on with what is allowed."
+        "and the subagent tool for the second read. sessionctl.py init creates the session "
+        "directory, so no mkdir is needed. Anything else is denied by design and is not a "
+        "reason to stop: carry on with what is allowed."
     )
 
 

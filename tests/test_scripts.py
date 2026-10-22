@@ -2871,6 +2871,15 @@ class SecondReadAndCarriedRounds(unittest.TestCase):
         self.assertIn("<strong>Still open, raised again here if it holds.</strong>", page)
         self.assertIn("<strong>Accepted, never posted.</strong>", page)
 
+    def test_a_carried_open_flag_walked_again_says_so(self):
+        carried = [{"round": 1, "n": 2, "state": "flag", "where": "a.py:4", "rewalked": 2}]
+        session = {
+            "repo": "acme/widget", "number": 7, "audience": {"mode": "review", "why": "open"},
+            "predecessor": {"round": 3, "head_sha": "c" * 40, "moved": {}, "carried": carried},
+        }
+        page = rr.render(session, [], "", {})
+        self.assertIn("<strong>Left open; its line changed and round 2 walked it again.</strong>", page)
+
     def test_a_first_round_session_shows_neither(self):
         page = rr.render({"repo": "acme/widget", "number": 7}, [], "", {})
         self.assertNotIn("Carried from earlier rounds", page)

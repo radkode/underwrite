@@ -876,8 +876,11 @@ class ReplacementRounds(unittest.TestCase):
         linked = self.link(third, second)
 
         self.assertEqual(linked["round"], 3)
-        # Round 1's open flag sat on line 4, which round 2 re-walked when it moved.
-        self.assertEqual([(entry["round"], entry["n"]) for entry in linked["carried"]], [(1, 1)])
+        # Round 1's open flag sat on line 4, which changed and which round 2 walked again.
+        self.assertEqual(
+            [(entry["round"], entry["n"], entry.get("rewalked")) for entry in linked["carried"]],
+            [(1, 1, None), (1, 2, 2)],
+        )
         with self.assertRaisesRegex(session_store.StoreError, "round 1"):
             session_store.SessionStore(third).put_beat(self.flag(1, 2))
 
@@ -1006,9 +1009,26 @@ class ReplacementRounds(unittest.TestCase):
         linked = self.link(third, second)
 
         self.assertEqual(
-            [(entry["round"], entry["n"], entry["state"]) for entry in linked["carried"]],
-            [(1, 1, "dropped"), (2, 1, "dropped")],
+            [(entry["round"], entry["n"], entry["state"], entry.get("rewalked"))
+             for entry in linked["carried"]],
+            [(1, 1, "dropped", None), (1, 2, "flag", 2), (2, 1, "dropped", None)],
         )
+
+    def test_a_flag_raised_over_a_drop_leaves_the_drop_carried(self):
+        prior = self.reviewed()
+        second = self.session("acme-widget-pr7-r2", self.second)
+        self.link(second, prior)
+        store = session_store.SessionStore(second)
+        store.put_beat(self.flag(1, 2, over_drop="the pin holds; the name shadows a builtin"))
+        third_head = self.commit("one\nTWO = unpinned\nthree\nFOUR = fast\nfive\nsix\n")
+        third = self.session("acme-widget-pr7-r3", third_head)
+
+        linked = self.link(third, second)
+
+        drops = [e for e in linked["carried"] if e["state"] == "dropped"]
+        self.assertEqual([(e["round"], e["n"]) for e in drops], [(1, 1)])
+        with self.assertRaisesRegex(session_store.StoreError, "dropped this finding in round 1"):
+            session_store.SessionStore(third).put_beat(self.flag(1, 2))
 
     def test_history_marks_order_unknown_where_creation_time_is_not_recorded(self):
         self.reviewed()

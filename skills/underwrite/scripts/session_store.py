@@ -3541,16 +3541,17 @@ class SessionStore:
             if beat.get("state") not in FLAG_STATES:
                 continue
             entry = {"round": prior_round, "state": beat["state"]}
-            for field in ("n", "where", "claim", "reason", "call", "landed"):
+            for field in ("n", "where", "claim", "reason", "call", "landed", "over_drop"):
                 if beat.get(field) is not None:
                     entry[field] = beat[field]
             anchor = anchor_line(beat.get("where"), files)
             if anchor is not None:
                 entry["anchor"] = anchor
             fresh.append(entry)
-        # The latest round's word on a finding replaces what an earlier round carried for it,
-        # and an unsettled finding whose line changed was walked again in that round.
-        settled = [entry["anchor"] for entry in fresh if "anchor" in entry]
+        # The latest round's word on a finding replaces what an earlier round carried for it.
+        # A flag raised over a drop is a different finding, so the drop it overrode stays.
+        settled = [entry["anchor"] for entry in fresh if "anchor" in entry and "over_drop" not in entry]
+        walked = earlier.get("moved") or {}
 
         def still_reads(anchor):
             texts = files.get(anchor["path"], {}).get("text", {})
@@ -3558,14 +3559,20 @@ class SessionStore:
 
         carried = []
         for entry in earlier.get("carried", ()):
+            entry = dict(entry)
             anchor = entry.get("anchor")
+            if anchor is not None and anchor in settled:
+                continue
             unsettled = entry.get("state") == "flag" or (
                 entry.get("state") == "accepted" and not entry.get("landed")
             )
-            if anchor is not None and anchor in settled:
-                continue
-            if anchor is not None and unsettled and not still_reads(anchor):
-                continue
+            # Kept, never dropped: when its line changed and the round that replaced it walked
+            # that file's moved lines, say so, and leave the reviewer to judge what it settled.
+            if (
+                anchor is not None and unsettled and "rewalked" not in entry
+                and anchor["path"] in walked and not still_reads(anchor)
+            ):
+                entry["rewalked"] = prior_round
             carried.append(entry)
         carried += fresh
         if not isinstance(moved, dict) or moved.get("prior_head_sha") != prior_target["head_sha"]:

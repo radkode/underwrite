@@ -231,6 +231,7 @@ class Runner(unittest.TestCase):
         self.assertTrue(sessionctl)
         self.assertTrue(all(tool.endswith(f" {reviews}/*)") for tool in sessionctl))
         self.assertFalse([tool for tool in sessionctl if "sessionctl.py *" in tool])
+        self.assertFalse([tool for tool in bash if tool.startswith("Bash(mkdir")])
 
     def test_a_regression_is_a_case_that_stopped_passing_or_a_count_that_rose(self):
         baseline = {
