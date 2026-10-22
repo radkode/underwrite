@@ -2,7 +2,7 @@
 name: underwrite
 description: Interactive PR review, one beat at a time. Reconstructs what a change is for and how it fits the project, walks it in causal order while the reviewer steers, resolves each flag at the moment it is raised, and finishes the chosen resolutions as commits, recorded decisions, durable report inclusions, or a GitHub review, whichever has a reader. Use for reviewing a PR or an unfamiliar diff, especially AI-authored changes where no author is around to answer questions.
 disable-model-invocation: true
-argument-hint: [pr-number | branch]
+argument-hint: [pr-number | branch] [--eval]
 ---
 
 # Underwrite
@@ -22,6 +22,14 @@ When you are working on this tool itself, point `$S` at your checkout instead. T
 installed plugin lags whatever you just committed until it is reinstalled, and running a
 walk against a stale copy is how you spend a session debugging a bug you already fixed.
 Say which one you are using when it is not the installed one.
+
+**Eval mode.** An argument carrying `--eval` is a scored replay, not a review:
+`evals/run.py` drives it headlessly and nobody is at the keyboard. Every rule here still
+holds, the second read included. At each of the two decisions take the option you would
+recommend and record it in your own words as the call, marked as eval mode. Do not serve
+the page, post status, or park: write each beat and go straight to the next. Leave every
+flag open, deliver nothing, skip Phase 4, and end with the recommendation and the count of
+flags raised.
 
 ## The six rules
 
@@ -1039,7 +1047,9 @@ re-publish the updated artifact; otherwise make the publishing offer above now.
 ## Session state
 
 `~/.claude/reviews/<owner>-<repo>-pr<N>/` (`-<branch>` when there is no PR). Outside every
-repo, so it never shows up in `git status`. `mkdir -p` it on first write.
+repo, so it never shows up in `git status`. `mkdir -p` it on first write. When
+`UNDERWRITE_REVIEWS` is set, it replaces `~/.claude/reviews` everywhere in this skill; the
+eval runner points it at a scratch directory.
 
 ```
 session.sqlite3  authoritative versioned session, target identity, actions, and delivery

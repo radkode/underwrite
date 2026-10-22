@@ -1,0 +1,10 @@
+{
+  "id": "ai-kit-5-core-deps",
+  "kind": "clean",
+  "repo": "radkode/ai-kit",
+  "number": 5,
+  "base_sha": "49900cb40b08c88bab66be4e73a510b07cdc9b5a",
+  "head_sha": "1b007a07504df51eb1f90725b52713a3dc5e6115",
+  "expected": [],
+  "evidence": "scripts/check-core-deps.mjs unchanged since merge"
+}

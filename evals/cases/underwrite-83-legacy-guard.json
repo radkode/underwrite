@@ -1,0 +1,18 @@
+{
+  "id": "underwrite-83-legacy-guard",
+  "kind": "miss",
+  "repo": "radkode/underwrite",
+  "number": 83,
+  "base_sha": "90e432561bdd16932be9bbb9500189c4bdc78450",
+  "head_sha": "ef1fa2222f1b6481cae6c85528e1de5383cb4bc1",
+  "expected": [
+    {
+      "path": "skills/underwrite/scripts/attested_implementation.py",
+      "lines": [
+        561
+      ],
+      "class": "an existence guard keyed on the new storage format refuses a legacy session.json session"
+    }
+  ],
+  "evidence": "https://github.com/radkode/underwrite/pull/84"
+}

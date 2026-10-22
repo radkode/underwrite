@@ -1,0 +1,19 @@
+{
+  "id": "underwrite-76-normalize-compare",
+  "kind": "miss",
+  "repo": "radkode/underwrite",
+  "number": 76,
+  "base_sha": "80bdf166d0f40f214b37166f8d7994b6ee19c47e",
+  "head_sha": "ee01410253691c0cde9e3f17251ca33c1d8a867b",
+  "expected": [
+    {
+      "path": "skills/underwrite/scripts/session_store.py",
+      "lines": [
+        907,
+        1550
+      ],
+      "class": "slots canonicalized on write but compared raw, so a pinned beat written back unchanged counts as a change"
+    }
+  ],
+  "evidence": "https://github.com/radkode/underwrite/pull/79"
+}

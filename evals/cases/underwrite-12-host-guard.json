@@ -1,0 +1,10 @@
+{
+  "id": "underwrite-12-host-guard",
+  "kind": "clean",
+  "repo": "radkode/underwrite",
+  "number": 12,
+  "base_sha": "6c011f38c8a8311e8b4f309e542e50b77c72f5d7",
+  "head_sha": "cf3e876d2936a29b7e861a07354db4c7a1cf4a17",
+  "expected": [],
+  "evidence": "no later fix or revert touches its lines"
+}
