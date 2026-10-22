@@ -876,9 +876,9 @@ class ReplacementRounds(unittest.TestCase):
         linked = self.link(third, second)
 
         self.assertEqual(linked["round"], 3)
-        # Round 1's open flag sat on line 4, which changed and which round 2 walked again.
+        # Round 1's open flag sat on line 4, whose words round 2's head changed.
         self.assertEqual(
-            [(entry["round"], entry["n"], entry.get("rewalked")) for entry in linked["carried"]],
+            [(entry["round"], entry["n"], entry.get("line_changed")) for entry in linked["carried"]],
             [(1, 1, None), (1, 2, 2)],
         )
         with self.assertRaisesRegex(session_store.StoreError, "round 1"):
@@ -1009,7 +1009,7 @@ class ReplacementRounds(unittest.TestCase):
         linked = self.link(third, second)
 
         self.assertEqual(
-            [(entry["round"], entry["n"], entry["state"], entry.get("rewalked"))
+            [(entry["round"], entry["n"], entry["state"], entry.get("line_changed"))
              for entry in linked["carried"]],
             [(1, 1, "dropped", None), (1, 2, "flag", 2), (2, 1, "dropped", None)],
         )

@@ -1182,8 +1182,8 @@ each path to the head lines that changed since `head_sha`, and `carried` lists e
 flag from earlier rounds with its round, state, call, reason, and the words on its line.
 A later round's call on the same line replaces an earlier one, except that a flag raised
 `over_drop` leaves the drop it overrode in place. An open or undelivered finding is never
-dropped from `carried`; when its line changed and the next round walked that file's moved
-lines, it gains `rewalked` with that round. Only `link-predecessor` writes it.
+dropped from `carried`; once its line no longer reads the same it gains `line_changed`, the
+round whose head changed it, and the page says so without claiming anyone looked again. Only `link-predecessor` writes it.
 
 Sessions accumulate into a review history, and `history` is how a later session reads it:
 for every other session on the same repository, its facts, its recommendation, and the

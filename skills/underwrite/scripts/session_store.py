@@ -3551,7 +3551,6 @@ class SessionStore:
         # The latest round's word on a finding replaces what an earlier round carried for it.
         # A flag raised over a drop is a different finding, so the drop it overrode stays.
         settled = [entry["anchor"] for entry in fresh if "anchor" in entry and "over_drop" not in entry]
-        walked = earlier.get("moved") or {}
 
         def still_reads(anchor):
             texts = files.get(anchor["path"], {}).get("text", {})
@@ -3566,13 +3565,13 @@ class SessionStore:
             unsettled = entry.get("state") == "flag" or (
                 entry.get("state") == "accepted" and not entry.get("landed")
             )
-            # Kept, never dropped: when its line changed and the round that replaced it walked
-            # that file's moved lines, say so, and leave the reviewer to judge what it settled.
+            # Kept, never dropped: when its line no longer reads the same, say since which round,
+            # and claim nothing about whether anyone looked at it again.
             if (
-                anchor is not None and unsettled and "rewalked" not in entry
-                and anchor["path"] in walked and not still_reads(anchor)
+                anchor is not None and unsettled and "line_changed" not in entry
+                and not still_reads(anchor)
             ):
-                entry["rewalked"] = prior_round
+                entry["line_changed"] = prior_round
             carried.append(entry)
         carried += fresh
         if not isinstance(moved, dict) or moved.get("prior_head_sha") != prior_target["head_sha"]:

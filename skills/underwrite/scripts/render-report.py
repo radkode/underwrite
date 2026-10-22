@@ -935,14 +935,12 @@ def carried_html(session, mode, live):
             outcome = "Accepted, never implemented" if mode == "branch" else "Accepted, never posted"
         elif state == "accepted":
             outcome = ACCEPTED_TOKEN.get(mode, "INCLUDED").capitalize()
-        elif state == "flag" and entry.get("rewalked"):
-            outcome = "Left open"
         elif state == "flag":
             outcome = "Still open, raised again here if it holds"
         else:
             outcome = "Decided"
-        if entry.get("rewalked"):
-            outcome += f"; its line changed and round {md(entry['rewalked'])} walked it again"
+        if entry.get("line_changed"):
+            outcome += f"; its line has changed since round {md(entry['line_changed'])}"
         claim = f" {md(entry['claim'])}." if entry.get("claim") else ""
         call = f" <q>{md(entry['call'])}</q>" if entry.get("call") else ""
         rows.append(
