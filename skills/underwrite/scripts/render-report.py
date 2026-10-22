@@ -75,6 +75,7 @@ REASON_LABEL = {
 SECOND_READ_LABEL = {
     "confirmed": "Confirmed by a second read",
     "disputed": "A second read disputed this flag",
+    "unread": "Not read twice",
 }
 
 

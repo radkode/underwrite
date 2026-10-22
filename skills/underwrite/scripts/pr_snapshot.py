@@ -1059,8 +1059,8 @@ def moved_lines(store, predecessor):
         )
         if lines:
             moved[path] = sorted(lines)
-        elif path in changed and path not in between:
-            # A binary or mode-only change has no line to name, so the whole file moved.
+        elif path in changed and (path not in between or not sides["RIGHT"]):
+            # A deleted, binary or mode-only change has no head line to name, so the file moved.
             moved[path] = []
     return {"prior_head_sha": prior["head_sha"], "head_sha": target["head_sha"], "lines": moved}
 

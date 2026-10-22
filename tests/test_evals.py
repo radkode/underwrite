@@ -6,6 +6,7 @@ import argparse
 import importlib.util
 import json
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -41,7 +42,7 @@ class Cases(unittest.TestCase):
         good = {
             "id": "x", "kind": "miss", "repo": "acme/widget", "number": 1,
             "base_sha": "a" * 40, "head_sha": "b" * 40, "evidence": "e",
-            "expected": [{"path": "a.py", "lines": [3], "class": "c"}],
+            "expected": [{"path": "a.py", "lines": [3], "class": "c", "keywords": ["guard"]}],
         }
         self.assertEqual(score.case_problems(good), [])
         for change, message in (
@@ -49,7 +50,8 @@ class Cases(unittest.TestCase):
             ({"head_sha": "abc"}, "full lowercase SHA"),
             ({"expected": []}, "names what the walk should have flagged"),
             ({"kind": "clean"}, "expects no finding"),
-            ({"expected": [{"path": "a.py", "lines": []}]}, "path, lines and class"),
+            ({"expected": [{"path": "a.py", "lines": []}]}, "path, lines, class and keywords"),
+            ({"expected": [{"path": "a.py", "lines": [3], "class": "c"}]}, "class and keywords"),
             ({"repo": ["acme/widget"]}, "repo must be nonempty text"),
             ({"number": True}, "number must be a positive integer"),
         ):
@@ -101,19 +103,22 @@ class Scoring(unittest.TestCase):
             },
             inputs / "pr.diff", inputs / "pr.json", inputs / "trusted.json", inputs / "pr.bundle",
         )
+        store.patch_session({"recommendation": "Eval mode: done."})
         self.store = store
 
     def case(self, kind="miss", lines=(5,)):
         return {
             "id": "t", "kind": kind, "repo": "acme/widget", "number": 7,
             "base_sha": self.base, "head_sha": self.head, "evidence": "e",
-            "expected": [] if kind == "clean" else [{"path": "a.py", "lines": list(lines), "class": "c"}],
+            "expected": [] if kind == "clean" else [
+                {"path": "a.py", "lines": list(lines), "class": "c", "keywords": ["guard"]}
+            ],
         }
 
     def flag(self, n, line, **extra):
         return {
-            "n": n, "tier": "core", "state": "flag", "proof_kind": "read", "claim": "c",
-            "where": f"a.py:{line}",
+            "n": n, "tier": "core", "state": "flag", "proof_kind": "read",
+            "claim": extra.pop("claim", "the empty guard is gone"), "where": f"a.py:{line}",
             "slots": {"what": "w", "proof": f"a.py:{line}", "risk": "r", "fix": "f"},
             **extra,
         }
@@ -142,6 +147,29 @@ class Scoring(unittest.TestCase):
         self.assertTrue(result["pass"])
         self.assertEqual((result["flags"], result["demoted"]), (0, 1))
 
+    def test_a_nearby_flag_about_something_else_finds_nothing(self):
+        self.store.put_beat(self.flag(1, 5, claim="the log line is noisy"))
+        result = score.score(self.case(), self.root)
+        self.assertEqual(len(result["missed"]), 1)
+        self.assertEqual([alarm["n"] for alarm in result["false_alarms"]], [1])
+
+    def test_a_found_miss_with_an_extra_alarm_does_not_pass(self):
+        self.store.put_beat(self.flag(1, 5))
+        self.store.put_beat(self.flag(2, 15))
+        result = score.score(self.case(), self.root)
+        self.assertEqual(len(result["found"]), 1)
+        self.assertFalse(result["pass"])
+
+    def test_a_walk_with_no_recommendation_is_unfinished(self):
+        self.store.put_beat(self.flag(1, 5))
+        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+            body = json.loads(db.execute("SELECT body_json FROM session").fetchone()[0])
+            body.pop("recommendation")
+            db.execute("UPDATE session SET body_json = ?", (json.dumps(body),))
+        result = score.score(self.case(), self.root)
+        self.assertFalse(result["finished"])
+        self.assertFalse(result["pass"])
+
     def test_a_walk_that_stored_nothing_passes_no_case(self):
         result = score.score(self.case("clean"), self.root)
         self.assertEqual(result["beats"], 0)
@@ -167,8 +195,8 @@ class Scoring(unittest.TestCase):
     def test_one_flag_answers_for_one_expected_finding(self):
         self.store.put_beat(self.flag(1, 5))
         case = dict(self.case(), expected=[
-            {"path": "a.py", "lines": [5], "class": "one"},
-            {"path": "a.py", "lines": [6], "class": "two"},
+            {"path": "a.py", "lines": [5], "class": "one", "keywords": ["guard"]},
+            {"path": "a.py", "lines": [6], "class": "two", "keywords": ["guard"]},
         ])
         result = score.score(case, self.root)
         self.assertEqual((len(result["found"]), len(result["missed"])), (1, 1))
@@ -188,7 +216,23 @@ class Runner(unittest.TestCase):
         self.assertIn("Read(//tmp/eval-checkout/**)", tools)
         writes = [tool for tool in tools if tool.startswith(("Edit", "Write"))]
         self.assertEqual(writes, ["Write(//tmp/eval-reviews/**)", "Edit(//tmp/eval-reviews/**)"])
-        self.assertTrue(all(tool.endswith("*)") for tool in tools if tool.startswith("Bash(")))
+        bash = [tool for tool in tools if tool.startswith("Bash(")]
+        sessionctl = [tool for tool in bash if "sessionctl.py" in tool]
+        self.assertTrue(sessionctl)
+        self.assertTrue(all(tool.endswith(f" {reviews}/*)") for tool in sessionctl))
+        self.assertFalse([tool for tool in sessionctl if "sessionctl.py *" in tool])
+
+    def test_a_regression_is_a_case_that_stopped_passing_or_a_count_that_rose(self):
+        baseline = {
+            "summary": {"missed": 0, "false_alarms": 1},
+            "results": [{"case": "a", "pass": True}, {"case": "b", "pass": False}],
+        }
+        same = {"summary": {"missed": 0, "false_alarms": 1},
+                "results": [{"case": "a", "pass": True}, {"case": "b", "pass": False}]}
+        self.assertEqual(run.regressions(baseline, same), [])
+        worse = {"summary": {"missed": 1, "false_alarms": 2},
+                 "results": [{"case": "a", "pass": False}, {"case": "b", "pass": False}]}
+        self.assertEqual(len(run.regressions(baseline, worse)), 3)
 
     def test_the_skill_documents_the_mode_and_the_scratch_reviews_root(self):
         text = " ".join((ROOT / "skills" / "underwrite" / "SKILL.md").read_text(encoding="utf-8").split())

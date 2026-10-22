@@ -53,7 +53,7 @@ OPEN_STATES = ("clean", "flag", "unverified")
 # What PROOF is: a command whose output would have read differently were the claim
 # false, a file or diff read, or an inference. Only `ran` earns CLEAN.
 PROOF_KINDS = ("ran", "read", "inferred")
-SECOND_READ_VERDICTS = ("confirmed", "disputed")
+SECOND_READ_VERDICTS = ("confirmed", "disputed", "unread")
 FLAG_STATES = ("flag", "accepted", "dropped", "decided")
 RESOLUTION_KINDS = ("delivery", "decision")
 STORE_OWNED_FIELDS = ("call", "reason", "landed", "branch", "delivery_kind", "delivery")
@@ -307,12 +307,14 @@ def second_read_problems(beat):
         or not reading["evidence"].strip()
     ):
         return [
-            f"beat {n}: second_read requires verdict confirmed or disputed "
+            f"beat {n}: second_read requires verdict confirmed, disputed or unread "
             "and evidence as nonempty text"
         ]
     state = beat.get("state")
-    if reading["verdict"] == "confirmed" and state not in FLAG_STATES:
-        return [f"beat {n}: a confirmed second read belongs to a flag, not {state!r}"]
+    if reading["verdict"] in ("confirmed", "unread") and state not in FLAG_STATES:
+        return [
+            f"beat {n}: a {reading['verdict']} second read belongs to a flag, not {state!r}"
+        ]
     if reading["verdict"] == "disputed" and state != "unverified":
         return [
             f"beat {n}: a disputed second read demotes the flag; write it unverified "

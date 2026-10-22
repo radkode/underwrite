@@ -11,7 +11,13 @@
       "lines": [
         561
       ],
-      "class": "an existence guard keyed on the new storage format refuses a legacy session.json session"
+      "class": "an existence guard keyed on the new storage format refuses a legacy session.json session",
+      "keywords": [
+        "legacy",
+        "session.json",
+        "pre-sqlite",
+        "migrat"
+      ]
     }
   ],
   "evidence": "https://github.com/radkode/underwrite/pull/84"

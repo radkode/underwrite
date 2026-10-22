@@ -4346,6 +4346,13 @@ class SecondRead(StoreCase):
         with self.assertRaisesRegex(session_store.StoreError, "evidence is 26 words"):
             self.store.put_beat(dict(FLAG, n=3, second_read=long))
 
+    def test_a_flag_written_without_a_read_says_so(self):
+        unread = {"verdict": "unread", "evidence": "the harness has no subagent tool"}
+        written = self.store.put_beat(dict(FLAG, n=3, second_read=unread))
+        self.assertEqual(written["second_read"], unread)
+        with self.assertRaisesRegex(session_store.StoreError, "belongs to a flag"):
+            self.store.put_beat(dict(self.demoted(second_read=unread), n=4))
+
     def test_a_stored_flag_cannot_be_demoted_by_a_rewrite(self):
         self.store.put_beat(dict(FLAG, n=3))
         with self.assertRaisesRegex(session_store.StoreError, "demotes the flag"):

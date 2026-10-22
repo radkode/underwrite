@@ -88,7 +88,7 @@ def path_from_token(token):
 
 LEDGER_COUNTS = (
     "beats", "flags", "open", "accepted", "decided", "dropped", "unverified",
-    "confirmed", "disputed", "questions",
+    "confirmed", "disputed", "unread_flags", "questions",
 )
 
 
@@ -112,6 +112,8 @@ def noise_counts(beats):
         verdict = (beat.get("second_read") or {}).get("verdict")
         if verdict in ("confirmed", "disputed"):
             counts[verdict] += 1
+        elif verdict == "unread":
+            counts["unread_flags"] += 1
     return counts
 
 
@@ -153,8 +155,19 @@ def ledger(reviews):
     return {"sessions": sessions, "overall": share(overall)}
 
 
+def born(root):
+    """When a session's store came to exist; the store keeps no creation time of its own."""
+    for name in ("session.sqlite3", "session.json"):
+        path = root / name
+        if path.exists():
+            stat = path.stat()
+            return getattr(stat, "st_birthtime", stat.st_mtime)
+    return None
+
+
 def history(root):
-    """Findings earlier sessions on this repository left on the paths this one touches."""
+    """What earlier sessions on this repository learned: their facts and recommendation, and
+    the findings they left on the paths this session touches."""
     root = Path(root).expanduser()
     store = SessionStore(root)
     session, _beats = store.snapshot()
@@ -162,10 +175,12 @@ def history(root):
     repo = target.get("repo") or session.get("repo")
     paths = sorted(store.changed_paths()) if target else None
     found, unreadable = [], []
+    now = born(root)
     for sibling in sorted(path for path in root.parent.iterdir() if path.is_dir()):
-        if sibling.resolve() == root.resolve() or not (
-            (sibling / "session.sqlite3").exists() or (sibling / "session.json").exists()
-        ):
+        if sibling.resolve() == root.resolve():
+            continue
+        started = born(sibling)
+        if started is None or (now is not None and started >= now):
             continue
         try:
             prior, beats = SessionStore.detached_presentation_snapshot(sibling)
@@ -187,14 +202,15 @@ def history(root):
                 for key in ("n", "where", "claim", "state", "reason", "call")
                 if beat.get(key) is not None
             })
-        if findings:
-            found.append({
-                "session": sibling.name,
-                "number": prior_target.get("number"),
-                "head_sha": prior_target.get("head_sha"),
-                "round": (prior.get("predecessor") or {}).get("round", 1),
-                "findings": findings,
-            })
+        found.append({
+            "session": sibling.name,
+            "number": prior_target.get("number"),
+            "head_sha": prior_target.get("head_sha"),
+            "round": (prior.get("predecessor") or {}).get("round", 1),
+            "recommendation": prior.get("recommendation"),
+            "facts": list(prior.get("facts") or ()),
+            "findings": findings,
+        })
     return {"repo": repo, "sessions": found, "unreadable": unreadable}
 
 

@@ -66,8 +66,11 @@ def case_problems(case):
             and item["lines"]
             and all(isinstance(n, int) and n > 0 for n in item["lines"])
             and isinstance(item.get("class"), str)
+            and isinstance(item.get("keywords"), list)
+            and item["keywords"]
+            and all(isinstance(k, str) and k.strip() for k in item["keywords"])
         ):
-            problems.append("each expected finding has path, lines and class")
+            problems.append("each expected finding has path, lines, class and keywords")
     return problems
 
 
@@ -76,15 +79,27 @@ def cited(where):
     return (match["path"], int(match["line"])) if match else (None, None)
 
 
-def matches(item, path, line):
+def words(beat):
+    slots = beat.get("slots") if isinstance(beat.get("slots"), dict) else {}
+    return " ".join(str(v) for v in (beat.get("claim"), *slots.values()) if v).lower()
+
+
+def matches(item, beat):
+    """Near the defect and about it: the flag's own words name at least one of the class's
+    keywords, so a different finding that happens to sit close by earns nothing."""
+    path, line = cited(beat.get("where"))
     if path is None or not (path == item["path"] or item["path"].endswith("/" + path)):
         return False
-    return any(abs(line - n) <= WINDOW for n in item["lines"])
+    if not any(abs(line - n) <= WINDOW for n in item["lines"]):
+        return False
+    text = words(beat)
+    return any(keyword.lower() in text for keyword in item["keywords"])
 
 
 def score(case, session_root):
     """A standing flag is one the walk would put in front of a reviewer; a demoted one is not.
-    A walk that stored no beat walked nothing, so it passes no case."""
+    A case passes when every expected finding is found and nothing else stands, and only for
+    a finished walk: at least one beat and a recorded recommendation."""
     session, beats = SessionStore.detached_presentation_snapshot(session_root)
     target = session.get("target") or {}
     if (
@@ -99,7 +114,7 @@ def score(case, session_root):
     found, missed, used = [], [], set()
     for item in case["expected"]:
         hit = next(
-            (b for b in standing if b["n"] not in used and matches(item, *cited(b.get("where")))),
+            (b for b in standing if b["n"] not in used and matches(item, b)),
             None,
         )
         if hit:
@@ -110,8 +125,9 @@ def score(case, session_root):
     false_alarms = [
         {"n": beat["n"], "where": beat.get("where"), "claim": beat.get("claim")}
         for beat in standing
-        if not any(matches(item, *cited(beat.get("where"))) for item in case["expected"])
+        if beat["n"] not in used
     ]
+    finished = bool(beats) and bool(str(session.get("recommendation") or "").strip())
     return {
         "case": case["id"],
         "kind": case["kind"],
@@ -121,7 +137,8 @@ def score(case, session_root):
         "found": found,
         "missed": missed,
         "false_alarms": false_alarms,
-        "pass": bool(beats) and not missed and (case["kind"] == "miss" or not standing),
+        "finished": finished,
+        "pass": finished and not missed and not false_alarms,
     }
 
 

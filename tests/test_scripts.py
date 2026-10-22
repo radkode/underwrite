@@ -2819,6 +2819,11 @@ class SecondReadAndCarriedRounds(unittest.TestCase):
         self.assertIn('<span class="lbl">Confirmed by a second read</span><span>new at a.py:1</span>', page)
         self.assertIn('<span class="lbl">A second read disputed this flag</span><span>the base had it</span>', page)
 
+    def test_a_flag_that_was_not_read_twice_says_so(self):
+        unread = dict(self.FLAG, second_read={"verdict": "unread", "evidence": "no subagent tool"})
+        page = rr.render({"repo": "acme/widget", "number": 7}, [unread], "", {})
+        self.assertIn('<span class="lbl">Not read twice</span><span>no subagent tool</span>', page)
+
     def test_a_beat_with_no_second_read_shows_no_line(self):
         page = rr.render({"repo": "acme/widget", "number": 7}, [self.FLAG], "", {})
         self.assertNotIn("second-read", page)

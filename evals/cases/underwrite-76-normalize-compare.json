@@ -12,7 +12,14 @@
         907,
         1550
       ],
-      "class": "slots canonicalized on write but compared raw, so a pinned beat written back unchanged counts as a change"
+      "class": "slots canonicalized on write but compared raw, so a pinned beat written back unchanged counts as a change",
+      "keywords": [
+        "canonical",
+        "spelling",
+        "upper",
+        "pinned",
+        "raw"
+      ]
     }
   ],
   "evidence": "https://github.com/radkode/underwrite/pull/79"

@@ -73,7 +73,8 @@ alone and answers three questions: did this PR introduce it, is it real, and wou
 engineer stop at it. A flag the PR did not introduce, or that is not real, is demoted to
 `UNVERIFIED` with the second reading beside it, so a wrong flag costs a glance rather than a
 decision. A doubt about whether it is worth stopping for stays beside a confirmed flag
-instead, because that call is yours.
+instead, because that call is yours. A flag written where no second reader was available says
+"Not read twice" rather than passing for a checked one.
 
 A flag in a PR session has to land on a line the diff touches: the store refuses one on a
 line the PR never put in front of you, naming the nearest touched line. That holds a flag
@@ -308,8 +309,9 @@ since the walked head, and every finding the reviewer settled in an earlier roun
 replacement walks only those moved lines, the page carries the earlier calls forward, and
 the store refuses a flag the reviewer already dropped while its line reads the same. By the
 fourth round the recommendation says to reconsider the approach rather than fix again.
-`history` lists what earlier sessions on the same repository found on the paths a new one
-touches, so the second review of an area starts from the first.
+`history` returns what earlier sessions on the same repository learned, their facts and
+recommendation and the findings they left on the paths a new one touches, so the second
+review of an area starts from the first.
 
 Linked creation is deterministic for one source action and refuses a conflicting second
 authorization. A complete child is atomically published at its deterministic path, so a

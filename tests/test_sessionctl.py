@@ -908,14 +908,41 @@ class ReplacementRounds(unittest.TestCase):
         self.assertEqual(written["state"], "flag")
 
     def test_history_names_a_session_it_could_not_read(self):
-        current = self.session("acme-widget-pr7-r2", self.second)
         broken = self.reviews / "acme-widget-pr6"
         broken.mkdir()
         (broken / "session.sqlite3").write_bytes(b"not a database")
+        current = self.session("acme-widget-pr7-r2", self.second)
 
         result = json.loads(self.run_ctl("history", current).stdout)
 
         self.assertEqual([entry["session"] for entry in result["unreadable"]], ["acme-widget-pr6"])
+
+    def test_history_carries_earlier_facts_and_skips_later_sessions(self):
+        prior = self.reviewed()
+        session_store.SessionStore(prior).patch_session({
+            "facts": ["ADR-039 governs claims"], "recommendation": "Fix the pin first.",
+        })
+        current = self.session("acme-widget-pr7-r2", self.second)
+        self.session("acme-widget-pr9", self.second, number=9)
+
+        result = json.loads(self.run_ctl("history", current).stdout)
+
+        self.assertEqual([entry["session"] for entry in result["sessions"]], ["acme-widget-pr7"])
+        entry = result["sessions"][0]
+        self.assertEqual(entry["facts"], ["ADR-039 governs claims"])
+        self.assertEqual(entry["recommendation"], "Fix the pin first.")
+
+    def test_deleting_the_file_between_heads_moves_it_whole(self):
+        prior = self.reviewed()
+        (self.repo / "a.py").unlink()
+        self.git("rm", "-q", "a.py")
+        self.git("commit", "-q", "-m", "drop a.py")
+        gone = self.git("rev-parse", "HEAD")
+        replacement = self.session("acme-widget-pr7-r2", gone)
+
+        linked = self.link(replacement, prior)
+
+        self.assertEqual(linked["moved"], {"a.py": []})
 
     def test_history_lists_earlier_findings_on_the_paths_this_session_touches(self):
         self.reviewed()

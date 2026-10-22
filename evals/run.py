@@ -22,16 +22,28 @@ sys.path.insert(0, str(HERE))
 from score import CaseError, load_case, score  # noqa: E402
 
 
+SESSION_COMMANDS = (
+    "init", "snapshot-pr", "check-controller", "freeze-execution", "check-execution",
+    "trusted-context", "diff", "context-log", "read-blob", "check-pr", "put-session",
+    "patch-session", "put-beat", "get-session", "get-beat", "history", "export", "reconcile",
+)
+
+
 def allowed_tools(skill, reviews, checkout):
     sessionctl = skill / "scripts" / "sessionctl.py"
     scratch = f"/{reviews}/**"
     reads = [f"{tool}(/{root}/**)" for root in (skill, reviews, checkout) for tool in ("Read", "Grep", "Glob")]
+    # Every session argument has to sit under the scratch reviews root, so no real session moves.
+    store = [
+        f"Bash({prefix}{sessionctl} {name} {reviews}/*)"
+        for prefix in ("", "python3 ")
+        for name in SESSION_COMMANDS
+    ]
     return [
         *reads, "Agent",
         f"Write({scratch})",
         f"Edit({scratch})",
-        f"Bash({sessionctl} *)",
-        f"Bash(python3 {sessionctl} *)",
+        *store,
         "Bash(gh pr view *)",
         "Bash(gh issue view *)",
         "Bash(mkdir -p *)",
@@ -84,6 +96,9 @@ def run_case(case, args):
             result["cost_usd"] = transcript.get("total_cost_usd")
         except json.JSONDecodeError:
             pass
+        if walk.returncode != 0:
+            result["error"] = f"walk exited {walk.returncode}; see walk.stderr"
+            return result
         sessions = [path for path in reviews.iterdir() if (path / "session.sqlite3").exists()]
         if len(sessions) != 1:
             result["error"] = f"walk exited {walk.returncode} and left {len(sessions)} sessions"
@@ -107,6 +122,7 @@ def main(argv=None):
     ap.add_argument("--claude", default="claude")
     ap.add_argument("--bare", action="store_true", help="skip hooks and CLAUDE.md; needs ANTHROPIC_API_KEY")
     ap.add_argument("--keep", action="store_true", help="keep each work directory")
+    ap.add_argument("--baseline", type=Path, help="fail only on a regression against this result file")
     args = ap.parse_args(argv)
     paths = sorted((HERE / "cases").glob("*.json"))
     if args.cases:
@@ -121,8 +137,27 @@ def main(argv=None):
         "missed": sum(len(r.get("missed", ())) for r in results),
         "false_alarms": sum(len(r.get("false_alarms", ())) for r in results),
     }
-    print(json.dumps({"summary": summary, "results": results}, indent=2, sort_keys=True))
+    report = {"summary": summary, "results": results}
+    if args.baseline:
+        report["regressions"] = regressions(json.loads(args.baseline.read_text(encoding="utf-8")), report)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 2 if report["regressions"] else 0
+    print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if summary["passed"] == summary["cases"] else 2
+
+
+def regressions(baseline, report):
+    """What got worse: a case that passed and now fails, or more misses or false alarms."""
+    before = {r["case"]: r for r in baseline.get("results", ())}
+    worse = [
+        f"{r['case']} passed in the baseline and now fails"
+        for r in report["results"]
+        if before.get(r["case"], {}).get("pass") and not r.get("pass")
+    ]
+    for key in ("missed", "false_alarms"):
+        if report["summary"][key] > baseline.get("summary", {}).get(key, 0):
+            worse.append(f"{key} rose from {baseline['summary'].get(key, 0)} to {report['summary'][key]}")
+    return worse
 
 
 if __name__ == "__main__":
