@@ -72,6 +72,10 @@ REASON_LABEL = {
     "not-worth-it": "not worth it",
     "pre-existing": "pre-existing",
 }
+SECOND_READ_LABEL = {
+    "confirmed": "Confirmed by a second read",
+    "disputed": "A second read disputed this flag",
+}
 
 
 def state_token(state, mode, landed=True):
@@ -890,6 +894,62 @@ def why_html(n):
     )
 
 
+def second_read_html(reading):
+    """What the fresh-context read said about a flag: it stands, or it was demoted."""
+    if not isinstance(reading, dict) or not isinstance(reading.get("evidence"), str):
+        return ""
+    label = SECOND_READ_LABEL.get(reading.get("verdict"))
+    if label is None:
+        return ""
+    return (
+        f'<div class="second-read {attr(reading["verdict"])}"><span class="lbl">{label}</span>'
+        f'<span>{md(reading["evidence"])}</span></div>'
+    )
+
+
+def carried_html(session, mode, live):
+    """What a replacement inherits: the lines it walks, and the calls that already stand."""
+    predecessor = session.get("predecessor")
+    if not isinstance(predecessor, dict):
+        return ""
+    moved = predecessor.get("moved") if isinstance(predecessor.get("moved"), dict) else {}
+    lines = sum(len(v) for v in moved.values() if isinstance(v, list))
+    prior = str(predecessor.get("head_sha") or "")[:7]
+    earlier = int(predecessor.get("round", 2)) - 1
+    files = f"{len(moved)} file" + ("" if len(moved) == 1 else "s")
+    walked = (
+        f"This round walks {lines} line{'' if lines == 1 else 's'} in {files} that "
+        f"moved since {html.escape(prior)}. Everything else was walked "
+        + ("in round 1." if earlier == 1 else f"in rounds 1 to {earlier}.")
+    )
+    entries = [e for e in predecessor.get("carried") or () if isinstance(e, dict)]
+    rows = []
+    for entry in entries:
+        state = entry.get("state")
+        if state == "dropped":
+            why = REASON_LABEL.get(entry.get("reason"))
+            outcome = f"Dropped as {why}" if why else "Dropped"
+        elif state == "accepted":
+            outcome = ACCEPTED_TOKEN.get(mode, "INCLUDED").capitalize()
+        else:
+            outcome = "Decided"
+        claim = f" {md(entry['claim'])}." if entry.get("claim") else ""
+        call = f" <q>{md(entry['call'])}</q>" if entry.get("call") else ""
+        rows.append(
+            f'<dt>round {md(entry.get("round", "?"))} · {md(entry.get("where", ""))}</dt>'
+            f"<dd><strong>{outcome}.</strong>{claim}{call}</dd>"
+        )
+    count = f'<span class="sep">·</span>{len(entries)}' if entries else ""
+    body = f'<p class="carried-lead">{walked}</p>'
+    if rows:
+        body += f"<dl>{''.join(rows)}</dl>"
+    return (
+        f'<details class="frame carried"{"" if live else " open"}>'
+        f'<summary><span class="frame-k">Carried from earlier rounds</span>{count}</summary>'
+        f"{body}</details>"
+    )
+
+
 def beat_html(
     beat,
     problems,
@@ -946,6 +1006,9 @@ def beat_html(
         body.append(diff_html(beat["diff"]))
     if fix_row:
         body.append(f'<dl class="slots fix-row">{"".join(fix_row)}</dl>')
+    reading = second_read_html(beat.get("second_read"))
+    if reading:
+        body.append(reading)
     body.append(outcome_html(beat, mode))
     if beat.get("call"):
         label = f"Dropped as {why}" if why else "Your call"
@@ -1485,6 +1548,9 @@ def render(
     parts.append('<span class="sep">·</span><span>underwrite</span>')
     if session.get("date"):
         parts.append(f'<span class="sep">·</span><span>{md(session["date"])}</span>')
+    predecessor = session.get("predecessor")
+    if isinstance(predecessor, dict) and predecessor.get("round"):
+        parts.append(f'<span class="sep">·</span><span>round {md(predecessor["round"])}</span>')
     parts.append(
         f'</div><h1><span class="num">{html.escape(label)}</span> '
         f'{md(session.get("title", ""))}</h1>'
@@ -1500,6 +1566,9 @@ def render(
     frame = frame_html(session, live)
     if frame:
         parts.append(frame)
+    carried = carried_html(session, session_mode(session), live)
+    if carried:
+        parts.append(carried)
     facts_values = list(session.get("facts") or [])
     if session_mode(session) == "report":
         facts_values.append("Outcome: report only")
