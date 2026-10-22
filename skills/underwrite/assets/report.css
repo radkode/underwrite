@@ -235,6 +235,11 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
 .frame dd { margin: 2px 0 16px; }
 .frame dd:last-child { margin-bottom: 0; }
 .frame[open] { padding-bottom: 12px; }
+.carried { margin-top: 12px; }
+.carried .carried-lead { margin: 12px 0 0; max-width: 68ch; color: var(--ink-2); }
+/* A path is case-sensitive, so the carried rows drop the uppercase label treatment. */
+.carried dt { text-transform: none; letter-spacing: 0.02em; font-size: 12px; }
+.carried strong { font-weight: 600; }
 
 /* ---- count strip ---- */
 
@@ -758,6 +763,32 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
   margin-bottom: 2px;
 }
 .unproven-why ul { margin: 0; padding-left: 18px; }
+
+.second-read {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 10px;
+  padding: 9px 14px;
+  border-radius: 3px;
+  font-size: 13px;
+  color: var(--ink-2);
+  max-width: 70ch;
+}
+.second-read .lbl {
+  font-family: var(--mono);
+  font-size: 11px;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+.second-read.confirmed { background: var(--clean-bg); }
+.second-read.confirmed .lbl { color: var(--clean); }
+.second-read.disputed { background: var(--unver-bg); }
+.second-read.disputed .lbl { color: var(--unver); }
+.second-read.unread { background: var(--flag-bg); }
+.second-read.unread .lbl { color: var(--flag); }
+.second-read.over-drop { background: var(--flag-bg); }
+.second-read.over-drop .lbl { color: var(--flag); }
 
 /* Named .shipped, not .landed: .next-row.landed already exists in What lands,
    and a bare .landed rule silently overrode that section's grid. */

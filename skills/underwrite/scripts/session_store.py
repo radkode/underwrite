@@ -21,7 +21,7 @@ HERE = str(Path(__file__).resolve().parent)
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-from diff_lines import parse_diff, untouched_anchor  # noqa: E402
+from diff_lines import anchor_line, parse_diff, untouched_anchor  # noqa: E402
 
 
 DB_SCHEMA_VERSION = 8
@@ -56,6 +56,8 @@ OPEN_STATES = ("clean", "flag", "unverified")
 # Only `ran` and `attested` earn CLEAN.
 PROOF_KINDS = ("ran", "read", "inferred", "attested")
 CLEAN_PROOF_KINDS = ("ran", "attested")
+SECOND_READ_VERDICTS = ("confirmed", "disputed", "unread")
+FLAG_STATES = ("flag", "accepted", "dropped", "decided")
 RESOLUTION_KINDS = ("delivery", "decision")
 STORE_OWNED_FIELDS = (
     "call", "reason", "landed", "branch", "delivery_kind", "delivery", "attestation",
@@ -243,6 +245,14 @@ def beat_budget_problems(beat):
                 f"beat {n}: clean beat fills {len(filled)} slots, over "
                 f"{BEAT_BUDGET['clean_slots']} ({', '.join(filled)})"
             )
+    reading = beat.get("second_read")
+    if isinstance(reading, dict) and isinstance(reading.get("evidence"), str):
+        words = len(reading["evidence"].split())
+        if words > BEAT_BUDGET["slot_words"]:
+            over.append(
+                f"beat {n}: second_read evidence is {words} words, over "
+                f"{BEAT_BUDGET['slot_words']}"
+            )
     quoted = beat.get("diff")
     if isinstance(quoted, list) and len(quoted) > BEAT_BUDGET["diff_lines"]:
         over.append(
@@ -304,9 +314,54 @@ def decision_problems(beat):
     return []
 
 
+def second_read_problems(beat):
+    """A second read confirms a flag or demotes it; it never sits on a beat it did not judge."""
+    if "second_read" not in beat:
+        return []
+    n = beat.get("n", "?")
+    reading = beat["second_read"]
+    if (
+        not isinstance(reading, dict)
+        or set(reading) != {"verdict", "evidence"}
+        or reading["verdict"] not in SECOND_READ_VERDICTS
+        or not isinstance(reading["evidence"], str)
+        or not reading["evidence"].strip()
+    ):
+        return [
+            f"beat {n}: second_read requires verdict confirmed, disputed or unread "
+            "and evidence as nonempty text"
+        ]
+    state = beat.get("state")
+    if reading["verdict"] in ("confirmed", "unread") and state not in FLAG_STATES:
+        return [
+            f"beat {n}: a {reading['verdict']} second read belongs to a flag, not {state!r}"
+        ]
+    if reading["verdict"] == "disputed" and state != "unverified":
+        return [
+            f"beat {n}: a disputed second read demotes the flag; write it unverified "
+            "without its risk"
+        ]
+    return []
+
+
+def over_drop_problems(beat):
+    """A flag raised over an earlier drop says, in a line, how it differs from what was dropped."""
+    if "over_drop" not in beat:
+        return []
+    n = beat.get("n", "?")
+    text = beat["over_drop"]
+    if beat.get("state") not in FLAG_STATES:
+        return [f"beat {n}: over_drop belongs to a flag"]
+    if not isinstance(text, str) or not text.strip():
+        return [f"beat {n}: over_drop must be nonempty text"]
+    if len(text.split()) > BEAT_BUDGET["slot_words"]:
+        return [f"beat {n}: over_drop is {len(text.split())} words, over {BEAT_BUDGET['slot_words']}"]
+    return []
+
+
 def validate_beat(beat, mode="branch", final=False):
     """Return beat contract violations. Empty means the beat is shippable."""
-    problems = decision_problems(beat)
+    problems = decision_problems(beat) + second_read_problems(beat) + over_drop_problems(beat)
     n = beat.get("n", "?")
     state = beat.get("state")
     raw_slots = beat.get("slots")
@@ -1845,10 +1900,19 @@ class SessionStore:
         allow_new_branch=False,
         allow_new_execution_policy=False,
         allow_new_audience=False,
+        allow_new_predecessor=False,
     ):
         version, body = self._session_document(document)
         row = self._session_row(db)
         current = json.loads(row["body_json"])
+        current_predecessor = current.get("predecessor", _MISSING)
+        if current_predecessor != body.get("predecessor", _MISSING):
+            if current_predecessor is _MISSING and allow_new_predecessor:
+                pass
+            elif current_predecessor is _MISSING:
+                raise Conflict("session predecessor must be recorded through link-predecessor")
+            else:
+                raise Conflict("session predecessor cannot change once linked")
         current_target = current.get("target", _MISSING)
         incoming_target = body.get("target", _MISSING)
         if current_target != incoming_target:
@@ -2041,6 +2105,8 @@ class SessionStore:
             )
         if "legacy_pr" in patch:
             raise Conflict("session legacy PR identity cannot change")
+        if "predecessor" in patch:
+            raise Conflict("session predecessor must be recorded through link-predecessor")
         if "delivery_branch" in patch:
             raise Conflict(
                 "session delivery_branch must be changed through pin-branch"
@@ -3771,6 +3837,127 @@ class SessionStore:
         if problem:
             raise StoreError(f"beat {beat['n']}: {problem}")
 
+    def link_predecessor(self, predecessor, moved):
+        """Record the session this one replaces, and carry forward what the reviewer settled.
+
+        Written once, before the first beat: what moved since the last walk scopes this one,
+        a finding the reviewer dropped stays dropped while its line reads the same, and a flag
+        still open is carried as open so the replacement raises it again.
+        """
+        prior_session, prior_beats = predecessor.snapshot()
+        prior_target = prior_session.get("target")
+        if not isinstance(prior_target, dict):
+            raise Conflict("predecessor has no frozen PR target")
+        earlier = prior_session.get("predecessor") or {}
+        prior_round = earlier.get("round", 1)
+        files = parse_diff(
+            predecessor.read_verified_target_diff()[1].decode("utf-8", "replace")
+        )
+        fresh = []
+        for beat in prior_beats:
+            if beat.get("state") not in FLAG_STATES:
+                continue
+            entry = {"round": prior_round, "state": beat["state"]}
+            for field in ("n", "where", "claim", "reason", "call", "landed", "over_drop"):
+                if beat.get(field) is not None:
+                    entry[field] = beat[field]
+            anchor = anchor_line(beat.get("where"), files)
+            if anchor is not None:
+                entry["anchor"] = anchor
+            fresh.append(entry)
+        # The latest round's word on a finding replaces what an earlier round carried for it.
+        # A flag raised over a drop is a different finding, so the drop it overrode stays.
+        settled = [entry["anchor"] for entry in fresh if "anchor" in entry and "over_drop" not in entry]
+
+        def still_reads(anchor):
+            texts = files.get(anchor["path"], {}).get("text", {})
+            return any(text.rstrip() == anchor["text"] for text in texts.values())
+
+        carried = []
+        for entry in earlier.get("carried", ()):
+            entry = dict(entry)
+            anchor = entry.get("anchor")
+            if anchor is not None and anchor in settled:
+                continue
+            unsettled = entry.get("state") == "flag" or (
+                entry.get("state") == "accepted" and not entry.get("landed")
+            )
+            # Kept, never dropped: when its line no longer reads the same, say since which round,
+            # and claim nothing about whether anyone looked at it again.
+            if (
+                anchor is not None and unsettled and "line_changed" not in entry
+                and not still_reads(anchor)
+            ):
+                entry["line_changed"] = prior_round
+            carried.append(entry)
+        carried += fresh
+        if not isinstance(moved, dict) or moved.get("prior_head_sha") != prior_target["head_sha"]:
+            raise StoreError("moved lines must be computed against the predecessor's head")
+        with self._first_work_write() as db:
+            session = json.loads(self._session_row(db)["body_json"])
+            target = session.get("target")
+            if not isinstance(target, dict):
+                raise Conflict("link-predecessor requires a frozen PR target")
+            if "predecessor" in session:
+                raise Conflict("session predecessor is already linked")
+            if db.execute("SELECT EXISTS(SELECT 1 FROM beats)").fetchone()[0]:
+                raise Conflict("link the predecessor before the first beat")
+            if predecessor.root.resolve() == self.root.resolve():
+                raise Conflict("a session cannot replace itself")
+            if (prior_target["repo"], prior_target["number"]) != (target["repo"], target["number"]):
+                raise Conflict("predecessor reviewed a different pull request")
+            if (prior_target["base_sha"], prior_target["head_sha"]) == (
+                target["base_sha"], target["head_sha"]
+            ):
+                raise Conflict("predecessor froze the same base and head; resume it instead")
+            if moved.get("head_sha") != target["head_sha"]:
+                raise StoreError("moved lines must be computed against this session's head")
+            session["predecessor"] = {
+                "session": predecessor.root.name,
+                "round": prior_round + 1,
+                "base_sha": prior_target["base_sha"],
+                "head_sha": prior_target["head_sha"],
+                "moved": moved["lines"],
+                "carried": carried,
+            }
+            if self._save_session(db, session, allow_new_predecessor=True):
+                self._bump_render(db)
+        return self.snapshot()[0]["predecessor"]
+
+    def _guard_beat(self, session, beat):
+        """The checks every write of a beat answers to, whichever command carries it."""
+        problems = second_read_problems(beat) + over_drop_problems(beat)
+        if problems:
+            raise StoreError("; ".join(problems))
+        self._refuse_untouched_flag(session, beat)
+        self._refuse_dropped_finding(session, beat)
+
+    def _refuse_dropped_finding(self, session, beat):
+        """A finding the reviewer dropped is not raised again while its line reads the same."""
+        predecessor = session.get("predecessor")
+        target = session.get("target")
+        if beat.get("state") != "flag" or not predecessor or not isinstance(target, dict):
+            return
+        files = parse_diff(self._verified_diff_bytes(target).decode("utf-8", "replace"))
+        anchor = anchor_line(beat.get("where"), files)
+        drops = [
+            entry for entry in predecessor.get("carried", ())
+            if anchor is not None and entry.get("state") == "dropped" and entry.get("anchor") == anchor
+        ]
+        if "over_drop" in beat and not drops:
+            raise StoreError(
+                f"beat {beat['n']}: over_drop names no earlier drop on this line; remove it"
+            )
+        if "over_drop" in beat:
+            return
+        for entry in drops:
+            raise StoreError(
+                f"beat {beat['n']}: the reviewer dropped this finding in round "
+                f"{entry['round']} as {entry.get('reason', 'unstated')} "
+                f"({entry.get('call', 'no words')!r}); its line still reads the same, "
+                "so it is not raised again unless over_drop says how this finding differs"
+            )
+
     def changed_paths(self):
         """The paths the frozen diff touches, read only after its digest verifies.
 
@@ -3935,7 +4122,7 @@ class SessionStore:
             self._attest_beat(db, session, beat)
             if row is not None:
                 self._hold_authorized_finding(db, beat, current)
-            self._refuse_untouched_flag(session, beat)
+            self._guard_beat(session, beat)
             changed, _revision, _state, _detail = self._save_beat(db, beat)
             if changed:
                 self._bump_render(db)
@@ -4027,6 +4214,25 @@ class SessionStore:
         for beat in beats:
             beat["questions"] = questions.get(beat["n"], [])
         return session, beats
+
+    @classmethod
+    def detached_presentation_snapshot(cls, root):
+        """Read a session without writing to it: a schema upgrade lands on a backup copy."""
+        root = Path(root).expanduser()
+        source = root / "session.sqlite3"
+        if not source.exists():
+            if not (root / "session.json").exists():
+                raise StoreError(f"no session at {root}")
+            return cls.legacy_presentation_snapshot(root)
+        with tempfile.TemporaryDirectory(prefix="underwrite-read-") as scratch:
+            reader = sqlite3.connect(f"{source.resolve().as_uri()}?mode=ro", uri=True)
+            copy = sqlite3.connect(str(Path(scratch) / "session.sqlite3"))
+            try:
+                reader.backup(copy)
+            finally:
+                copy.close()
+                reader.close()
+            return cls(scratch).presentation_snapshot()
 
     # ---- action queue -------------------------------------------------
 
@@ -4451,7 +4657,7 @@ class SessionStore:
                         )
                 else:
                     self._validate_new_beat(beat)
-                    self._refuse_untouched_flag(normalized_session, beat)
+                    self._guard_beat(normalized_session, beat)
                     beat_changed, _revision, _state, _detail = self._save_beat(db, beat)
                     changed = beat_changed or changed
             if changed:

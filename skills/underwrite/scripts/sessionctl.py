@@ -5,6 +5,7 @@ import argparse
 import base64
 import binascii
 import json
+import os
 import sqlite3
 import sys
 from pathlib import Path
@@ -14,7 +15,8 @@ HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
-from session_store import SessionStore, StoreError  # noqa: E402
+from session_store import DROP_REASONS, FLAG_STATES, SessionStore, StoreError  # noqa: E402
+from diff_lines import LOCATION_LINE, resolve_path  # noqa: E402
 from pr_snapshot import (  # noqa: E402
     TargetMoved,
     capture,
@@ -23,6 +25,7 @@ from pr_snapshot import (  # noqa: E402
     check_controller,
     check_worktree,
     context_log,
+    moved_lines,
     read_blob,
     review_identity,
     review_receipt,
@@ -82,6 +85,138 @@ def path_from_token(token):
     if path_token(path) != token:
         raise StoreError("blob path token is not canonical")
     return path
+
+
+LEDGER_COUNTS = (
+    "beats", "flags", "open", "accepted", "decided", "dropped", "unverified",
+    "confirmed", "disputed", "unread_flags", "questions",
+)
+
+
+def noise_counts(beats):
+    counts = dict.fromkeys(LEDGER_COUNTS, 0)
+    counts["dropped_by_reason"] = dict.fromkeys((*DROP_REASONS, "unstated"), 0)
+    for beat in beats:
+        state = beat.get("state")
+        counts["beats"] += 1
+        counts["questions"] += len(beat.get("questions") or ())
+        if state in FLAG_STATES:
+            counts["flags"] += 1
+        if state == "flag":
+            counts["open"] += 1
+        elif state in ("accepted", "decided", "unverified"):
+            counts[state] += 1
+        elif state == "dropped":
+            counts["dropped"] += 1
+            reason = beat.get("reason")
+            counts["dropped_by_reason"][reason if reason in DROP_REASONS else "unstated"] += 1
+        verdict = (beat.get("second_read") or {}).get("verdict")
+        if verdict in ("confirmed", "disputed"):
+            counts[verdict] += 1
+        elif verdict == "unread":
+            counts["unread_flags"] += 1
+    return counts
+
+
+def add_counts(total, counts):
+    for key in LEDGER_COUNTS:
+        total[key] += counts[key]
+    for reason, value in counts["dropped_by_reason"].items():
+        total["dropped_by_reason"][reason] += value
+
+
+def share(counts):
+    beats = counts["beats"]
+    counts["unverified_share"] = round(counts["unverified"] / beats, 3) if beats else None
+    return counts
+
+
+def ledger(reviews):
+    """Count what every stored session raised and how the reviewer answered it."""
+    reviews = Path(reviews).expanduser()
+    if not reviews.is_dir():
+        raise StoreError(f"no reviews directory at {reviews}")
+    sessions = []
+    overall = noise_counts(())
+    for root in sorted(path for path in reviews.iterdir() if path.is_dir()):
+        if not ((root / "session.sqlite3").exists() or (root / "session.json").exists()):
+            continue
+        entry = {"session": root.name}
+        try:
+            session, beats = SessionStore.detached_presentation_snapshot(root)
+        except (OSError, sqlite3.Error, json.JSONDecodeError, StoreError) as error:
+            entry["error"] = str(error)
+            sessions.append(entry)
+            continue
+        entry["repo"] = (session.get("target") or {}).get("repo") or session.get("repo")
+        counts = noise_counts(beats)
+        add_counts(overall, counts)
+        entry.update(share(counts))
+        sessions.append(entry)
+    return {"sessions": sessions, "overall": share(overall)}
+
+
+def born(root):
+    """When a session's store came to exist, where the filesystem records it. The store keeps
+    no creation time, and a modification time moves with every write, so it never stands in."""
+    for name in ("session.sqlite3", "session.json"):
+        path = root / name
+        if path.exists():
+            return getattr(path.stat(), "st_birthtime", None)
+    return None
+
+
+def history(root):
+    """What earlier sessions on this repository learned: their facts and recommendation, and
+    the findings they left on the paths this session touches."""
+    root = Path(root).expanduser()
+    store = SessionStore(root)
+    session, _beats = store.snapshot()
+    target = session.get("target") or {}
+    repo = target.get("repo") or session.get("repo")
+    paths = sorted(store.changed_paths()) if target else None
+    found, unreadable = [], []
+    now = born(root)
+    for sibling in sorted(path for path in root.parent.iterdir() if path.is_dir()):
+        if sibling.resolve() == root.resolve() or not (
+            (sibling / "session.sqlite3").exists() or (sibling / "session.json").exists()
+        ):
+            continue
+        started = born(sibling)
+        if started is not None and now is not None and started >= now:
+            continue
+        order = "earlier" if started is not None and now is not None else "unknown"
+        try:
+            prior, beats = SessionStore.detached_presentation_snapshot(sibling)
+        except (OSError, sqlite3.Error, json.JSONDecodeError, StoreError) as error:
+            unreadable.append({"session": sibling.name, "error": str(error)})
+            continue
+        prior_target = prior.get("target") or {}
+        if (prior_target.get("repo") or prior.get("repo")) != repo:
+            continue
+        findings = []
+        for beat in beats:
+            if beat.get("state") not in FLAG_STATES:
+                continue
+            cited = LOCATION_LINE.match(str(beat.get("where") or "").strip())
+            if paths is not None and not (cited and resolve_path(cited["path"], paths)):
+                continue
+            findings.append({
+                key: beat[key]
+                for key in ("n", "where", "claim", "state", "reason", "call")
+                if beat.get(key) is not None
+            })
+        found.append({
+            "session": sibling.name,
+            "number": prior_target.get("number"),
+            "head_sha": prior_target.get("head_sha"),
+            "round": (prior.get("predecessor") or {}).get("round", 1),
+            "order": order,
+            "recommendation": prior.get("recommendation"),
+            "facts": list(prior.get("facts") or ()),
+            "findings": findings,
+        })
+    return {"repo": repo, "sessions": found, "unreadable": unreadable}
 
 
 def parser():
@@ -201,10 +336,36 @@ def parser():
 
     export = commands.add_parser("export")
     export.add_argument("session")
+
+    stats = commands.add_parser("stats")
+    stats.add_argument("reviews")
+
+    link = commands.add_parser("link-predecessor")
+    link.add_argument("session")
+    link.add_argument("predecessor")
+
+    prior = commands.add_parser("history")
+    prior.add_argument("session")
     return ap
 
 
+def confine(args):
+    """Under the eval runner every session path has to resolve inside its scratch root."""
+    root = os.environ.get("UNDERWRITE_CONFINE")
+    if not root:
+        return
+    boundary = Path(root).resolve()
+    for name in ("session", "predecessor", "reviews"):
+        value = getattr(args, name, None)
+        if value is None:
+            continue
+        target = Path(value).expanduser().resolve()
+        if target != boundary and boundary not in target.parents:
+            raise StoreError(f"{name} {value} is outside UNDERWRITE_CONFINE {boundary}")
+
+
 def run(args):
+    confine(args)
     if args.command == "init":
         store = SessionStore(
             args.session, handled_override=args.handled_seq, create=True
@@ -325,6 +486,14 @@ def run(args):
         result = store.abandon_head(args.seq, args.actor, args.reason)
     elif args.command == "export":
         return SessionStore(args.session).export_json()
+    elif args.command == "stats":
+        return ledger(args.reviews)
+    elif args.command == "history":
+        return history(args.session)
+    elif args.command == "link-predecessor":
+        store = SessionStore(args.session)
+        predecessor = SessionStore(args.predecessor)
+        result = store.link_predecessor(predecessor, moved_lines(store, predecessor))
     else:
         raise StoreError(f"unknown command {args.command!r}")
 

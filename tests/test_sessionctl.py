@@ -6,6 +6,7 @@ import json
 import os
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -582,6 +583,488 @@ class Failures(SessionCtlCase):
         self.assertEqual(failed.returncode, 1)
         self.assertIn("at the head", failed.stderr)
         self.assertEqual(self.store().head()["seq"], first["seq"])
+
+
+class NoiseLedger(unittest.TestCase):
+    """Judging whether a skill change made the walk noisier meant opening each session by
+    hand. The ledger counts what every stored session raised and how the reviewer answered,
+    and reading it never upgrades a session in place."""
+
+    def setUp(self):
+        self.reviews = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.reviews, True)
+
+    def beat(self, n, state, **extra):
+        slots = {"what": f"beat {n}", "proof": f"a.py:{n}"}
+        if state == "flag":
+            slots.update(risk="r", fix="pin it")
+        return {
+            "n": n, "tier": "core", "state": state, "proof_kind": "read",
+            "claim": "c", "where": f"a.py:{n}", "slots": slots, **extra,
+        }
+
+    def walked(self):
+        root = self.reviews / "acme-widget-pr1"
+        store = session_store.SessionStore(root, create=True)
+        store.put_session(dict(SESSION, cursor=1))
+        for n in (1, 2):
+            store.put_beat(self.beat(n, "flag"))
+        store.put_beat(self.beat(
+            3, "flag", second_read={"verdict": "confirmed", "evidence": "new at a.py:3"}
+        ))
+        store.put_beat(self.beat(4, "unverified"))
+        store.put_beat(self.beat(
+            5, "unverified", second_read={"verdict": "disputed", "evidence": "the base has it"}
+        ))
+        store.produce("drop-1", 1, "drop", "the base already did this", reason="pre-existing")
+        store.ack(store.head()["seq"])
+        asked = store.produce("question-4", 4, "question", "Is this proven?")
+        store.apply(asked["seq"], {
+            "kind": "question",
+            "answer": "Not yet.",
+            "evidence": "Static inspection of a.py:4.",
+        })
+        store.ack(asked["seq"])
+        store.produce("accept-2", 2, "accept", "Implement it.")
+        return root
+
+    def legacy(self):
+        root = self.reviews / "acme-widget-pr2"
+        (root / "beats").mkdir(parents=True)
+        (root / "session.json").write_text(json.dumps(SESSION), encoding="utf-8")
+        dropped = dict(self.beat(1, "dropped"), call="noise")
+        (root / "beats" / "01.json").write_text(json.dumps(dropped), encoding="utf-8")
+        return root
+
+    def stats(self):
+        completed = subprocess.run(
+            [sys.executable, str(SESSIONCTL), "stats", str(self.reviews)],
+            text=True, capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return json.loads(completed.stdout)
+
+    def test_two_sessions_yield_counts_per_session_and_overall(self):
+        self.walked()
+        self.legacy()
+        (self.reviews / "acme-widget-pr3.diff").write_text("", encoding="utf-8")
+
+        ledger = self.stats()
+
+        names = [entry["session"] for entry in ledger["sessions"]]
+        self.assertEqual(names, ["acme-widget-pr1", "acme-widget-pr2"])
+        walked, legacy = ledger["sessions"]
+        self.assertEqual(
+            {key: walked[key] for key in (
+                "beats", "flags", "open", "accepted", "dropped", "unverified",
+                "confirmed", "disputed", "questions",
+            )},
+            {
+                "beats": 5, "flags": 3, "open": 1, "accepted": 1, "dropped": 1,
+                "unverified": 2, "confirmed": 1, "disputed": 1, "questions": 1,
+            },
+        )
+        self.assertEqual(walked["dropped_by_reason"]["pre-existing"], 1)
+        self.assertEqual(walked["unverified_share"], 0.4)
+        self.assertEqual(legacy["dropped_by_reason"]["unstated"], 1)
+        overall = ledger["overall"]
+        self.assertEqual((overall["beats"], overall["flags"], overall["dropped"]), (6, 4, 2))
+        self.assertEqual(overall["dropped_by_reason"]["pre-existing"], 1)
+        self.assertEqual(overall["dropped_by_reason"]["unstated"], 1)
+
+    def test_reading_the_ledger_never_writes_a_session(self):
+        root = self.walked()
+        legacy = self.legacy()
+        database = root / "session.sqlite3"
+        with sqlite3.connect(str(database)) as db:
+            db.execute("PRAGMA user_version = 6")
+        before = {
+            path: path.read_bytes()
+            for base in (root, legacy) for path in base.rglob("*") if path.is_file()
+        }
+
+        self.stats()
+
+        after = {
+            path: path.read_bytes()
+            for base in (root, legacy) for path in base.rglob("*") if path.is_file()
+        }
+        self.assertEqual(after, before)
+        self.assertFalse((legacy / "session.sqlite3").exists())
+
+    def test_an_unreadable_session_is_reported_and_the_rest_still_count(self):
+        self.walked()
+        broken = self.reviews / "acme-widget-pr9"
+        broken.mkdir()
+        (broken / "session.sqlite3").write_bytes(b"not a database")
+
+        ledger = self.stats()
+
+        entry = next(item for item in ledger["sessions"] if item["session"] == "acme-widget-pr9")
+        self.assertIn("error", entry)
+        self.assertEqual(ledger["overall"]["beats"], 5)
+
+    def test_a_missing_directory_is_refused(self):
+        completed = subprocess.run(
+            [sys.executable, str(SESSIONCTL), "stats", str(self.reviews / "typo")],
+            text=True, capture_output=True,
+        )
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("no reviews directory", completed.stderr)
+
+
+class ReplacementRounds(unittest.TestCase):
+    """A moved head used to mean a fresh walk of the whole PR that knew nothing of the
+    last one. The replacement links its predecessor, walks only what moved, carries the
+    reviewer's calls forward, and never raises again a finding the reviewer dropped."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.repo = self.tmp / "worktree"
+        self.reviews = self.tmp / "reviews"
+        self.reviews.mkdir()
+        self.git("init", "-q", str(self.repo), cwd=self.tmp)
+        for key, value in (
+            ("user.name", "Underwrite Test"),
+            ("user.email", "test@example.test"),
+            ("commit.gpgsign", "false"),
+        ):
+            self.git("config", key, value)
+        self.base = self.commit("one\ntwo\nthree\nfour\nfive\n")
+        self.first = self.commit("one\nTWO = unpinned\nthree\nFOUR = slow\nfive\n")
+        self.second = self.commit("one\nTWO = unpinned\nthree\nFOUR = fast\nfive\n")
+
+    def git(self, *args, cwd=None):
+        return subprocess.run(
+            ["git", *args], cwd=cwd or self.repo, check=True, capture_output=True, text=True
+        ).stdout.strip()
+
+    def commit(self, text):
+        (self.repo / "a.py").write_text(text, encoding="utf-8")
+        self.git("add", "a.py")
+        self.git("commit", "-q", "-m", "change")
+        return self.git("rev-parse", "HEAD")
+
+    def session(self, name, head, number=7):
+        root = self.reviews / name
+        store = session_store.SessionStore(root, create=True)
+        scratch = self.tmp / f"{name}-input"
+        scratch.mkdir()
+        diff = scratch / "pr.diff"
+        diff.write_text(self.git("diff", f"{self.base}...{head}") + "\n", encoding="utf-8")
+        metadata = scratch / "pr.json"
+        metadata.write_text(json.dumps({"number": number}), encoding="utf-8")
+        context = scratch / "trusted.json"
+        context.write_text(
+            json.dumps({"version": 1, "base_sha": self.base, "files": []},
+                       separators=(",", ":"), sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        self.git("update-ref", "refs/underwrite/base", self.base)
+        self.git("update-ref", "refs/underwrite/head", head)
+        bundle = scratch / "pr.bundle"
+        self.git("bundle", "create", "-q", str(bundle), "refs/underwrite/base", "refs/underwrite/head")
+        store.freeze_target(
+            {
+                "version": 1, "kind": "github_pr", "repo": "acme/widget", "number": number,
+                "state": "open", "merged_at": None, "base_sha": self.base, "head_sha": head,
+                "head_repo_id": 123, "head_repo": "acme/widget", "head_ref": "feature",
+                "merge_base_sha": self.base, "changed_files": 1,
+            },
+            diff, metadata, context, bundle,
+        )
+        return root
+
+    def flag(self, n, line, **extra):
+        return {
+            "n": n, "tier": "core", "state": "flag", "proof_kind": "read",
+            "claim": "c", "where": f"a.py:{line}",
+            "slots": {"what": "w", "proof": f"a.py:{line}", "risk": "r", "fix": "f"},
+            "decision": {"question": "Include it?", "recommendation": "Include it."},
+            **extra,
+        }
+
+    def reviewed(self):
+        root = self.session("acme-widget-pr7", self.first)
+        store = session_store.SessionStore(root)
+        store.put_beat(self.flag(1, 2))
+        store.put_beat(self.flag(2, 4))
+        store.produce("drop-1", 1, "drop", "pinned upstream on purpose", reason="intentional")
+        store.ack(store.head()["seq"])
+        return root
+
+    def run_ctl(self, *args):
+        return subprocess.run(
+            [sys.executable, str(SESSIONCTL), *map(str, args)],
+            text=True, capture_output=True, stdin=subprocess.DEVNULL, timeout=60,
+        )
+
+    def link(self, root, prior):
+        completed = self.run_ctl("link-predecessor", root, prior)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        return json.loads(completed.stdout)
+
+    def test_the_replacement_scopes_to_moved_lines_and_carries_the_calls(self):
+        prior = self.reviewed()
+        replacement = self.session("acme-widget-pr7-r2", self.second)
+
+        linked = self.link(replacement, prior)
+
+        self.assertEqual(linked["round"], 2)
+        self.assertEqual(linked["session"], "acme-widget-pr7")
+        self.assertEqual(linked["head_sha"], self.first)
+        self.assertEqual(linked["moved"], {"a.py": [4]})
+        dropped = next(entry for entry in linked["carried"] if entry["n"] == 1)
+        self.assertEqual(dropped["state"], "dropped")
+        self.assertEqual(dropped["reason"], "intentional")
+        self.assertEqual(dropped["anchor"], {"path": "a.py", "text": "TWO = unpinned"})
+        self.assertEqual(
+            [(entry["n"], entry["state"]) for entry in linked["carried"]],
+            [(1, "dropped"), (2, "flag")],
+        )
+
+    def test_a_dropped_finding_is_refused_while_its_line_reads_the_same(self):
+        prior = self.reviewed()
+        replacement = self.session("acme-widget-pr7-r2", self.second)
+        self.link(replacement, prior)
+        store = session_store.SessionStore(replacement)
+
+        with self.assertRaisesRegex(session_store.StoreError, "dropped this finding in round 1 as intentional"):
+            store.put_beat(self.flag(1, 2))
+        written = store.put_beat(self.flag(1, 4))
+
+        self.assertEqual(written["where"], "a.py:4")
+
+    def test_the_link_is_write_once_and_comes_before_the_first_beat(self):
+        prior = self.reviewed()
+        replacement = self.session("acme-widget-pr7-r2", self.second)
+        self.link(replacement, prior)
+
+        again = self.run_ctl("link-predecessor", replacement, prior)
+        self.assertEqual(again.returncode, 1)
+        self.assertIn("already linked", again.stderr)
+        store = session_store.SessionStore(replacement)
+        with self.assertRaisesRegex(session_store.Conflict, "link-predecessor"):
+            store.patch_session({"predecessor": {"round": 9}})
+        self.assertEqual(store.snapshot()[0]["predecessor"]["round"], 2)
+
+        late = self.session("acme-widget-pr7-r3", self.second)
+        session_store.SessionStore(late).put_beat(self.flag(1, 4))
+        refused = self.run_ctl("link-predecessor", late, prior)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("before the first beat", refused.stderr)
+
+    def test_a_link_to_another_pull_request_or_the_same_head_is_refused(self):
+        prior = self.reviewed()
+        other = self.session("acme-widget-pr8", self.second, number=8)
+        same = self.session("acme-widget-pr7-again", self.first)
+
+        for root, message in ((other, "different pull request"), (same, "resume it instead")):
+            with self.subTest(root=root.name):
+                completed = self.run_ctl("link-predecessor", root, prior)
+                self.assertEqual(completed.returncode, 1)
+                self.assertIn(message, completed.stderr)
+
+    def test_a_third_round_still_remembers_the_first_rounds_drop(self):
+        prior = self.reviewed()
+        second = self.session("acme-widget-pr7-r2", self.second)
+        self.link(second, prior)
+        third_head = self.commit("one\nTWO = unpinned\nthree\nFOUR = faster\nfive\n")
+        third = self.session("acme-widget-pr7-r3", third_head)
+
+        linked = self.link(third, second)
+
+        self.assertEqual(linked["round"], 3)
+        # Round 1's open flag sat on line 4, whose words round 2's head changed.
+        self.assertEqual(
+            [(entry["round"], entry["n"], entry.get("line_changed")) for entry in linked["carried"]],
+            [(1, 1, None), (1, 2, 2)],
+        )
+        with self.assertRaisesRegex(session_store.StoreError, "round 1"):
+            session_store.SessionStore(third).put_beat(self.flag(1, 2))
+
+    def test_a_deletion_between_heads_moves_the_lines_around_it(self):
+        prior = self.reviewed()
+        trimmed = self.commit("one\nTWO = unpinned\nthree\nfive\n")
+        replacement = self.session("acme-widget-pr7-r2", trimmed)
+
+        linked = self.link(replacement, prior)
+
+        self.assertEqual(linked["moved"], {"a.py": [3, 4]})
+
+    def test_a_line_whose_words_repeat_in_the_diff_is_not_refused(self):
+        self.base = self.commit("one\nx = 1\nthree\nx = 1\nfive\n")
+        first = self.commit("one\nx = 2\nthree\nx = 2\nfive\n")
+        second = self.commit("one\nx = 2\nthree\nx = 2\nsix\n")
+        prior = self.session("acme-widget-pr7", first)
+        store = session_store.SessionStore(prior)
+        store.put_beat(self.flag(1, 2))
+        store.produce("drop-1", 1, "drop", "fine here", reason="intentional")
+        replacement = self.session("acme-widget-pr7-r2", second)
+
+        linked = self.link(replacement, prior)
+
+        self.assertNotIn("anchor", linked["carried"][0])
+        written = session_store.SessionStore(replacement).put_beat(self.flag(1, 4))
+        self.assertEqual(written["state"], "flag")
+
+    def test_history_names_a_session_it_could_not_read(self):
+        broken = self.reviews / "acme-widget-pr6"
+        broken.mkdir()
+        (broken / "session.sqlite3").write_bytes(b"not a database")
+        current = self.session("acme-widget-pr7-r2", self.second)
+
+        result = json.loads(self.run_ctl("history", current).stdout)
+
+        self.assertEqual([entry["session"] for entry in result["unreadable"]], ["acme-widget-pr6"])
+
+    def history_module(self, born):
+        spec = importlib.util.spec_from_file_location("sessionctl_module", SESSIONCTL)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        module.born = born
+        return module
+
+    def test_history_carries_earlier_facts_and_skips_later_sessions(self):
+        prior = self.reviewed()
+        session_store.SessionStore(prior).patch_session({
+            "facts": ["ADR-039 governs claims"], "recommendation": "Fix the pin first.",
+        })
+        current = self.session("acme-widget-pr7-r2", self.second)
+        self.session("acme-widget-pr9", self.second, number=9)
+        created = {"acme-widget-pr7": 1.0, "acme-widget-pr7-r2": 2.0, "acme-widget-pr9": 3.0}
+        module = self.history_module(lambda root: created[Path(root).name])
+
+        result = module.history(current)
+
+        self.assertEqual([entry["session"] for entry in result["sessions"]], ["acme-widget-pr7"])
+        entry = result["sessions"][0]
+        self.assertEqual(entry["order"], "earlier")
+        self.assertEqual(entry["facts"], ["ADR-039 governs claims"])
+        self.assertEqual(entry["recommendation"], "Fix the pin first.")
+
+    def test_deleting_the_file_between_heads_moves_it_whole(self):
+        prior = self.reviewed()
+        (self.repo / "a.py").unlink()
+        self.git("rm", "-q", "a.py")
+        self.git("commit", "-q", "-m", "drop a.py")
+        gone = self.git("rev-parse", "HEAD")
+        replacement = self.session("acme-widget-pr7-r2", gone)
+
+        linked = self.link(replacement, prior)
+
+        self.assertEqual(linked["moved"], {"a.py": []})
+
+    def test_navigation_cannot_raise_a_dropped_finding_either(self):
+        prior = self.reviewed()
+        replacement = self.session("acme-widget-pr7-r2", self.second)
+        self.link(replacement, prior)
+        store = session_store.SessionStore(replacement)
+        action = store.produce("nav-1", None, "next", "")
+        session = dict(store.snapshot()[0], current_beat=1)
+
+        with self.assertRaisesRegex(session_store.StoreError, "dropped this finding"):
+            store.apply(action["seq"], {"kind": "walk", "current_beat": 1}, session=session,
+                        beats=(self.flag(1, 2),))
+        self.assertEqual(store.snapshot()[1], [])
+
+    def test_over_drop_raises_a_different_finding_on_a_dropped_line(self):
+        prior = self.reviewed()
+        replacement = self.session("acme-widget-pr7-r2", self.second)
+        self.link(replacement, prior)
+        store = session_store.SessionStore(replacement)
+
+        written = store.put_beat(self.flag(1, 2, over_drop="the pin is fine; the name now shadows a builtin"))
+        self.assertEqual(written["state"], "flag")
+        with self.assertRaisesRegex(session_store.StoreError, "names no earlier drop"):
+            store.put_beat(self.flag(2, 4, over_drop="nothing was dropped here"))
+
+    def test_a_binary_change_between_heads_moves_the_file_whole(self):
+        (self.repo / "logo.bin").write_bytes(b"\x00\x01old")
+        self.git("add", "logo.bin")
+        self.git("commit", "-q", "-m", "binary")
+        first = self.git("rev-parse", "HEAD")
+        (self.repo / "logo.bin").write_bytes(b"\x00\x01new")
+        self.git("commit", "-q", "-am", "binary again")
+        second = self.git("rev-parse", "HEAD")
+        prior = self.session("acme-widget-pr7", first)
+        replacement = self.session("acme-widget-pr7-r2", second)
+
+        linked = self.link(replacement, prior)
+
+        self.assertEqual(linked["moved"], {"logo.bin": []})
+
+    def test_a_later_round_supersedes_what_an_earlier_round_left_open(self):
+        prior = self.reviewed()
+        second = self.session("acme-widget-pr7-r2", self.second)
+        self.link(second, prior)
+        store = session_store.SessionStore(second)
+        store.put_beat(self.flag(1, 4))
+        store.produce("drop-1", 1, "drop", "fast is intended", reason="intentional")
+        store.ack(store.head()["seq"])
+        third_head = self.commit("one\nTWO = unpinned\nthree\nFOUR = fast\nfive\nsix\n")
+        third = self.session("acme-widget-pr7-r3", third_head)
+
+        linked = self.link(third, second)
+
+        self.assertEqual(
+            [(entry["round"], entry["n"], entry["state"], entry.get("line_changed"))
+             for entry in linked["carried"]],
+            [(1, 1, "dropped", None), (1, 2, "flag", 2), (2, 1, "dropped", None)],
+        )
+
+    def test_a_flag_raised_over_a_drop_leaves_the_drop_carried(self):
+        prior = self.reviewed()
+        second = self.session("acme-widget-pr7-r2", self.second)
+        self.link(second, prior)
+        store = session_store.SessionStore(second)
+        store.put_beat(self.flag(1, 2, over_drop="the pin holds; the name shadows a builtin"))
+        third_head = self.commit("one\nTWO = unpinned\nthree\nFOUR = fast\nfive\nsix\n")
+        third = self.session("acme-widget-pr7-r3", third_head)
+
+        linked = self.link(third, second)
+
+        drops = [e for e in linked["carried"] if e["state"] == "dropped"]
+        self.assertEqual([(e["round"], e["n"]) for e in drops], [(1, 1)])
+        with self.assertRaisesRegex(session_store.StoreError, "dropped this finding in round 1"):
+            session_store.SessionStore(third).put_beat(self.flag(1, 2))
+
+    def test_history_marks_order_unknown_where_creation_time_is_not_recorded(self):
+        self.reviewed()
+        current = self.session("acme-widget-pr7-r2", self.second)
+        result = self.history_module(lambda root: None).history(current)
+
+        self.assertEqual([(e["session"], e["order"]) for e in result["sessions"]], [("acme-widget-pr7", "unknown")])
+
+    def test_confinement_refuses_a_session_outside_the_eval_root(self):
+        current = self.session("acme-widget-pr7-r2", self.second)
+        env = dict(os.environ, UNDERWRITE_CONFINE=str(self.reviews / "scratch"))
+        (self.reviews / "scratch").mkdir()
+        escape = self.reviews / "scratch" / ".." / "acme-widget-pr7-r2"
+        for target in (current, escape):
+            with self.subTest(target=str(target)):
+                completed = subprocess.run(
+                    [sys.executable, str(SESSIONCTL), "get-session", str(target)],
+                    text=True, capture_output=True, env=env, stdin=subprocess.DEVNULL,
+                )
+                self.assertEqual(completed.returncode, 1)
+                self.assertIn("outside UNDERWRITE_CONFINE", completed.stderr)
+
+    def test_history_lists_earlier_findings_on_the_paths_this_session_touches(self):
+        self.reviewed()
+        current = self.session("acme-widget-pr7-r2", self.second)
+
+        completed = self.run_ctl("history", current)
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["repo"], "acme/widget")
+        sessions = {entry["session"]: entry for entry in result["sessions"]}
+        self.assertEqual(set(sessions), {"acme-widget-pr7"})
+        findings = sessions["acme-widget-pr7"]["findings"]
+        self.assertEqual([(item["n"], item["state"]) for item in findings], [(1, "dropped"), (2, "flag")])
+        self.assertEqual(findings[0]["reason"], "intentional")
 
 
 if __name__ == "__main__":

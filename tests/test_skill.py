@@ -618,5 +618,50 @@ class ClaimSections(unittest.TestCase):
         self.assertIn("which of Testing, Risk and How to revert", readme)
 
 
+class ReviewerNoise(unittest.TestCase):
+    """The article's convergence fixes: measure noise before changing the reviewer, check
+    every flag with a second read, and let a moved head reopen only what moved."""
+
+    def skill(self):
+        return " ".join(SKILL.read_text(encoding="utf-8").split())
+
+    def readme(self):
+        return " ".join(README.read_text(encoding="utf-8").split())
+
+    def test_the_ledger_is_the_guardrail_for_skill_changes(self):
+        for text in (self.skill(), self.readme()):
+            self.assertIn("sessionctl.py stats ~/.claude/reviews", text)
+            self.assertIn("a change that raises the dropped share is a regression even when it finds more", text)
+
+    def test_a_flag_is_read_twice_before_it_is_written(self):
+        walk = self.skill().split("## Phase 3: walk")[1].split("**Persist the beat")[0]
+        self.assertIn("A flag gets a second read before you write it.", walk)
+        self.assertIn("Did this PR introduce it? Is it real? Would a senior engineer stop at it?", walk)
+        self.assertIn("Do not pass your reasoning or your other beats", walk)
+        self.assertIn("on whether it is real, demotes the flag before it is written", walk)
+        self.assertIn("A no on whether a senior engineer would stop does not demote it", walk)
+        self.assertIn("A stored flag cannot be demoted by a rewrite", walk)
+
+    def test_a_replacement_links_its_predecessor_and_plans_only_what_moved(self):
+        text = self.skill()
+        ingest = text.split("## Phase 0")[1].split("## Phase 1")[0]
+        self.assertIn('sessionctl.py link-predecessor "$R" "$P"', ingest)
+        self.assertIn("never in it", ingest)
+        self.assertIn('sessionctl.py history "$R"', ingest)
+        plan = text.split("## Phase 2: plan the walk")[1].split("## Phase 3")[0]
+        self.assertIn("A replacement plans only what moved.", plan)
+        self.assertIn("it is not included again", plan)
+
+    def test_the_fourth_round_says_reconsider_the_approach(self):
+        orient = self.skill().split("## Phase 1: orient")[1].split("## Phase 2")[0]
+        self.assertIn("In round 4, the third replacement on one PR, the recommendation says to reconsider the approach", orient)
+        self.assertIn("the recommendation says to reconsider the approach", self.readme())
+
+    def test_the_review_history_promise_names_the_command_that_keeps_it(self):
+        text = self.skill()
+        self.assertNotIn("read the prior sessions for context", text)
+        self.assertIn("`history` is how a later session reads it", text)
+
+
 if __name__ == "__main__":
     unittest.main()
