@@ -24,7 +24,7 @@ if HERE not in sys.path:
 from diff_lines import parse_diff, untouched_anchor  # noqa: E402
 
 
-DB_SCHEMA_VERSION = 7
+DB_SCHEMA_VERSION = 8
 SCHEMA_VERSION = 1
 DELIVERY_VERSION = 1
 FINDINGS_FILE = "findings.md"
@@ -51,10 +51,21 @@ RESOLVABLE = {"accept": ("flag",), "drop": ("flag",), "decide": ("flag", "accept
 DROP_REASONS = ("wrong", "intentional", "not-worth-it", "pre-existing")
 OPEN_STATES = ("clean", "flag", "unverified")
 # What PROOF is: a command whose output would have read differently were the claim
-# false, a file or diff read, or an inference. Only `ran` earns CLEAN.
-PROOF_KINDS = ("ran", "read", "inferred")
+# false, a file or diff read, or an inference. `attested` is a command the execution
+# gateway ran on the frozen head and signed for, with the exit code the walk predicted.
+# Only `ran` and `attested` earn CLEAN.
+PROOF_KINDS = ("ran", "read", "inferred", "attested")
+CLEAN_PROOF_KINDS = ("ran", "attested")
 RESOLUTION_KINDS = ("delivery", "decision")
-STORE_OWNED_FIELDS = ("call", "reason", "landed", "branch", "delivery_kind", "delivery")
+STORE_OWNED_FIELDS = (
+    "call", "reason", "landed", "branch", "delivery_kind", "delivery", "attestation",
+)
+# What a proof may append to the trusted profile's command, and how much of what it
+# printed the page keeps. The full streams stay in the session's proof evidence.
+MAX_PROOF_ARGUMENTS = 16
+MAX_PROOF_ARGUMENT_BYTES = 512
+PROOF_OUTPUT_TAIL_LINES = 8
+PROOF_OUTPUT_TAIL_CHARS = 1000
 # Rule 2's budget, in numbers. It binds what a walk writes now and never what is
 # already on disk: validate_beat stays the shippability contract for stored beats,
 # so tightening here cannot retroactively unship a session or an accepted finding.
@@ -256,10 +267,20 @@ def proof_kind_problems(beat):
         problems.append(
             f"beat {n}: proof_kind must be one of {', '.join(PROOF_KINDS)}"
         )
-    elif state == "clean" and kind != "ran":
+    elif state == "clean" and kind not in CLEAN_PROOF_KINDS:
         problems.append(
             f"beat {n}: clean on a {kind} proof; write it unverified, "
             "or name the command you ran"
+        )
+    if kind == "attested" and "attested_proof" not in beat:
+        problems.append(
+            f"beat {n}: attested proof names no attested_proof; "
+            "run proofctl.py prove first"
+        )
+    if "attested_proof" in beat and kind != "attested":
+        problems.append(
+            f"beat {n}: attested_proof is set but proof_kind is {kind}; "
+            "write proof_kind attested"
         )
     slots = beat.get("slots")
     if state in ("clean", "unverified") and isinstance(slots, dict) and slots.get("risk"):
@@ -372,6 +393,10 @@ def validate_beat(beat, mode="branch", final=False):
             f"beat {n}: proof_kind {beat['proof_kind']!r} is not one of "
             f"{', '.join(PROOF_KINDS)}"
         )
+    if beat.get("proof_kind") == "attested" and not isinstance(
+        beat.get("attestation"), dict
+    ):
+        problems.append(f"beat {n}: attested proof carries no gateway attestation")
     return problems
 
 
@@ -747,6 +772,7 @@ class SessionStore:
         )
         for statement in statements:
             db.execute(statement)
+        self._create_proof_table(db)
         db.execute(f"PRAGMA user_version = {DB_SCHEMA_VERSION}")
 
     def _actions_schema(self, name):
@@ -828,6 +854,7 @@ class SessionStore:
             if version in (1, 2, 3):
                 self._default_legacy_execution_policy(db)
             self._create_implementation_tables(db)
+            self._create_proof_table(db)
             if db.total_changes != before:
                 # Derived from rows a repair just rewrote, and before the commit, so a
                 # failed write takes the repair with it and the next open retries both.
@@ -883,6 +910,25 @@ class SessionStore:
             failed_at TEXT,
             PRIMARY KEY (action_seq, attempt)
         )""")
+
+    def _create_proof_table(self, db):
+        db.execute("""CREATE TABLE IF NOT EXISTS proof_attempts (
+                proof INTEGER PRIMARY KEY CHECK (proof > 0),
+                beat INTEGER NOT NULL CHECK (beat > 0),
+                challenge TEXT NOT NULL UNIQUE,
+                state TEXT NOT NULL CHECK (state IN ('reserved', 'verified', 'failed')),
+                trusted_profile_json TEXT NOT NULL,
+                request_json TEXT NOT NULL,
+                request_sha256 TEXT NOT NULL,
+                capability BLOB,
+                receipt BLOB,
+                evidence_json TEXT,
+                output_json TEXT,
+                failure TEXT,
+                created_at TEXT NOT NULL,
+                verified_at TEXT,
+                failed_at TEXT
+            )""")
 
     def _default_legacy_execution_policy(self, db):
         row = self._session_row(db)
@@ -3077,11 +3123,15 @@ class SessionStore:
             raise StoreError(f"implementation evidence {label} must not be truncated")
         return value
 
-    def _implementation_evidence(self, document, attempt, capability, receipt):
+    def _implementation_evidence(
+        self, document, attempt, capability, receipt, exit_code=None
+    ):
         if not isinstance(document, dict) or set(document) != _IMPLEMENTATION_EVIDENCE_FIELDS:
             raise StoreError("implementation evidence has an unsupported shape")
         evidence = _copy(document)
         profile = json.loads(attempt["trusted_profile_json"])
+        if exit_code is None:
+            exit_code = profile["exitCode"]
         if type(evidence["version"]) is not int or evidence["version"] != 1:
             raise StoreError("implementation evidence version must be 1")
         expected = {
@@ -3091,7 +3141,7 @@ class SessionStore:
             "executorId": profile["executorId"],
             "capabilitySha256": hashlib.sha256(capability).hexdigest(),
             "receiptSha256": hashlib.sha256(receipt).hexdigest(),
-            "exitCode": profile["exitCode"],
+            "exitCode": exit_code,
         }
         for name, value in expected.items():
             if evidence[name] != value:
@@ -3302,6 +3352,273 @@ class SessionStore:
             return self._delivery_receipt(
                 action_seq, action["beat_n"], "landed", desired
             )
+
+    # ---- attested proofs --------------------------------------------
+
+    def _proof_session(self, db):
+        """The one kind of session a proof may run for: a frozen PR source.
+
+        The controller still executes nothing. The gateway runs the command on its own
+        quarantine of the frozen head, and what comes back is evidence for one beat."""
+        session_row = self._session_row(db)
+        session = json.loads(session_row["body_json"])
+        target = session.get("target")
+        if not isinstance(target, dict):
+            raise Conflict("attested proof requires a frozen PR target")
+        if "object_bundle_sha256" not in target:
+            raise Conflict("attested proof requires a frozen Git object bundle")
+        if session.get("linked_implementation") is not None:
+            raise Conflict("a linked implementation child runs no proofs")
+        policy = self._required_execution_policy(session)
+        if policy["mode"] != "no_exec":
+            raise Conflict("attested proof runs only for a no-exec source session")
+        return session_row, session
+
+    def _proof_arguments(self, arguments):
+        if not isinstance(arguments, list) or not arguments:
+            raise StoreError("proof arguments must be a non-empty list")
+        if len(arguments) > MAX_PROOF_ARGUMENTS:
+            raise StoreError(
+                f"proof takes at most {MAX_PROOF_ARGUMENTS} arguments after the "
+                "trusted command"
+            )
+        for index, argument in enumerate(arguments):
+            if not isinstance(argument, str) or not argument:
+                raise StoreError(f"proof argument {index} must be non-empty text")
+            if any(ord(character) < 32 or ord(character) == 127 for character in argument):
+                raise StoreError(f"proof argument {index} contains a control character")
+            if len(argument.encode("utf-8")) > MAX_PROOF_ARGUMENT_BYTES:
+                raise StoreError(
+                    f"proof argument {index} exceeds {MAX_PROOF_ARGUMENT_BYTES} bytes"
+                )
+        return list(arguments)
+
+    def _proof_document(self, row):
+        return {
+            "version": 1,
+            "proof": row["proof"],
+            "beat": row["beat"],
+            "state": row["state"],
+            "challenge": row["challenge"],
+            "request": json.loads(row["request_json"]),
+            "request_sha256": row["request_sha256"],
+            "trusted_profile": json.loads(row["trusted_profile_json"]),
+            "capability": row["capability"],
+            "receipt": row["receipt"],
+            "evidence": None if row["evidence_json"] is None else json.loads(row["evidence_json"]),
+            "output": None if row["output_json"] is None else json.loads(row["output_json"]),
+            "failure": row["failure"],
+            "created_at": row["created_at"],
+            "verified_at": row["verified_at"],
+            "failed_at": row["failed_at"],
+        }
+
+    def _proof_row(self, db, proof):
+        _positive(proof, "proof")
+        row = db.execute(
+            "SELECT * FROM proof_attempts WHERE proof = ?", (proof,)
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"session has no proof {proof}")
+        return row
+
+    def proof_attempt(self, proof):
+        with self._read() as db:
+            return self._proof_document(self._proof_row(db, proof))
+
+    def proof_attempts(self):
+        with self._read() as db:
+            return [
+                self._proof_document(row)
+                for row in db.execute("SELECT * FROM proof_attempts ORDER BY proof")
+            ]
+
+    def reserve_proof(self, beat, trusted_profile, arguments, exit_code):
+        """Bind one command and its predicted exit code to a beat, ready for the gateway.
+
+        The command is the trusted profile's own, with the walk's arguments after it.
+        The prediction is the claim: the gateway signs only an exit code that matches
+        it, so a receipt is a run whose result would have differed were the claim false.
+        A retry of the same command returns the attempt it already has; only a definite
+        failure makes room for a fresh one."""
+        beat = _positive(beat, "proof beat")
+        profile = self._trusted_implementation_profile(trusted_profile)
+        arguments = self._proof_arguments(arguments)
+        _non_negative(exit_code, "proof exit code")
+        if exit_code > 255:
+            raise StoreError("proof exit code must not exceed 255")
+        profile_json = _dump(profile)
+        job = _copy(profile["job"])
+        job["argv"] = list(job["argv"]) + arguments
+        with self._write() as db:
+            session_row, session = self._proof_session(db)
+            for row in db.execute(
+                "SELECT * FROM proof_attempts WHERE beat = ? AND state != 'failed' "
+                "ORDER BY proof",
+                (beat,),
+            ):
+                request = json.loads(row["request_json"])
+                if (
+                    row["trusted_profile_json"] == profile_json
+                    and request["job"] == job
+                    and request["exitCode"] == exit_code
+                ):
+                    return self._proof_document(row)
+            number = db.execute(
+                "SELECT COALESCE(MAX(proof), 0) + 1 FROM proof_attempts"
+            ).fetchone()[0]
+            challenge = secrets.token_hex(32)
+            request = {
+                "version": 1,
+                "sessionId": session_row["session_id"],
+                "challenge": challenge,
+                "target": _copy(session["target"]),
+                "action": {"seq": number, "beat": beat, "attempt": 1},
+                "job": job,
+                "sandbox": _copy(profile["sandbox"]),
+                "exitCode": exit_code,
+            }
+            request_json = _dump(request)
+            if len(request_json.encode("utf-8")) > MAX_IMPLEMENTATION_REQUEST_BYTES:
+                raise StoreError("proof request exceeds its byte limit")
+            db.execute(
+                "INSERT INTO proof_attempts "
+                "(proof, beat, challenge, state, trusted_profile_json, request_json, "
+                "request_sha256, created_at) VALUES (?, ?, ?, 'reserved', ?, ?, ?, ?)",
+                (
+                    number, beat, challenge, profile_json, request_json,
+                    hashlib.sha256(request_json.encode("utf-8")).hexdigest(), _now(),
+                ),
+            )
+            return self._proof_document(self._proof_row(db, number))
+
+    def _proof_output(self, stdout, stderr, evidence):
+        """The tail of each stream as the page shows it, bound to the signed digests."""
+        output = {}
+        for name, data in (("stdout", stdout), ("stderr", stderr)):
+            if not isinstance(data, bytes):
+                raise StoreError(f"proof {name} must be bytes")
+            if self._stream_descriptor(evidence[name], name) != {
+                "sha256": hashlib.sha256(data).hexdigest(),
+                "bytes": len(data),
+                "truncated": False,
+            }:
+                raise Conflict(f"proof {name} does not match its signed digest")
+            text = data.decode("utf-8", "replace")
+            text = "".join(
+                character
+                for character in text
+                if character in "\n\t" or not (
+                    ord(character) < 32 or ord(character) == 127
+                )
+            )
+            lines = text.rstrip("\n").split("\n")[-PROOF_OUTPUT_TAIL_LINES:]
+            tail = "\n".join(lines)[-PROOF_OUTPUT_TAIL_CHARS:]
+            output[name] = tail
+        return output
+
+    def record_verified_proof(self, proof, capability, receipt, evidence, stdout, stderr):
+        if not isinstance(capability, bytes) or not capability:
+            raise StoreError("verified capability must be non-empty bytes")
+        if not isinstance(receipt, bytes) or not receipt:
+            raise StoreError("verified receipt must be non-empty bytes")
+        with self._write() as db:
+            self._proof_session(db)
+            row = self._proof_row(db, proof)
+            request = json.loads(row["request_json"])
+            verified = self._implementation_evidence(
+                evidence, row, capability, receipt, exit_code=request["exitCode"]
+            )
+            output = self._proof_output(stdout, stderr, verified)
+            evidence_json, output_json = _dump(verified), _dump(output)
+            if row["state"] == "verified":
+                if (
+                    row["capability"] != capability
+                    or row["receipt"] != receipt
+                    or row["evidence_json"] != evidence_json
+                    or row["output_json"] != output_json
+                ):
+                    raise Conflict("proof already has different verified evidence")
+                return self._proof_document(row)
+            if row["state"] != "reserved":
+                raise Conflict(f"proof is {row['state']}, not reserved")
+            db.execute(
+                "UPDATE proof_attempts SET state = 'verified', capability = ?, "
+                "receipt = ?, evidence_json = ?, output_json = ?, verified_at = ? "
+                "WHERE proof = ?",
+                (capability, receipt, evidence_json, output_json, _now(), proof),
+            )
+            return self._proof_document(self._proof_row(db, proof))
+
+    def fail_proof(self, proof, failure):
+        if not isinstance(failure, str) or not failure.strip():
+            raise StoreError("proof failure must be non-empty text")
+        failure = failure.strip()
+        with self._write() as db:
+            self._proof_session(db)
+            row = self._proof_row(db, proof)
+            if row["state"] == "failed":
+                if row["failure"] != failure:
+                    raise Conflict("proof failed for a different reason")
+                return self._proof_document(row)
+            if row["state"] != "reserved":
+                raise Conflict(f"proof is {row['state']}, not reserved")
+            db.execute(
+                "UPDATE proof_attempts SET state = 'failed', failure = ?, failed_at = ? "
+                "WHERE proof = ?",
+                (failure, _now(), proof),
+            )
+            return self._proof_document(self._proof_row(db, proof))
+
+    def _attest_beat(self, db, session, beat):
+        """Hold an attested proof to the receipt it names, and write what it showed.
+
+        The walk names the proof; the store writes the command, exit code and output
+        beside it from the verified row, so the page never shows the walk's paraphrase
+        of a run as the run itself."""
+        beat.pop("attestation", None)
+        if beat.get("proof_kind") != "attested":
+            if "attested_proof" in beat:
+                raise StoreError(
+                    f"beat {beat['n']}: attested_proof is set but proof_kind is "
+                    f"{beat.get('proof_kind')}"
+                )
+            return
+        if not isinstance(session.get("target"), dict):
+            raise Conflict(
+                f"beat {beat['n']}: an attested proof needs a frozen PR target; "
+                "a branch walk runs its own commands and writes ran"
+            )
+        proof = beat.get("attested_proof")
+        if isinstance(proof, bool) or not isinstance(proof, int) or proof <= 0:
+            raise StoreError(
+                f"beat {beat['n']}: attested proof names no attested_proof number"
+            )
+        row = db.execute(
+            "SELECT * FROM proof_attempts WHERE proof = ?", (proof,)
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"beat {beat['n']}: session has no proof {proof}")
+        if row["beat"] != beat["n"]:
+            raise Conflict(
+                f"beat {beat['n']}: proof {proof} was run for beat {row['beat']}"
+            )
+        if row["state"] != "verified":
+            raise Conflict(
+                f"beat {beat['n']}: proof {proof} is {row['state']}, not verified; "
+                "an unverified run is no proof"
+            )
+        request = json.loads(row["request_json"])
+        evidence = json.loads(row["evidence_json"])
+        beat["attestation"] = {
+            "proof": proof,
+            "argv": request["job"]["argv"],
+            "exit_code": request["exitCode"],
+            "receipt_sha256": evidence["receiptSha256"],
+            "key_id": evidence["keyId"],
+            "executor_id": evidence["executorId"],
+            "output": json.loads(row["output_json"]),
+        }
 
     def read_trusted_context(self):
         with self._session_lock():
@@ -3571,6 +3888,9 @@ class SessionStore:
                         beat[field] = current[field]
                     else:
                         beat.pop(field, None)
+                # Recomputed from its proof row below, so writing back what get-beat
+                # returned is no change.
+                beat.pop("attestation", None)
                 if "proof_kind" in current or "proof_kind" in beat:
                     # Written under the proof-kind rule, so a rewrite answers to it too;
                     # a beat from before the field keeps its verdict untouched.
@@ -3586,7 +3906,10 @@ class SessionStore:
                         beat.pop("resolution_kind", None)
                 if current.get("state") == "accepted":
                     if self._audience_mode(session) == "report":
-                        frozen_fields = ("tier", "claim", "where", "slots", "diff", "decision")
+                        frozen_fields = (
+                            "tier", "claim", "where", "slots", "diff", "decision",
+                            "proof_kind", "attested_proof",
+                        )
                         changed_fields = [
                             field
                             for field in frozen_fields
@@ -3609,6 +3932,8 @@ class SessionStore:
                         if not isinstance(slots, dict):
                             raise StoreError(f"beat {beat['n']} slots must be an object")
                         slots["fix"] = current_slots["fix"]
+            self._attest_beat(db, session, beat)
+            if row is not None:
                 self._hold_authorized_finding(db, beat, current)
             self._refuse_untouched_flag(session, beat)
             changed, _revision, _state, _detail = self._save_beat(db, beat)

@@ -77,6 +77,15 @@ was: `CLEAN` is reserved for a command whose output would have differed were the
 false, and a claim that was read or inferred opens `UNVERIFIED`, which is where your own
 reading goes. A risk appears only on a flag, with a decision beside it.
 
+A PR session can still earn `CLEAN` when the host runs a proof gateway. The walk picks a
+command, such as one test module, and predicts its exit code. `proofctl.py prove` hands
+it to the execution gateway, which runs it on the gateway's own copy of the frozen head
+inside its sandbox and signs a receipt only if the command exits as predicted. The
+store accepts `proof_kind: attested` only beside a verified receipt for that beat, and
+writes the signed command, exit code and the last lines it printed onto the card itself,
+so the walk's `PROOF` line cannot pass for the run. A flag can carry its failing run the
+same way. A wrong prediction yields no receipt and proves nothing.
+
 Beats stay that size because the store makes them. A slot over 25 words, a claim over 20,
 a fourth filled slot on a clean beat, or an eleventh quoted line is refused at write time,
 with the offending slot and its count named, as is a clean verdict on a read proof or a
@@ -138,6 +147,13 @@ target. Underwrite may inspect the hash-bound diff and frozen Git objects throug
 static readers, but it does not check out the head, install, build, test, lint, run repo
 scripts or interpreters, or invoke Git hooks and filters. Review comments, report
 inclusions, notes, navigation, and recorded decisions still work.
+
+A proof never changes the session's `no_exec` policy. This machine never runs the head;
+the gateway does, in a sandbox with no network or credentials, from its own quarantine of
+the frozen bundle. It happens only on a host that opted in twice: a proof configuration
+for the controller, and `proofArguments` in the gateway's own configuration. Even then
+the gateway runs the profile's fixed command with at most 16 bounded arguments after it.
+The receipt is evidence for one beat and authorizes nothing.
 
 The host execution protocol is documented in
 [`docs/host-execution-protocol.md`](docs/host-execution-protocol.md). Its
@@ -274,6 +290,8 @@ implementations/<link-id>/  one linked child, nested below the source session
     output.bundle           verified output transport
     stdout                  complete captured standard output
     stderr                  complete captured standard error
+proof-evidence/<proof>/     one verified attested proof: request, both signed
+                            envelopes, and both complete streams
 ```
 
 The scripts are Python 3 stdlib, with no dependencies. `serve.py` runs the walk and

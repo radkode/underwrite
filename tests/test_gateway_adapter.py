@@ -894,5 +894,68 @@ class CliOutcomeTests(unittest.TestCase):
         self.assertEqual(result["status"], "retry")
 
 
+class ProofDeploymentTests(GatewayAdapterCase):
+    """A proof deployment lets a request extend the profile's command and predict its
+    exit code. Everything else stays pinned, and without the opt-in nothing changes."""
+
+    def proof_request(self, *arguments, exit_code=1):
+        request = copy.deepcopy(self.request)
+        request["job"]["argv"] = list(self.profile["job"]["argv"]) + list(arguments)
+        request["exitCode"] = exit_code
+        return request
+
+    def check(self, request, proof_arguments, name):
+        path = self.root / name
+        path.write_bytes(canonical(request))
+        path.chmod(0o600)
+        policy = adapter._policy(self.configuration)
+        return adapter._request(str(path), policy, self.profile, proof_arguments)
+
+    def test_the_opt_in_is_a_bounded_integer(self):
+        accepted = copy.deepcopy(self.configuration)
+        accepted["proofArguments"] = 4
+        loaded = adapter.load_configuration(
+            str(self.write_configuration(accepted, name="proof.json"))
+        )
+        self.assertEqual(loaded["proofArguments"], 4)
+        for index, value in enumerate((0, 17, "4", True, None)):
+            with self.subTest(value=value):
+                refused = copy.deepcopy(self.configuration)
+                refused["proofArguments"] = value
+                path = self.write_configuration(refused, name=f"refused-{index}.json")
+                with self.assertRaises(adapter.AdapterError):
+                    adapter.load_configuration(str(path))
+
+    def test_a_proof_deployment_accepts_a_tail_and_a_predicted_exit(self):
+        request = self.proof_request("tests.test_app", exit_code=1)
+        self.assertEqual(self.check(request, 4, "proof-1.json"), request)
+
+    def test_without_the_opt_in_a_tail_is_refused(self):
+        request = self.proof_request("tests.test_app", exit_code=0)
+        with self.assertRaisesRegex(adapter.AdapterError, "job does not match"):
+            self.check(request, None, "plain.json")
+
+    def test_a_proof_cannot_change_what_the_profile_pins(self):
+        cases = {}
+        cases["too many"] = self.proof_request("a", "b", "c", exit_code=1)
+        changed_prefix = self.proof_request("x", exit_code=1)
+        changed_prefix["job"]["argv"][1] = "-c"
+        cases["prefix"] = changed_prefix
+        environment = self.proof_request("x", exit_code=1)
+        environment["job"]["environment"]["PYTHONPATH"] = "/tmp"
+        cases["environment"] = environment
+        cases["control"] = self.proof_request("a\nb", exit_code=1)
+        cases["long"] = self.proof_request("a" * 513, exit_code=1)
+        cases["empty"] = self.proof_request("", exit_code=1)
+        cases["no tail, other exit"] = self.proof_request(exit_code=1)
+        for index, (label, request) in enumerate(cases.items()):
+            with self.subTest(label=label):
+                with self.assertRaises((adapter.AdapterError, adapter.GatewayError)):
+                    self.check(request, 2, f"refused-request-{index}.json")
+
+    def test_a_proof_deployment_still_runs_the_exact_profile_job(self):
+        self.assertEqual(self.check(self.request, 2, "exact.json"), self.request)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -243,11 +243,12 @@ exits. The configuration is version 1 with exactly these fields:
 
 The embedded `profile` is the exact separately provisioned profile later given to
 `implementationctl.py`. Its key ID must match the configured key pair, and its executor ID
-must match the policy derived from this deployment. The request's complete `job`, `sandbox`,
-and `exitCode` must match it. The `docker`, `openssl`, and `git` values are explicit absolute
-host executable paths. They must be trusted regular executables owned by root or the gateway
-account and not writable by group or other. The job executable is instead an absolute path
-inside the pinned runtime image.
+must match the policy derived from this deployment. The request's complete `job`,
+`sandbox`, and `exitCode` must match it, except as **Proof deployments** below allows. The
+`docker`, `openssl`, and `git` values are explicit absolute host executable paths. They
+must be trusted regular executables owned by root or the gateway account and not writable
+by group or other. The job executable is instead an absolute path inside the pinned runtime
+image.
 
 Preprovision `storeRoot` as a gateway-owned `0700` directory. Separately, provision the
 immediate outbox parent as gateway-owned, group-owned by `consumerGid`, and exactly `0710`.
@@ -330,3 +331,43 @@ local branch. After `implementationctl.py consume` durably succeeds, the gateway
 supervisor may delete the final transport directory. The consumer cannot and must not
 delete it through the `0710` parent. Neither the adapter nor the gateway checks out the
 branch, pushes it, opens a pull request, or publishes a review.
+
+### Proof deployments
+
+A deployment may also run walk claims for source review sessions, through
+`proofctl.py`. It opts in with one more configuration field, `"proofArguments": N`, an
+integer from 1 to 16. With it, a request may differ from the profile in exactly two ways:
+its `job.argv` may append 1 to `N` arguments after the profile's own argv, each non-empty
+printable text of at most 512 UTF-8 bytes, and its `exitCode` may be any integer from 0 to
+255. The executable, environment, working directory, closed stdin and sandbox stay the
+profile's. A request equal to the profile's job is still held to the profile's exit
+code, so the same deployment keeps serving implementation children unchanged. Without
+the field, every request must equal the profile exactly, as before.
+
+The predicted exit code is what makes a run a proof. The broker already signs a receipt
+only when the target exits with the request's `exitCode`, so a mismatch ends the attempt
+as `failed` with no receipt, and the controller records that nothing was proven. Choose a
+profile whose fixed argv names what a proof may run, such as
+`["/usr/local/bin/python3", "-I", "-B", "-m", "unittest"]`. A proof runs head code in the
+sandbox by design: that is what the network denial, the seccomp filter, the single
+process, the `noexec` read-only layout, and the resource limits are for. Do not enable
+`proofArguments` on a host whose sandbox you would not trust with the head.
+
+The controller reaches the adapter through its own proof configuration, kept outside every
+repository and session:
+
+```json
+{
+  "version": 1,
+  "profile": "/etc/underwrite/proof-profile.json",
+  "publicKey": "/etc/underwrite/signing-public.pem",
+  "adapter": ["/usr/local/bin/underwrite-proof-adapter"],
+  "evidenceRoot": "/srv/underwrite-handoff/outbox"
+}
+```
+
+`proofctl.py prove` appends `--request`, `--source-bundle` and `--evidence-dir` to
+`adapter` and reads the handled JSON result. When the gateway runs as another account, as
+it should, `adapter` names a supervisor wrapper that stages the request and the session's
+`pr.bundle` where the gateway may read them and then runs the adapter. The evidence
+directory is `<evidenceRoot>/underwrite-<session id>-proof-<n>`.

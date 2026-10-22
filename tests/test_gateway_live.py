@@ -20,6 +20,10 @@ from gateway.docker_runner import DockerRunner, runtime_container_name
 from gateway.signing import OpenSSLSigner
 from skills.underwrite.scripts.execution_receipt import verify_execution_receipt
 
+SCRIPTS = Path(__file__).parents[1] / "skills" / "underwrite" / "scripts"
+if str(SCRIPTS) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS))
+
 
 IMAGE_ENV = "UNDERWRITE_LIVE_GATEWAY_IMAGE"
 PLATFORM_ENV = "UNDERWRITE_LIVE_GATEWAY_PLATFORM"
@@ -512,6 +516,212 @@ class LiveGatewayTests(unittest.TestCase):
                 ]
             )
             self.assertEqual(remaining, b"")
+
+    def proof_session(self, root):
+        """A captured PR whose head breaks the test its base shipped."""
+        from pr_snapshot import capture
+        from session_store import SessionStore
+
+        remote = root / "upstream.git"
+        controller = root / "controller"
+        self.command([self.git, "init", "--bare", "--template=", remote])
+        self.command([self.git, "init", "--template=", controller])
+        for name, value in (
+            ("user.name", "Underwrite Live Test"),
+            ("user.email", "live@underwrite.invalid"),
+            ("commit.gpgsign", "false"),
+        ):
+            self.command([self.git, "config", name, value], cwd=controller)
+        (controller / "tests").mkdir()
+        (controller / "app.py").write_text("VALUE = 0\n", encoding="utf-8")
+        (controller / "tests" / "__init__.py").write_text("", encoding="utf-8")
+        (controller / "tests" / "test_app.py").write_text(
+            "import unittest\n\nimport app\n\n\n"
+            "class AppTest(unittest.TestCase):\n"
+            "    def test_value(self):\n"
+            "        self.assertEqual(app.VALUE, 0)\n",
+            encoding="utf-8",
+        )
+        self.command([self.git, "add", "."], cwd=controller)
+        self.command([self.git, "commit", "-m", "base"], cwd=controller)
+        self.command([self.git, "branch", "-M", "main"], cwd=controller)
+        self.command([self.git, "remote", "add", "origin", remote], cwd=controller)
+        self.command([self.git, "push", "origin", "main"], cwd=controller)
+        base = self.command([self.git, "rev-parse", "HEAD"], cwd=controller).decode()
+        self.command([self.git, "checkout", "-b", "feature"], cwd=controller)
+        (controller / "app.py").write_text("VALUE = 1\n", encoding="utf-8")
+        self.command([self.git, "commit", "-am", "head"], cwd=controller)
+        head = self.command([self.git, "rev-parse", "HEAD"], cwd=controller).decode()
+        self.command(
+            [self.git, "push", "origin", "HEAD:refs/pull/7/head"], cwd=controller
+        )
+        self.command([self.git, "checkout", "main"], cwd=controller)
+        metadata = {
+            "number": 7,
+            "state": "open",
+            "merged_at": None,
+            "changed_files": 1,
+            "base": {
+                "ref": "main",
+                "sha": base,
+                "repo": {"full_name": "acme/widget", "clone_url": str(remote)},
+            },
+            "head": {
+                "ref": "feature",
+                "sha": head,
+                "repo": {"id": 123, "full_name": "acme/widget"},
+            },
+        }
+        session_root = root / "session"
+        store = SessionStore(session_root, create=True)
+        capture(store, "acme/widget", 7, controller, api=lambda _r, _n: dict(metadata))
+        return session_root, store
+
+    def test_a_proof_runs_the_frozen_head_in_the_sandbox_and_signs_only_its_prediction(self):
+        import attested_proof
+
+        with tempfile.TemporaryDirectory(dir="/tmp") as name:
+            root = Path(name).resolve()
+            os.chown(root, -1, os.getegid())
+            root.chmod(0o710)
+            container_name = runtime_container_name(RUNTIME_DOMAIN_ID)
+            self.remove_container(container_name)
+            self.addCleanup(self.remove_container, container_name)
+            session_root, store = self.proof_session(root)
+            private_key = root / "private.pem"
+            public_key = root / "public.pem"
+            self.command([
+                self.openssl, "genpkey", "-algorithm", "EC",
+                "-pkeyopt", "ec_paramgen_curve:P-256",
+                "-pkeyopt", "ec_param_enc:named_curve",
+                "-out", private_key,
+            ])
+            private_key.chmod(0o600)
+            public_key.write_bytes(
+                self.command([self.openssl, "pkey", "-in", private_key, "-pubout"]) + b"\n"
+            )
+            signer_id = "https://runner.example/hosts/live-proof"
+            signer = OpenSSLSigner(private_key, public_key, signer_id, openssl=self.openssl)
+            environment = {
+                "LANG": "C",
+                "LC_ALL": "C",
+                "PATH": "/usr/local/bin:/usr/bin:/bin",
+                "PYTHONDONTWRITEBYTECODE": "1",
+                "PYTHONUTF8": "1",
+            }
+            sandbox = self.sandbox(self.limits(wallSeconds=20, cpuSeconds=10))
+            job = {
+                "argv": [self.executable["path"], "-I", "-B", "-m", "unittest"],
+                "cwd": ".",
+                "environment": environment,
+                "executable": self.executable,
+                "stdin": "closed",
+            }
+            policy = GatewayPolicy(
+                signer_id=signer_id,
+                deployment_id="urn:underwrite:gateway:live-proof",
+                runtime_domain_id=RUNTIME_DOMAIN_ID,
+                docker_host=self.docker_host,
+                image=self.image,
+                platform=self.platform,
+                runner_sha256=self.runner_sha256,
+                executable=self.executable,
+                environment=environment,
+                sandbox=sandbox,
+                target_uid=65532,
+                target_gid=65532,
+            )
+            profile = {
+                "version": 1,
+                "keyId": signer.key_id,
+                "signerId": signer_id,
+                "executorId": policy.executor_id,
+                "job": job,
+                "sandbox": sandbox,
+                "exitCode": 0,
+            }
+            store_root = root / "store"
+            outbox = root / "outbox"
+            store_root.mkdir(mode=0o700)
+            outbox.mkdir(mode=0o710)
+
+            def canonical(value):
+                return json.dumps(
+                    value, ensure_ascii=False, separators=(",", ":"), sort_keys=True
+                ).encode("utf-8")
+
+            gateway_config = root / "gateway.json"
+            gateway_config.write_bytes(canonical({
+                "version": 1,
+                "privateKey": str(private_key),
+                "publicKey": str(public_key),
+                "storeRoot": str(store_root),
+                "docker": self.docker,
+                "openssl": self.openssl,
+                "git": self.git,
+                "deploymentId": policy.deployment_id,
+                "runtimeDomainId": policy.runtime_domain_id,
+                "dockerHost": self.docker_host,
+                "image": self.image,
+                "platform": self.platform,
+                "runnerSha256": self.runner_sha256,
+                "targetUid": 65532,
+                "targetGid": 65532,
+                "consumerGid": os.getegid(),
+                "capabilitySeconds": 300,
+                "maxSourceBundleBytes": 64 * 1024 * 1024,
+                "profile": profile,
+                "proofArguments": 8,
+            }))
+            gateway_config.chmod(0o600)
+            profile_path = root / "profile.json"
+            profile_path.write_bytes(canonical(profile))
+            proof_config = root / "proof.json"
+            proof_config.write_bytes(canonical({
+                "version": 1,
+                "profile": str(profile_path),
+                "publicKey": str(public_key),
+                "adapter": [
+                    sys.executable, "-I", "-S", str(ADAPTER_PATH),
+                    "--config", str(gateway_config),
+                ],
+                "evidenceRoot": str(outbox),
+            }))
+            arguments = ["discover", "-s", "tests", "-t", "."]
+
+            wrong = attested_proof.prove(session_root, 1, proof_config, arguments, 0)
+
+            self.assertEqual(wrong["status"], "failed", wrong)
+            self.assertIn("exit code", wrong["proof"]["failure"])
+            self.assertIsNone(wrong["proof"]["evidence"])
+
+            right = attested_proof.prove(session_root, 1, proof_config, arguments, 1)
+
+            self.assertEqual(right["status"], "verified", right)
+            self.assertEqual(right["proof"]["evidence"]["exitCode"], 1)
+            self.assertIn("AssertionError: 1 != 0", right["proof"]["output"]["stderr"])
+            beat = store.put_beat({
+                "n": 1,
+                "tier": "core",
+                "state": "flag",
+                "proof_kind": "attested",
+                "attested_proof": right["proof"]["proof"],
+                "claim": "the new value breaks the shipped test",
+                "where": "app.py:1",
+                "slots": {
+                    "what": "VALUE moves from 0 to 1",
+                    "proof": "`python3 -m unittest discover -s tests -t .` exits 1",
+                    "risk": "every caller relying on 0 changes behavior",
+                    "fix": "keep VALUE at 0 or update the test with intent",
+                },
+                "decision": {
+                    "question": "Include the failing test in the review, or drop it?",
+                    "recommendation": "Include it: the sandbox ran the test and it failed.",
+                },
+            })
+            self.assertEqual(beat["attestation"]["exit_code"], 1)
+            self.assertEqual(beat["attestation"]["argv"], job["argv"] + arguments)
+            self.assertEqual(store.snapshot()[0]["execution_policy"]["mode"], "no_exec")
 
     def test_clean_job_has_only_the_declared_surface_and_round_trips_output(self):
         environment = {
