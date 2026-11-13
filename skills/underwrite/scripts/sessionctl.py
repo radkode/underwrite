@@ -135,8 +135,8 @@ def share(counts):
 
 def ledger(reviews):
     """Count what every stored session raised and how the reviewer answered it. A round that
-    a replacement superseded is marked, and its counts stay its own: only settled findings
-    carry forward, so an open flag there is still open nowhere else."""
+    a replacement superseded is marked, and its counts stay its own: a replacement carries
+    earlier findings as notes, not as beats, so nothing is counted twice."""
     reviews = Path(reviews).expanduser()
     if not reviews.is_dir():
         raise StoreError(f"no reviews directory at {reviews}")

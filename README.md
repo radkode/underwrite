@@ -347,7 +347,8 @@ in total it counts beats, flags raised, flags still open, accepted, decided, dro
 reason, unverified beats and their share, flags a second read confirmed or disputed, and
 questions asked, plus the dropped share of settled flags. A drop recorded before reasons
 existed counts as unstated. A round that a replacement superseded is marked with its
-successor; its counts stay its own, since only settled findings carry forward. It reads each
+successors; its counts stay its own, since a replacement carries earlier findings as notes
+beside its own beats, never as beats the ledger counts again. It reads each
 session from a backup copy, so counting never upgrades an old session in place. Read it
 before and after a change to the skill: a change that raises the dropped share is a
 regression even when it finds more.

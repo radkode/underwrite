@@ -86,13 +86,17 @@ def finding_shape(item):
 def citations(where, paths):
     """Every diff location a `where` names, read the way the store reads a flag's anchor: the
     whole string when it resolves to a frozen path, so a path with a space survives, and
-    otherwise each token, so `a.py:907 and a.py:1550` cites both lines."""
+    otherwise each token, so `a.py:907 and a.py:1550` cites both lines. Surrounding
+    punctuation is shed only when the text as written does not resolve."""
     text = str(where or "").strip()
 
     def located(candidate):
-        match = LOCATION_LINE.match(candidate.lstrip("([").rstrip(".)],;+\u00b7"))
-        path = resolve_path(match["path"], paths) if match else None
-        return (path, int(match["line"])) if path else None
+        for form in (candidate.rstrip(",;+\u00b7"), candidate.lstrip("(").rstrip(".),;+\u00b7")):
+            match = LOCATION_LINE.match(form)
+            path = resolve_path(match["path"], paths) if match else None
+            if path:
+                return path, int(match["line"])
+        return None
 
     whole = located(text)
     if whole:
@@ -108,7 +112,28 @@ def frozen_paths(root, target):
         raise CaseError(f"the session has no frozen diff: {error}") from error
     if len(data) != target.get("diff_bytes") or hashlib.sha256(data).hexdigest() != target.get("diff_sha256"):
         raise CaseError("the session's frozen diff does not match its target")
-    return sorted(parse_diff(data.decode("utf-8")))
+    return sorted(parse_diff(data.decode("utf-8", "replace")))
+
+
+def assign(items, beats, paths):
+    """The largest one-to-one pairing of findings to flags that match them, so which flag
+    answers which finding never depends on the order the case lists them in."""
+    owner = {}
+
+    def claim(i, seen):
+        for beat in beats:
+            n = beat["n"]
+            if n in seen or not matches(items[i], beat, paths):
+                continue
+            seen.add(n)
+            if n not in owner or claim(owner[n], seen):
+                owner[n] = i
+                return True
+        return False
+
+    for i in range(len(items)):
+        claim(i, set())
+    return {i: n for n, i in owner.items()}
 
 
 def words(beat):
@@ -145,32 +170,21 @@ def score(case, session_root):
         beat for beat in beats
         if (beat.get("second_read") or {}).get("verdict") == "disputed"
     ]
-    found, missed, used = [], [], set()
-    for item in case["expected"]:
-        hit = next(
-            (b for b in standing if b["n"] not in used and matches(item, b, paths)),
-            None,
-        )
-        if hit:
-            used.add(hit["n"])
-            found.append(dict(item, beat=hit["n"]))
-        else:
-            missed.append(item)
-    false_alarms, accepted_alternates, excused = [], [], set()
-    acceptable = list(enumerate(case.get("acceptable", ())))
-    for beat in standing:
-        if beat["n"] in used:
-            continue
-        alternate = next(
-            (i for i, item in acceptable if i not in excused and matches(item, beat, paths)),
-            None,
-        )
+    expected = list(case["expected"])
+    hits = assign(expected, standing, paths)
+    found = [dict(item, beat=hits[i]) for i, item in enumerate(expected) if i in hits]
+    missed = [item for i, item in enumerate(expected) if i not in hits]
+    rest = [beat for beat in standing if beat["n"] not in hits.values()]
+    acceptable = list(case.get("acceptable", ()))
+    excused = assign(acceptable, rest, paths)
+    classes = {n: acceptable[i]["class"] for i, n in excused.items()}
+    false_alarms, accepted_alternates = [], []
+    for beat in rest:
         entry = {"n": beat["n"], "where": beat.get("where"), "claim": beat.get("claim")}
-        if alternate is None:
-            false_alarms.append(entry)
+        if beat["n"] in classes:
+            accepted_alternates.append(dict(entry, **{"class": classes[beat["n"]]}))
         else:
-            excused.add(alternate)
-            accepted_alternates.append(dict(entry, **{"class": acceptable[alternate][1]["class"]}))
+            false_alarms.append(entry)
     # A recommendation is written provisionally before the walk, so only the marker eval mode
     # writes last says the walk reached its end.
     finished = (

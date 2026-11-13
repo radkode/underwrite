@@ -73,6 +73,8 @@ class Cases(unittest.TestCase):
 
 class SessionFixture(unittest.TestCase):
     FILES = ("a.py",)
+    ENCODING = "utf-8"
+    WORD = "line"
 
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
@@ -89,22 +91,26 @@ class SessionFixture(unittest.TestCase):
             git("config", key, value)
         for name in self.FILES:
             (repo / name).parent.mkdir(parents=True, exist_ok=True)
-            (repo / name).write_text("".join(f"line {n}\n" for n in range(1, 21)), encoding="utf-8")
+            (repo / name).write_bytes(
+                "".join(f"{self.WORD} {n}\n" for n in range(1, 21)).encode(self.ENCODING)
+            )
         git("add", "-A")
         git("commit", "-q", "-m", "base")
         self.base = git("rev-parse", "HEAD")
         for name in self.FILES:
-            (repo / name).write_text(
-                "".join(f"{'CHANGED' if n in (5, 15) else 'line'} {n}\n" for n in range(1, 21)),
-                encoding="utf-8",
-            )
+            (repo / name).write_bytes("".join(
+                f"{'CHANGED' if n in (5, 15) else self.WORD} {n}\n" for n in range(1, 21)
+            ).encode(self.ENCODING))
         git("commit", "-q", "-am", "head")
         self.head = git("rev-parse", "HEAD")
         self.root = self.tmp / "reviews" / "acme-widget-pr7"
         store = session_store.SessionStore(self.root, create=True)
         inputs = self.tmp / "inputs"
         inputs.mkdir()
-        (inputs / "pr.diff").write_text(git("diff", f"{self.base}...{self.head}") + "\n", encoding="utf-8")
+        (inputs / "pr.diff").write_bytes(subprocess.run(
+            ["git", "-C", str(repo), "diff", f"{self.base}...{self.head}"],
+            check=True, capture_output=True,
+        ).stdout)
         (inputs / "pr.json").write_text("{}", encoding="utf-8")
         (inputs / "trusted.json").write_text(
             json.dumps({"version": 1, "base_sha": self.base, "files": []},
@@ -300,6 +306,62 @@ class SpacedPaths(SessionFixture):
     def test_a_flag_on_the_spaced_file_finds_a_miss_there(self):
         self.store.put_beat(self.flag(1, 5, where="other src/a.py:5"))
         self.assertTrue(score.score(self.case(path="other src/a.py"), self.root)["pass"])
+
+
+class Citations(unittest.TestCase):
+    """Punctuation around a citation is shed only when the name as written is not in the diff,
+    and brackets are never shed: `app/[id]/page.tsx` is a real path."""
+
+    PATHS = ["[id]/a.py", "id]/a.py", "src/a.py", "other src/a.py"]
+
+    def test_each_citation_resolves_to_the_file_it_names(self):
+        for where, cited in (
+            ("[id]/a.py:5", [("[id]/a.py", 5)]),
+            ("([id]/a.py:5).", [("[id]/a.py", 5)]),
+            ("id]/a.py:5", [("id]/a.py", 5)]),
+            ("other src/a.py:5", [("other src/a.py", 5)]),
+            ("src/a.py:7 and (src/a.py:9).", [("src/a.py", 7), ("src/a.py", 9)]),
+            ("no anchor here", []),
+        ):
+            with self.subTest(where=where):
+                self.assertEqual(score.citations(where, self.PATHS), cited)
+
+
+class Latin1Diff(SessionFixture):
+    """The store reads a frozen diff that is not UTF-8 by replacing what it cannot decode; the
+    scorer reads it the same way rather than stopping the whole run."""
+
+    WORD = "caf\u00e9"
+    ENCODING = "latin-1"
+
+    def test_a_diff_with_latin1_bytes_still_scores(self):
+        self.store.put_beat(self.flag(1, 5))
+        self.assertTrue(score.score(self.case(), self.root)["pass"])
+
+
+class OverlappingAcceptable(SessionFixture):
+    def test_the_order_of_acceptable_findings_never_changes_the_score(self):
+        self.store.put_beat(self.flag(1, 5, claim="guard race"))
+        self.store.put_beat(self.flag(2, 5, claim="guard"))
+        guard = {"path": "a.py", "lines": [5], "class": "g", "keywords": ["guard"]}
+        race = {"path": "a.py", "lines": [5], "class": "r", "keywords": ["race"]}
+        for order in ([guard, race], [race, guard]):
+            with self.subTest(order=[item["class"] for item in order]):
+                result = score.score(dict(self.case("clean"), acceptable=order), self.root)
+                self.assertEqual(result["false_alarms"], [])
+                self.assertEqual(
+                    sorted((a["n"], a["class"]) for a in result["acceptable"]), [(1, "r"), (2, "g")]
+                )
+
+    def test_the_order_of_expected_findings_never_changes_the_score(self):
+        self.store.put_beat(self.flag(1, 5, claim="guard race"))
+        self.store.put_beat(self.flag(2, 5, claim="guard"))
+        guard = {"path": "a.py", "lines": [5], "class": "g", "keywords": ["guard"]}
+        race = {"path": "a.py", "lines": [5], "class": "r", "keywords": ["race"]}
+        for order in ([guard, race], [race, guard]):
+            with self.subTest(order=[item["class"] for item in order]):
+                result = score.score(dict(self.case(), expected=order), self.root)
+                self.assertTrue(result["pass"])
 
 
 class Runner(unittest.TestCase):

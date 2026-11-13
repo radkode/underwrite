@@ -676,17 +676,21 @@ class NoiseLedger(unittest.TestCase):
         self.assertEqual(overall["dropped_by_reason"]["unstated"], 1)
 
     def test_a_replaced_round_is_marked_and_keeps_its_own_counts(self):
-        """Only settled findings carry into a replacement, so a replaced round's open flag is
-        still open nowhere else and stays in the total."""
+        """A replacement carries earlier findings as notes, not as beats, so a replaced
+        round's open flag is counted once, in that round, and stays in the total."""
         first = self.walked()
         second = self.reviews / "acme-widget-pr1-r2"
         store = session_store.SessionStore(second, create=True)
         store.put_session(dict(SESSION, cursor=1))
         store.put_beat(self.beat(1, "flag"))
-        with sqlite3.connect(str(second / "session.sqlite3")) as db:
-            body = json.loads(db.execute("SELECT body_json FROM session").fetchone()[0])
-            body["predecessor"] = {"session": first.name, "round": 2}
-            db.execute("UPDATE session SET body_json = ?", (json.dumps(body),))
+        db = sqlite3.connect(str(second / "session.sqlite3"))
+        try:
+            with db:
+                body = json.loads(db.execute("SELECT body_json FROM session").fetchone()[0])
+                body["predecessor"] = {"session": first.name, "round": 2}
+                db.execute("UPDATE session SET body_json = ?", (json.dumps(body),))
+        finally:
+            db.close()
 
         ledger = self.stats()
 

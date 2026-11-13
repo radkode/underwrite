@@ -172,7 +172,7 @@ def median_count(runs, key):
 
 
 def count(value):
-    return value if isinstance(value, int) else len(value or ())
+    return value if isinstance(value, int) and not isinstance(value, bool) else len(value or ())
 
 
 def provenance(args):
