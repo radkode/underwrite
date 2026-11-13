@@ -746,7 +746,7 @@ class ReplacementRounds(unittest.TestCase):
         self.git("commit", "-q", "-m", "change")
         return self.git("rev-parse", "HEAD")
 
-    def session(self, name, head, number=7):
+    def session(self, name, head, number=7, **target_overrides):
         root = self.reviews / name
         store = session_store.SessionStore(root, create=True)
         scratch = self.tmp / f"{name}-input"
@@ -765,13 +765,15 @@ class ReplacementRounds(unittest.TestCase):
         self.git("update-ref", "refs/underwrite/head", head)
         bundle = scratch / "pr.bundle"
         self.git("bundle", "create", "-q", str(bundle), "refs/underwrite/base", "refs/underwrite/head")
+        target = {
+            "version": 1, "kind": "github_pr", "repo": "acme/widget", "number": number,
+            "state": "open", "merged_at": None, "base_sha": self.base, "head_sha": head,
+            "head_repo_id": 123, "head_repo": "acme/widget", "head_ref": "feature",
+            "merge_base_sha": self.base, "changed_files": 1,
+        }
+        target.update(target_overrides)
         store.freeze_target(
-            {
-                "version": 1, "kind": "github_pr", "repo": "acme/widget", "number": number,
-                "state": "open", "merged_at": None, "base_sha": self.base, "head_sha": head,
-                "head_repo_id": 123, "head_repo": "acme/widget", "head_ref": "feature",
-                "merge_base_sha": self.base, "changed_files": 1,
-            },
+            target,
             diff, metadata, context, bundle,
         )
         return root
@@ -865,6 +867,38 @@ class ReplacementRounds(unittest.TestCase):
                 completed = self.run_ctl("link-predecessor", root, prior)
                 self.assertEqual(completed.returncode, 1)
                 self.assertIn(message, completed.stderr)
+
+    def test_a_lifecycle_or_route_change_on_the_same_shas_links_with_empty_moved_lines(self):
+        prior = self.reviewed()
+        merged = self.session(
+            "acme-widget-pr7-r2", self.first,
+            state="closed", merged_at="2026-08-30T12:00:00Z",
+        )
+        rerouted = self.session(
+            "acme-widget-pr7-route", self.first,
+            head_repo=None, head_repo_id=None, head_ref="deleted-fork",
+        )
+
+        for root in (merged, rerouted):
+            with self.subTest(root=root.name):
+                linked = self.link(root, prior)
+                self.assertEqual(linked["round"], 2)
+                self.assertEqual(linked["moved"], {})
+                self.assertEqual(
+                    [(entry["n"], entry["state"]) for entry in linked["carried"]],
+                    [(1, "dropped"), (2, "flag")],
+                )
+        with self.assertRaisesRegex(session_store.StoreError, "dropped this finding in round 1"):
+            session_store.SessionStore(merged).put_beat(self.flag(1, 2))
+        unmoved_with_lines = self.session(
+            "acme-widget-pr7-bad-moved", self.first,
+            state="closed", merged_at="2026-08-30T12:00:00Z",
+        )
+        with self.assertRaisesRegex(session_store.StoreError, "empty when the head did not move"):
+            session_store.SessionStore(unmoved_with_lines).link_predecessor(
+                session_store.SessionStore(prior),
+                {"prior_head_sha": self.first, "head_sha": self.first, "lines": {"a.py": [2]}},
+            )
 
     def test_a_third_round_still_remembers_the_first_rounds_drop(self):
         prior = self.reviewed()

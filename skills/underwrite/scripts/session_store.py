@@ -3906,18 +3906,33 @@ class SessionStore:
                 raise Conflict("a session cannot replace itself")
             if (prior_target["repo"], prior_target["number"]) != (target["repo"], target["number"]):
                 raise Conflict("predecessor reviewed a different pull request")
-            if (prior_target["base_sha"], prior_target["head_sha"]) == (
+            same_revisions = (prior_target["base_sha"], prior_target["head_sha"]) == (
                 target["base_sha"], target["head_sha"]
+            )
+            identity_fields = (
+                "state",
+                "merged_at",
+                "head_repo_id",
+                "head_repo",
+                "head_ref",
+            )
+            if same_revisions and all(
+                prior_target.get(name) == target.get(name) for name in identity_fields
             ):
                 raise Conflict("predecessor froze the same base and head; resume it instead")
             if moved.get("head_sha") != target["head_sha"]:
                 raise StoreError("moved lines must be computed against this session's head")
+            moved_lines_map = moved.get("lines")
+            if not isinstance(moved_lines_map, dict):
+                raise StoreError("moved lines must map paths to head line lists")
+            if same_revisions and moved_lines_map:
+                raise StoreError("moved lines must be empty when the head did not move")
             session["predecessor"] = {
                 "session": predecessor.root.name,
                 "round": prior_round + 1,
                 "base_sha": prior_target["base_sha"],
                 "head_sha": prior_target["head_sha"],
-                "moved": moved["lines"],
+                "moved": {} if same_revisions else moved_lines_map,
                 "carried": carried,
             }
             if self._save_session(db, session, allow_new_predecessor=True):
