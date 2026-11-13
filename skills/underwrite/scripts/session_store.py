@@ -4052,6 +4052,13 @@ class SessionStore:
             "deliveries": deliveries,
         }
 
+    def _insert_new_beat(self, db, session, beat):
+        self._validate_new_beat(beat)
+        self._attest_beat(db, session, beat)
+        self._guard_beat(session, beat)
+        changed, _revision, _state, _detail = self._save_beat(db, beat)
+        return changed
+
     def put_beat(self, document):
         beat = self._beat_document(document)
         with self._first_work_write() as db:
@@ -4063,8 +4070,8 @@ class SessionStore:
                 (beat["n"],),
             ).fetchone()
             if row is None:
-                self._validate_new_beat(beat)
-            if row is not None:
+                changed = self._insert_new_beat(db, session, beat)
+            else:
                 _refuse_slot_collision(beat)
                 current = json.loads(row["body_json"])
                 if isinstance(current.get("slots"), dict):
@@ -4119,11 +4126,10 @@ class SessionStore:
                         if not isinstance(slots, dict):
                             raise StoreError(f"beat {beat['n']} slots must be an object")
                         slots["fix"] = current_slots["fix"]
-            self._attest_beat(db, session, beat)
-            if row is not None:
+                self._attest_beat(db, session, beat)
                 self._hold_authorized_finding(db, beat, current)
-            self._guard_beat(session, beat)
-            changed, _revision, _state, _detail = self._save_beat(db, beat)
+                self._guard_beat(session, beat)
+                changed, _revision, _state, _detail = self._save_beat(db, beat)
             if changed:
                 self._bump_render(db)
         return next(item for item in self.snapshot()[1] if item["n"] == beat["n"])
@@ -4545,13 +4551,23 @@ class SessionStore:
             normalized_beats,
         )
 
-    def _same_application(self, row, application):
+    def _same_application(self, row, application, db=None):
         current = json.loads(row["result_json"])
+        session = current.get("session")
         for value in (current, application):
-            value["beats"] = [
-                self._canonical_beat(beat) if isinstance(beat, dict) else beat
-                for beat in value.get("beats", [])
-            ]
+            normalized = []
+            for beat in value.get("beats", []):
+                if isinstance(beat, dict):
+                    beat = self._canonical_beat(beat)
+                    if (
+                        db is not None
+                        and isinstance(session, dict)
+                        and beat.get("proof_kind") == "attested"
+                        and "attestation" not in beat
+                    ):
+                        self._attest_beat(db, session, beat)
+                normalized.append(beat)
+            value["beats"] = normalized
         current_session = current.get("session")
         incoming_session = application.get("session")
         if (
@@ -4618,7 +4634,7 @@ class SessionStore:
                         reference_session=stored.get("session"),
                     )
                 )
-                if not self._same_application(row, application):
+                if not self._same_application(row, application, db=db):
                     raise Conflict(f"action {seq} already has a different application")
                 return self._action(row)
             if row["state"] == "abandoned":
@@ -4646,20 +4662,29 @@ class SessionStore:
             changed = False
             if normalized_session is not None:
                 changed = self._save_session(db, normalized_session) or changed
+            applied_beats = []
             for beat in normalized_beats:
                 current = db.execute(
                     "SELECT body_json FROM beats WHERE n = ?", (beat["n"],)
                 ).fetchone()
                 if current is not None:
-                    if self._canonical_beat(json.loads(current["body_json"])) != beat:
+                    stored_beat = self._canonical_beat(json.loads(current["body_json"]))
+                    candidate = _copy(beat)
+                    if (
+                        candidate.get("proof_kind") == "attested"
+                        and "attestation" not in candidate
+                    ):
+                        self._attest_beat(db, normalized_session, candidate)
+                    if stored_beat != candidate:
                         raise Conflict(
                             f"navigation cannot replace existing beat {beat['n']}"
                         )
+                    applied_beats.append(stored_beat)
                 else:
-                    self._validate_new_beat(beat)
-                    self._guard_beat(normalized_session, beat)
-                    beat_changed, _revision, _state, _detail = self._save_beat(db, beat)
+                    beat_changed = self._insert_new_beat(db, normalized_session, beat)
                     changed = beat_changed or changed
+                    applied_beats.append(beat)
+            application["beats"] = [_copy(beat) for beat in applied_beats]
             if changed:
                 self._bump_render(db)
             timestamp = _now()
@@ -4969,7 +4994,7 @@ class SessionStore:
                         reference_session=stored.get("session"),
                     )
                 )
-                if not self._same_application(row, application):
+                if not self._same_application(row, application, db=db):
                     raise Conflict(f"action {seq} already has a different application")
                 return self._action(row)
             if row["state"] == "abandoned":
@@ -4989,10 +5014,22 @@ class SessionStore:
                 current = json.loads(self._session_row(db)["body_json"])
                 if current != normalized_session:
                     raise Conflict("observed session does not match the stored session")
+            observed_beats = []
             for beat in normalized_beats:
-                current = json.loads(self._beat_row(db, beat["n"])["body_json"])
-                if self._canonical_beat(current) != beat:
+                current = self._canonical_beat(
+                    json.loads(self._beat_row(db, beat["n"])["body_json"])
+                )
+                candidate = _copy(beat)
+                if (
+                    candidate.get("proof_kind") == "attested"
+                    and "attestation" not in candidate
+                ):
+                    self._attest_beat(db, normalized_session or current_session, candidate)
+                if current != candidate:
                     raise Conflict(f"observed beat {beat['n']} does not match the stored beat")
+                observed_beats.append(current)
+            if observed_beats:
+                application["beats"] = [_copy(beat) for beat in observed_beats]
             timestamp = _now()
             db.execute(
                 "UPDATE actions SET state = 'applied', result_json = ?, evidence = ?, "
