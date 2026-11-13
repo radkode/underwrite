@@ -3699,25 +3699,35 @@ class ChangedPathsAllowlist(unittest.TestCase):
     def test_changed_paths_matches_git_diff_with_quotepath_enabled(self):
         repo = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, repo, True)
-        subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
-        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
-        subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@example.test"], check=True)
+        env = {
+            name: value for name, value in os.environ.items()
+            if not name.startswith("GIT_")
+        }
+        env.update({
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        })
+        subprocess.run(["git", "init", "--template=", str(repo)], check=True, capture_output=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@example.test"], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "config", "commit.gpgsign", "false"], check=True, env=env)
         (repo / "with space.py").write_text("x = 1\n", encoding="utf-8")
         (repo / "café.bin").write_bytes(b"\x00\x01\x02")
         (repo / "mode.sh").write_text("#!/bin/sh\n", encoding="utf-8")
         (repo / "dir b").mkdir()
         (repo / "dir b" / "item.py").write_text("y = 1\n", encoding="utf-8")
         (repo / r"lit\u0030.txt").write_text("z = 1\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
-        subprocess.run(["git", "-C", str(repo), "commit", "-m", "base"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "base"], check=True, capture_output=True, env=env)
 
         (repo / "with space.py").write_text("x = 2\n", encoding="utf-8")
         (repo / "café.bin").write_bytes(b"\x00\x01\x03\xff")
         (repo / "mode.sh").chmod(0o755)
         (repo / "dir b" / "item.py").chmod(0o755)
         (repo / r"lit\u0030.txt").write_text("z = 2\n", encoding="utf-8")
-        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
-        subprocess.run(["git", "-C", str(repo), "commit", "-m", "head"], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "head"], check=True, capture_output=True, env=env)
 
         raw = subprocess.run(
             [
@@ -3727,6 +3737,7 @@ class ChangedPathsAllowlist(unittest.TestCase):
             ],
             check=True,
             capture_output=True,
+            env=env,
         ).stdout
         store = self.store_for_diff(raw)
 
