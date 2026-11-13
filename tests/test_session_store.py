@@ -1145,18 +1145,93 @@ class FrozenTargets(unittest.TestCase):
         with self.assertRaisesRegex(session_store.Conflict, "is missing"):
             self.store.read_diff()
 
-    def test_reading_the_diff_fails_closed_above_max_bytes(self):
+    def test_reading_the_diff_fails_closed_above_max_bytes_without_reading_the_file(self):
         diff, metadata = self.inputs()
         target = self.store.freeze_target(self.target(), diff, metadata)
 
-        with self.assertRaisesRegex(session_store.Conflict, "above max_bytes"):
-            self.store.read_diff(max_bytes=target["diff_bytes"] - 1)
+        with mock.patch.object(
+            session_store, "_bounded_file_bytes",
+            side_effect=AssertionError("pr.diff should not be read above max_bytes"),
+        ), mock.patch.object(
+            Path, "read_bytes",
+            side_effect=AssertionError("Path.read_bytes should not be called"),
+        ):
+            with self.assertRaisesRegex(session_store.Conflict, "above max_bytes"):
+                self.store.read_diff(max_bytes=target["diff_bytes"] - 1)
         self.assertEqual(
             self.store.read_diff(max_bytes=target["diff_bytes"])["bytes"],
             target["diff_bytes"],
         )
         with self.assertRaisesRegex(session_store.StoreError, "diff max_bytes"):
             self.store.read_diff(max_bytes=0)
+
+    def test_frozen_artifact_reads_refuse_symlinks_and_fifos(self):
+        content = "review from the frozen base\n"
+        encoded = content.encode("utf-8")
+        blob_sha = hashlib.sha1(
+            b"blob " + str(len(encoded)).encode("ascii") + b"\0" + encoded
+        ).hexdigest()
+        context = {
+            "version": 1,
+            "base_sha": self.target()["base_sha"],
+            "files": [{
+                "path": "AGENTS.md",
+                "mode": "100644",
+                "blob_sha": blob_sha,
+                "content": content,
+            }],
+        }
+        diff, metadata = self.inputs()
+        bundle = self.root / "captured.bundle"
+        bundle.write_bytes(b"exact Git objects\n")
+        self.store.freeze_target(
+            self.target(), diff, metadata, self.context_input(document=context), bundle
+        )
+
+        elsewhere_diff = self.root / "elsewhere.diff"
+        elsewhere_diff.write_bytes((self.root / "pr.diff").read_bytes())
+        (self.root / "pr.diff").unlink()
+        (self.root / "pr.diff").symlink_to(elsewhere_diff)
+        with self.assertRaises(session_store.Conflict):
+            self.store.read_diff()
+        with self.assertRaises(session_store.Conflict):
+            self.store.read_verified_target_diff()
+        (self.root / "pr.diff").unlink()
+        os.mkfifo(self.root / "pr.diff")
+        with self.assertRaises(session_store.Conflict):
+            self.store.read_diff()
+        with self.assertRaises(session_store.Conflict):
+            self.store.read_verified_target_diff()
+        (self.root / "pr.diff").unlink()
+        elsewhere_diff.replace(self.root / "pr.diff")
+
+        elsewhere_ctx = self.root / "elsewhere.json"
+        elsewhere_ctx.write_bytes((self.root / "trusted-context.json").read_bytes())
+        (self.root / "trusted-context.json").unlink()
+        (self.root / "trusted-context.json").symlink_to(elsewhere_ctx)
+        with self.assertRaises(session_store.Conflict):
+            self.store.read_trusted_context()
+        (self.root / "trusted-context.json").unlink()
+        os.mkfifo(self.root / "trusted-context.json")
+        with self.assertRaises(session_store.Conflict):
+            self.store.read_trusted_context()
+        (self.root / "trusted-context.json").unlink()
+        elsewhere_ctx.replace(self.root / "trusted-context.json")
+
+        elsewhere_bundle = self.root / "elsewhere.bundle"
+        elsewhere_bundle.write_bytes((self.root / "pr.bundle").read_bytes())
+        (self.root / "pr.bundle").unlink()
+        (self.root / "pr.bundle").symlink_to(elsewhere_bundle)
+        copied = self.root / "copy-symlink.bundle"
+        with self.assertRaises(session_store.Conflict):
+            self.store.copy_verified_object_bundle(copied)
+        self.assertFalse(copied.exists())
+        (self.root / "pr.bundle").unlink()
+        os.mkfifo(self.root / "pr.bundle")
+        copied_fifo = self.root / "copy-fifo.bundle"
+        with self.assertRaises(session_store.Conflict):
+            self.store.copy_verified_object_bundle(copied_fifo)
+        self.assertFalse(copied_fifo.exists())
 
     def test_trusted_context_is_semantically_validated_and_hash_verified(self):
         content = "review from the frozen base\n"

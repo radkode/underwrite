@@ -623,7 +623,7 @@ def _bounded_file_identity(path, expected_size, label):
     return digest.hexdigest(), expected_size
 
 
-def _bounded_file_bytes(path, expected_size, label):
+def _bounded_file_bytes(path, expected_size, label, mismatch_on_size=False):
     if not hasattr(os, "O_NOFOLLOW"):
         raise Conflict("target reads require no-follow file opens")
     try:
@@ -641,11 +641,11 @@ def _bounded_file_bytes(path, expected_size, label):
         raise Conflict(f"{label} cannot be opened safely") from error
     try:
         before = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_nlink != 1
-            or before.st_size != expected_size
-        ):
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise Conflict(f"{label} is not one exact regular file")
+        if before.st_size != expected_size:
+            if mismatch_on_size:
+                raise Conflict(f"{label} does not match")
             raise Conflict(f"{label} is not one exact regular file")
         data = bytearray()
         while len(data) < expected_size:
@@ -673,6 +673,79 @@ def _bounded_file_bytes(path, expected_size, label):
     if identity(before) != identity(after):
         raise Conflict(f"{label} changed while read")
     return bytes(data)
+
+
+def _bounded_file_copy(source, destination, expected_size, label):
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise Conflict("target reads require no-follow file opens")
+    try:
+        descriptor = os.open(
+            os.fsencode(source),
+            os.O_RDONLY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_NOCTTY", 0),
+        )
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise Conflict(f"{label} cannot be opened safely") from error
+    created = False
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise Conflict(f"{label} is not one exact regular file")
+        if before.st_size != expected_size:
+            raise Conflict(f"{label} does not match")
+        try:
+            outgoing = destination.open("xb")
+        except OSError as error:
+            raise StoreError(
+                "verified Git object bundle destination cannot be created"
+            ) from error
+        created = True
+        digest = hashlib.sha256()
+        remaining = expected_size
+        with outgoing:
+            while remaining:
+                block = os.read(descriptor, min(remaining, 1024 * 1024))
+                if not block:
+                    raise Conflict(f"{label} became shorter while read")
+                outgoing.write(block)
+                digest.update(block)
+                remaining -= len(block)
+            if os.read(descriptor, 1):
+                raise Conflict(f"{label} became longer while read")
+            outgoing.flush()
+            os.fsync(outgoing.fileno())
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_nlink,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_nlink,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise Conflict(f"{label} changed while read")
+        return digest.hexdigest(), expected_size
+    except Exception:
+        if created:
+            with contextlib.suppress(FileNotFoundError):
+                destination.unlink()
+        raise
+    finally:
+        os.close(descriptor)
 
 
 class SessionStore:
@@ -3695,7 +3768,12 @@ class SessionStore:
                 raise Conflict("session has no frozen trusted context")
             path = self.root / "trusted-context.json"
             try:
-                data = path.read_bytes()
+                data = _bounded_file_bytes(
+                    path,
+                    expected_size,
+                    "frozen trusted context",
+                    mismatch_on_size=True,
+                )
             except FileNotFoundError as error:
                 raise Conflict("frozen trusted context is missing") from error
             digest = hashlib.sha256(data).hexdigest()
@@ -3708,11 +3786,17 @@ class SessionStore:
         read_verified_target_diff's; this adds the bound and the transport encoding so
         the agent never has to open the projection file itself."""
         max_bytes = _positive(max_bytes, "diff max_bytes")
-        target, data = self.read_verified_target_diff()
-        if len(data) > max_bytes:
-            raise Conflict(
-                f"frozen diff is {len(data)} bytes, above max_bytes {max_bytes}"
-            )
+        with self._session_lock():
+            with self._read() as db:
+                session = json.loads(self._session_row(db)["body_json"])
+                target = session.get("target")
+                if target is None:
+                    raise Conflict("session has no frozen target")
+            if target["diff_bytes"] > max_bytes:
+                raise Conflict(
+                    f"frozen diff is {target['diff_bytes']} bytes, above max_bytes {max_bytes}"
+                )
+            data = self._verified_diff_bytes(target)
         try:
             content, encoding = data.decode("utf-8"), "utf-8"
         except UnicodeError:
@@ -3759,40 +3843,19 @@ class SessionStore:
             if expected_digest is None or expected_size is None:
                 raise Conflict("session has no frozen Git object bundle")
             source = self.root / "pr.bundle"
-            digest, size = hashlib.sha256(), 0
-            created = False
             try:
-                try:
-                    incoming = source.open("rb")
-                except FileNotFoundError as error:
-                    raise Conflict("frozen Git object bundle is missing") from error
-                try:
-                    outgoing = destination.open("xb")
-                except OSError as error:
-                    incoming.close()
-                    raise StoreError(
-                        "verified Git object bundle destination cannot be created"
-                    ) from error
-                created = True
-                with incoming, outgoing:
-                    while True:
-                        chunk = incoming.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        outgoing.write(chunk)
-                        digest.update(chunk)
-                        size += len(chunk)
-                    outgoing.flush()
-                    os.fsync(outgoing.fileno())
-                if size != expected_size or digest.hexdigest() != expected_digest:
-                    raise Conflict("frozen Git object bundle does not match")
-            except Exception:
-                if created:
-                    try:
-                        destination.unlink()
-                    except FileNotFoundError:
-                        pass
-                raise
+                digest, size = _bounded_file_copy(
+                    source,
+                    destination,
+                    expected_size,
+                    "frozen Git object bundle",
+                )
+            except FileNotFoundError as error:
+                raise Conflict("frozen Git object bundle is missing") from error
+            if size != expected_size or digest != expected_digest:
+                with contextlib.suppress(FileNotFoundError):
+                    destination.unlink()
+                raise Conflict("frozen Git object bundle does not match")
             return target
 
     def review_marker(self):
@@ -3815,7 +3878,12 @@ class SessionStore:
 
     def _verified_diff_bytes(self, target):
         try:
-            data = (self.root / "pr.diff").read_bytes()
+            data = _bounded_file_bytes(
+                self.root / "pr.diff",
+                target["diff_bytes"],
+                "frozen target projection pr.diff",
+                mismatch_on_size=True,
+            )
         except FileNotFoundError as error:
             raise Conflict("frozen target projection pr.diff is missing") from error
         digest = hashlib.sha256(data).hexdigest()
