@@ -21,7 +21,7 @@ HERE = str(Path(__file__).resolve().parent)
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-from diff_lines import anchor_line, parse_diff, untouched_anchor  # noqa: E402
+from diff_lines import anchor_line, diff_paths, parse_diff, untouched_anchor  # noqa: E402
 
 
 DB_SCHEMA_VERSION = 8
@@ -3965,20 +3965,7 @@ class SessionStore:
         this list, so agent prose can never reach an href.
         """
         _target, data = self.read_verified_target_diff()
-        paths = set()
-        for line in data.split(b"\n"):
-            if not line.startswith(b"diff --git a/"):
-                continue
-            rest = line[len(b"diff --git a/"):]
-            marker = rest.find(b" b/")
-            if marker == -1:
-                continue
-            for side in (rest[:marker], rest[marker + 3:]):
-                try:
-                    paths.add(side.decode("utf-8"))
-                except UnicodeDecodeError:
-                    continue
-        return sorted(paths)
+        return diff_paths(data)
 
     def verify_target_files(self):
         with self._session_lock():

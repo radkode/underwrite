@@ -3575,6 +3575,92 @@ class FlagAnchors(unittest.TestCase):
         self.assertEqual(self.store.snapshot()[1][0]["where"], "src/a.py:11")
 
 
+class ChangedPathsAllowlist(unittest.TestCase):
+    def store_for_diff(self, raw_diff):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        store = session_store.SessionStore(root, create=True)
+        diff, metadata = root / "capture.diff", root / "capture.json"
+        diff.write_bytes(raw_diff if isinstance(raw_diff, bytes) else raw_diff.encode("utf-8"))
+        metadata.write_text("{}", encoding="utf-8")
+        store.freeze_target(FrozenTargets.target(self), diff, metadata)
+        return store
+
+    def test_changed_paths_parses_spaces_quoted_non_ascii_binary_mode_only_and_b_slash(self):
+        diff = (
+            'diff --git a/has space.txt b/has space.txt\n'
+            'index 1111111..2222222 100644\n'
+            '--- a/has space.txt\t\n'
+            '+++ b/has space.txt\t\n'
+            '@@ -1 +1 @@\n-old\n+new\n'
+            'diff --git "a/caf\\303\\251.bin" "b/caf\\303\\251.bin"\n'
+            'index 3333333..4444444 100644\n'
+            'Binary files "a/caf\\303\\251.bin" and "b/caf\\303\\251.bin" differ\n'
+            'diff --git "a/mode \\"exec\\".sh" "b/mode \\"exec\\".sh"\n'
+            'old mode 100644\n'
+            'new mode 100755\n'
+            'diff --git a/tricky b/file.py b/tricky b/file.py\n'
+            'old mode 100644\n'
+            'new mode 100755\n'
+            'diff --git a/tricky b/old.bin b/tricky b/new.bin\n'
+            'similarity index 100%\n'
+            'rename from tricky b/old.bin\n'
+            'rename to tricky b/new.bin\n'
+        )
+        store = self.store_for_diff(diff)
+
+        self.assertEqual(
+            store.changed_paths(),
+            [
+                "café.bin",
+                "has space.txt",
+                'mode "exec".sh',
+                "tricky b/file.py",
+                "tricky b/new.bin",
+                "tricky b/old.bin",
+            ],
+        )
+
+    def test_changed_paths_matches_git_diff_with_quotepath_enabled(self):
+        repo = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, repo, True)
+        subprocess.run(["git", "init", str(repo)], check=True, capture_output=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@example.test"], check=True)
+        (repo / "with space.py").write_text("x = 1\n", encoding="utf-8")
+        (repo / "café.bin").write_bytes(b"\x00\x01\x02")
+        (repo / "mode.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+        (repo / "dir b").mkdir()
+        (repo / "dir b" / "item.py").write_text("y = 1\n", encoding="utf-8")
+        (repo / r"lit\u0030.txt").write_text("z = 1\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "base"], check=True, capture_output=True)
+
+        (repo / "with space.py").write_text("x = 2\n", encoding="utf-8")
+        (repo / "café.bin").write_bytes(b"\x00\x01\x03\xff")
+        (repo / "mode.sh").chmod(0o755)
+        (repo / "dir b" / "item.py").chmod(0o755)
+        (repo / r"lit\u0030.txt").write_text("z = 2\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "head"], check=True, capture_output=True)
+
+        raw = subprocess.run(
+            [
+                "git", "-c", "core.quotePath=true", "-C", str(repo),
+                "diff", "--binary", "--src-prefix=a/", "--dst-prefix=b/",
+                "HEAD~1...HEAD", "--",
+            ],
+            check=True,
+            capture_output=True,
+        ).stdout
+        store = self.store_for_diff(raw)
+
+        self.assertEqual(
+            store.changed_paths(),
+            ["café.bin", "dir b/item.py", r"lit\u0030.txt", "mode.sh", "with space.py"],
+        )
+
+
 class FlagAnchorsWithoutATarget(StoreCase):
     def test_a_branch_walk_has_no_frozen_diff_to_check(self):
         self.store.put_beat({**FLAG, "n": 3, "where": "nowhere.py:999"})
