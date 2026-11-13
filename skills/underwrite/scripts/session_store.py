@@ -4168,18 +4168,28 @@ class SessionStore:
             session = json.loads(session_row["body_json"])
             session["schema_version"] = session_row["format_version"]
             questions = {}
+            latest_walk = None
             for row in db.execute(
-                "SELECT * FROM actions WHERE kind = 'question' ORDER BY seq"
+                "SELECT * FROM actions WHERE kind IN ('question', 'next', 'back', 'skip') "
+                "ORDER BY seq"
             ):
                 action = self._action(row)
                 result = action["result"] or {}
-                questions.setdefault(row["beat_n"], []).append({
-                    "seq": row["seq"],
-                    "question": row["note"],
-                    "state": row["state"],
-                    "answer": result.get("answer"),
-                    "evidence": result.get("evidence"),
-                })
+                if row["kind"] == "question":
+                    questions.setdefault(row["beat_n"], []).append({
+                        "seq": row["seq"],
+                        "question": row["note"],
+                        "state": row["state"],
+                        "answer": result.get("answer"),
+                        "evidence": result.get("evidence"),
+                    })
+                elif row["state"] in ("applied", "acked") and isinstance(result, dict):
+                    latest_walk = result
+            if isinstance(latest_walk, dict):
+                if "current_beat" not in session and "current_beat" in latest_walk:
+                    session["current_beat"] = latest_walk["current_beat"]
+                if "skipped_tiers" not in session and "skipped_tiers" in latest_walk:
+                    session["skipped_tiers"] = _copy(latest_walk["skipped_tiers"])
             beats = []
             for row in db.execute("SELECT * FROM beats ORDER BY n"):
                 beat = json.loads(row["body_json"])

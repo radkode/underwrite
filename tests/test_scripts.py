@@ -580,6 +580,47 @@ class TheWalk(unittest.TestCase):
         self.assertRegex(self.live(self.beats(), phase="done"),
                          r'<details class="beat s-acc" id="item-2" data-n="2" open>')
 
+    def test_back_stages_the_stored_position_and_legacy_falls_back_to_newest(self):
+        seven_plan = [{"n": n, "tier": "core", "where": f"f{n}.ts:{n}"} for n in range(1, 8)]
+        seven_beats = [beat(n=n, state="clean", where=f"f{n}.ts:{n}") for n in range(1, 8)]
+        backed = dict(self.session(), plan=seven_plan, current_beat=3)
+        html = rr.render(backed, seven_beats, "", {}, live=True, phase="parked")
+        stage = html.split('id="stage"')[1].split("</section>")[0]
+        ledger = html.split('id="stage"')[1].split("</section>", 1)[1]
+        self.assertIn('data-n="3"', stage)
+        self.assertNotIn('data-n="3"', ledger)
+        self.assertIn('data-n="7"', ledger)
+        self.assertIn('<span class="hint">item 3 of 7</span>', stage)
+        track = html.split('<ol class="track"')[1].split("</ol>")[0]
+        self.assertRegex(track, r'<li class="tk s-clean is-now" aria-current="step"[^>]*>3</li>')
+
+        legacy = rr.render(dict(self.session(), plan=seven_plan), seven_beats, "", {}, live=True, phase="parked")
+        legacy_stage = legacy.split('id="stage"')[1].split("</section>")[0]
+        self.assertIn('data-n="7"', legacy_stage)
+
+    def test_navigation_position_in_walk_receipt_stages_the_moved_beat(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            store = va.SessionStore(root, create=True)
+            store.put_session({
+                "repo": "acme/widget",
+                "audience": {"mode": "branch", "why": "local"},
+                "plan": [{"n": n, "tier": "core", "where": f"f{n}.ts:{n}"} for n in range(1, 8)],
+            })
+            for n in range(1, 8):
+                store.put_beat(beat(n=n, state="clean", proof_kind="ran", where=f"f{n}.ts:{n}"))
+            action = store.produce("back-1", None, "back", "")
+            session = store.snapshot()[0]
+            store.apply(
+                action["seq"],
+                {"kind": "walk", "current_beat": 3, "skipped_tiers": []},
+                session=session,
+            )
+            loaded_session, loaded_beats, css, problems, _ = rr.load(root, rr.default_css())
+            html = rr.render(loaded_session, loaded_beats, css, problems, live=True, phase="parked")
+            stage = html.split('id="stage"')[1].split("</section>")[0]
+            self.assertIn('data-n="3"', stage)
+
 
 class WalkCoverage(unittest.TestCase):
     """Every count on the page counts beats written, so a walk that stopped short
@@ -634,6 +675,22 @@ class WalkCoverage(unittest.TestCase):
 
     def test_a_session_with_nothing_at_all_renders_no_coverage_block(self):
         self.assertNotIn("coverage", self.final([], plan=False))
+
+    def test_skipped_tiers_are_reported_as_skipped_by_the_reviewer_not_unread(self):
+        session = self.session()
+        session["skipped_tiers"] = ["follow-through"]
+        html = rr.render(session, [beat(n=1, state="clean"), beat(n=2, state="clean"), beat(n=4, state="clean")], "", {})
+        self.assertIn("3 of 4 items read", html)
+        self.assertIn("Skipped by you", html)
+        self.assertNotIn("Not read yet", html)
+        self.assertIn("call sites", html)
+
+        partial = rr.render(session, [beat(n=1, state="clean"), beat(n=2, state="clean")], "", {})
+        self.assertIn("Not read yet:", partial)
+        self.assertIn("the migration", partial.split("Not read yet:")[1].split("</ul>")[0])
+        self.assertNotIn("call sites", partial.split("Not read yet:")[1].split("</ul>")[0])
+        self.assertIn("Skipped by you:", partial)
+        self.assertIn("call sites", partial.split("Skipped by you:")[1])
 
     def test_the_final_render_carries_it_even_though_the_plan_track_does_not(self):
         beats = [beat(n=1, state="clean")]
