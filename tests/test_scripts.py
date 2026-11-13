@@ -2593,6 +2593,8 @@ class RenderCli(unittest.TestCase):
         self.assertIn("enable(connected && usable && awaitingSeq === null)", page)
         self.assertIn("receipt.seq > observedSeq", page)
         self.assertIn("observedSeq >= awaitingSeq", page)
+        self.assertNotIn("data-reason=", page.split("<script>", 1)[1])
+        self.assertIn("chip.dataset.reason === reason", page)
 
     def test_out_puts_the_page_where_it_is_told(self):
         self.put(beat(n=1))

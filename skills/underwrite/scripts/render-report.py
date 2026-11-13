@@ -229,6 +229,9 @@ LIVE_JS = """<script>
       sessionStorage.setItem(draftKey, JSON.stringify({ session_id: sessionId, notes }));
     } catch (_) {}
   }
+  const reasonChip = (row, reason) => reason
+    ? [...row.querySelectorAll('.why')].find(chip => chip.dataset.reason === reason)
+    : null;
   function restoreDrafts() {
     const notes = storedDrafts();
     document.querySelectorAll('.acts').forEach(row => {
@@ -237,7 +240,7 @@ LIVE_JS = """<script>
       if (note && !note.value && saved) note.value = saved;
       const why = notes[row.dataset.acts + '/why'];
       if (why && !reasonOf(row)) {
-        const chip = row.querySelector(`.why[data-reason="${why}"]`);
+        const chip = reasonChip(row, why);
         if (chip) chip.setAttribute('aria-pressed', 'true');
       }
     });
@@ -377,7 +380,7 @@ LIVE_JS = """<script>
         note.focus();
         if (selection) note.setSelectionRange(selection[0], selection[1]);
       }
-      const chip = row.querySelector(`.why[data-reason="${reasons.get(row.dataset.acts)}"]`);
+      const chip = reasonChip(row, reasons.get(row.dataset.acts));
       if (chip) chip.setAttribute('aria-pressed', 'true');
     });
     known = beatIds();
