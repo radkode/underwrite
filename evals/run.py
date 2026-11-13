@@ -90,7 +90,10 @@ def command(case, plugin, reviews, checkout, args):
 
 
 def run_case(case, args):
-    work = Path(tempfile.mkdtemp(prefix=f"underwrite-eval-{case['id']}-")).resolve()
+    root = Path(args.work_root).resolve() if args.work_root else None
+    if root:
+        root.mkdir(parents=True, exist_ok=True)
+    work = Path(tempfile.mkdtemp(prefix=f"underwrite-eval-{case['id']}-", dir=root)).resolve()
     checkout, reviews = work / "checkout", work / "reviews"
     reviews.mkdir()
     result = {"case": case["id"], "work": str(work)}
@@ -127,10 +130,63 @@ def run_case(case, args):
     except (subprocess.SubprocessError, OSError, CaseError) as error:
         result["error"] = str(error)
     finally:
-        if not args.keep and "error" not in result:
+        # A scored failure is the run worth reading, so only a pass is cleaned away.
+        if not args.keep and result.get("pass"):
             shutil.rmtree(work, ignore_errors=True)
             result.pop("work")
     return result
+
+
+def repeated(case, args):
+    """One case walked `runs` times. Walks are not deterministic, so a case passes on a
+    majority of its runs and its counts are the mean, not one lucky or unlucky sample."""
+    runs = [run_case(case, args) for _ in range(args.runs)]
+    if len(runs) == 1:
+        return runs[0]
+    scored = [r for r in runs if not r.get("error")]
+    passes = sum(1 for r in scored if r.get("pass"))
+    result = {
+        "case": case["id"],
+        "runs": runs,
+        "passes": passes,
+        "pass_rate": round(passes / len(runs), 3),
+        "pass": passes * 2 > len(runs),
+        "finished": bool(scored) and all(r.get("finished") for r in scored),
+        "missed": mean_count(runs, "missed"),
+        "false_alarms": mean_count(runs, "false_alarms"),
+        "cost_usd": round(sum(r.get("cost_usd") or 0 for r in runs), 4),
+    }
+    errors = [r["error"] for r in runs if r.get("error")]
+    if errors:
+        result["error"] = f"{len(errors)} of {len(runs)} runs errored: {errors[0]}"
+    return result
+
+
+def mean_count(runs, key):
+    return round(sum(count(r.get(key)) for r in runs) / len(runs), 3)
+
+
+def count(value):
+    return value if isinstance(value, (int, float)) else len(value or ())
+
+
+def provenance(args):
+    def git(*argv):
+        try:
+            return subprocess.run(
+                ["git", "-C", str(ROOT), *argv], check=True, capture_output=True, text=True
+            ).stdout.strip()
+        except (subprocess.SubprocessError, OSError):
+            return None
+
+    return {
+        "skill_commit": git("rev-parse", "HEAD"),
+        "skill_dirty": bool(git("status", "--porcelain", "--", "skills", "evals")),
+        "model": args.model,
+        "runs": args.runs,
+        "bare": args.bare,
+        "max_budget_usd": args.max_budget_usd,
+    }
 
 
 def main(argv=None):
@@ -141,23 +197,27 @@ def main(argv=None):
     ap.add_argument("--timeout", type=int, default=3600)
     ap.add_argument("--claude", default="claude")
     ap.add_argument("--bare", action="store_true", help="skip hooks and CLAUDE.md; needs ANTHROPIC_API_KEY")
-    ap.add_argument("--keep", action="store_true", help="keep each work directory")
+    ap.add_argument("--keep", action="store_true", help="keep every work directory, passes too")
+    ap.add_argument("--runs", type=int, default=1, help="walks per case; a case passes on a majority")
+    ap.add_argument("--work-root", help="put work directories here instead of the system temp")
     ap.add_argument("--baseline", type=Path, help="fail only on a regression against this result file")
     args = ap.parse_args(argv)
+    if args.runs < 1:
+        ap.error("--runs must be at least 1")
     paths = sorted((HERE / "cases").glob("*.json"))
     if args.cases:
         paths = [path for path in paths if path.stem in args.cases]
         unknown = set(args.cases) - {path.stem for path in paths}
         if unknown:
             ap.error(f"unknown case {', '.join(sorted(unknown))}")
-    results = [run_case(load_case(path), args) for path in paths]
+    results = [repeated(load_case(path), args) for path in paths]
     summary = {
         "passed": sum(1 for r in results if r.get("pass")),
         "cases": len(results),
-        "missed": sum(len(r.get("missed", ())) for r in results),
-        "false_alarms": sum(len(r.get("false_alarms", ())) for r in results),
+        "missed": round(sum(count(r.get("missed")) for r in results), 3),
+        "false_alarms": round(sum(count(r.get("false_alarms")) for r in results), 3),
     }
-    report = {"summary": summary, "results": results}
+    report = {"summary": summary, "provenance": provenance(args), "results": results}
     if args.baseline:
         report["regressions"] = regressions(json.loads(args.baseline.read_text(encoding="utf-8")), report)
         print(json.dumps(report, indent=2, sort_keys=True))

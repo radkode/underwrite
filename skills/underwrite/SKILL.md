@@ -197,7 +197,6 @@ For a PR, initialize the store and capture its exact base and head before starti
 contextual reads:
 
 ```bash
-mkdir -p "$R"
 $S/scripts/sessionctl.py init "$R"
 $S/scripts/sessionctl.py snapshot-pr "$R" <owner/repo> <n> --controller-root "$PWD"
 ```
@@ -610,8 +609,8 @@ still sees it, and a question can raise it again. A no on whether a senior engin
 stop does not demote it: write the flag with `second_read: {verdict: "confirmed",
 evidence}` and put that doubt in the evidence, because what is worth stopping for is the
 reviewer's call. Otherwise the evidence is the settling line. Either way it is at most 25
-words. The eval set settled this: a read that also demoted on worth demoted the one
-real defect in `underwrite-83-legacy-guard`. A stored flag cannot be demoted by a
+words. Demoting on worth was tried and removed: it hid a real defect the reviewer
+needed to see. A stored flag cannot be demoted by a
 rewrite, which is why the read comes first. Where the harness has no subagent tool, write
 the flag with `second_read: {verdict: "unread", evidence}` naming why, so the page says
 it was not read twice.
@@ -1140,7 +1139,7 @@ re-publish the updated artifact; otherwise make the publishing offer above now.
 ## Session state
 
 `~/.claude/reviews/<owner>-<repo>-pr<N>/` (`-<branch>` when there is no PR). Outside every
-repo, so it never shows up in `git status`. `mkdir -p` it on first write. When
+repo, so it never shows up in `git status`. `sessionctl.py init` creates it. When
 `UNDERWRITE_REVIEWS` is set, it replaces `~/.claude/reviews` everywhere in this skill; the
 eval runner points it at a scratch directory.
 

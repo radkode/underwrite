@@ -58,25 +58,41 @@ def case_problems(case):
         problems.append("a miss case names what the walk should have flagged")
     if case["kind"] == "clean" and expected:
         problems.append("a clean case expects no finding")
-    for item in expected:
-        if not (
-            isinstance(item, dict)
-            and isinstance(item.get("path"), str)
-            and isinstance(item.get("lines"), list)
-            and item["lines"]
-            and all(isinstance(n, int) and n > 0 for n in item["lines"])
-            and isinstance(item.get("class"), str)
-            and isinstance(item.get("keywords"), list)
-            and item["keywords"]
-            and all(isinstance(k, str) and k.strip() for k in item["keywords"])
-        ):
-            problems.append("each expected finding has path, lines, class and keywords")
+    acceptable = case.get("acceptable", [])
+    if not isinstance(acceptable, list):
+        return problems + ["acceptable must be a list"]
+    for field, items in (("expected", expected), ("acceptable", acceptable)):
+        for item in items:
+            if not finding_shape(item):
+                problems.append(f"each {field} finding has path, lines, class and keywords")
     return problems
 
 
-def cited(where):
-    match = LOCATION_LINE.match(str(where or "").strip())
-    return (match["path"], int(match["line"])) if match else (None, None)
+def finding_shape(item):
+    return (
+        isinstance(item, dict)
+        and isinstance(item.get("path"), str)
+        and isinstance(item.get("lines"), list)
+        and item["lines"]
+        and all(isinstance(n, int) and n > 0 for n in item["lines"])
+        and isinstance(item.get("class"), str)
+        and isinstance(item.get("keywords"), list)
+        and item["keywords"]
+        and all(isinstance(k, str) and k.strip() for k in item["keywords"])
+    )
+
+
+def citations(where):
+    """Every `path:line` a `where` could name: the whole string, so a path with a space
+    survives, and each token, so `a.py:907 and a.py:1550` cites both lines. A candidate
+    whose path is not the defect's simply matches nothing."""
+    text = str(where or "").strip()
+    found = []
+    for candidate in (text, *text.split(" ")):
+        match = LOCATION_LINE.match(candidate.rstrip(",;+\u00b7"))
+        if match:
+            found.append((match["path"], int(match["line"])))
+    return found
 
 
 def words(beat):
@@ -87,10 +103,12 @@ def words(beat):
 def matches(item, beat):
     """Near the defect and about it: the flag's own words name at least one of the class's
     keywords, so a different finding that happens to sit close by earns nothing."""
-    path, line = cited(beat.get("where"))
-    if path is None or not (path == item["path"] or item["path"].endswith("/" + path)):
-        return False
-    if not any(abs(line - n) <= WINDOW for n in item["lines"]):
+    near = any(
+        (path == item["path"] or item["path"].endswith("/" + path))
+        and any(abs(line - n) <= WINDOW for n in item["lines"])
+        for path, line in citations(beat.get("where"))
+    )
+    if not near:
         return False
     text = words(beat)
     return any(keyword.lower() in text for keyword in item["keywords"])
@@ -122,11 +140,18 @@ def score(case, session_root):
             found.append(dict(item, beat=hit["n"]))
         else:
             missed.append(item)
-    false_alarms = [
-        {"n": beat["n"], "where": beat.get("where"), "claim": beat.get("claim")}
-        for beat in standing
-        if beat["n"] not in used
-    ]
+    false_alarms, accepted_alternates = [], []
+    for beat in standing:
+        if beat["n"] in used:
+            continue
+        alternate = next(
+            (item for item in case.get("acceptable", ()) if matches(item, beat)), None
+        )
+        entry = {"n": beat["n"], "where": beat.get("where"), "claim": beat.get("claim")}
+        if alternate:
+            accepted_alternates.append(dict(entry, **{"class": alternate["class"]}))
+        else:
+            false_alarms.append(entry)
     # A recommendation is written provisionally before the walk, so only the marker eval mode
     # writes last says the walk reached its end.
     finished = (
@@ -142,6 +167,7 @@ def score(case, session_root):
         "demoted": len(demoted),
         "found": found,
         "missed": missed,
+        "acceptable": accepted_alternates,
         "false_alarms": false_alarms,
         "finished": finished,
         "pass": finished and not missed and not false_alarms,

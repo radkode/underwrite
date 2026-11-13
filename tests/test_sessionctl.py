@@ -666,11 +666,35 @@ class NoiseLedger(unittest.TestCase):
         )
         self.assertEqual(walked["dropped_by_reason"]["pre-existing"], 1)
         self.assertEqual(walked["unverified_share"], 0.4)
+        self.assertEqual(walked["dropped_share"], 0.5)
         self.assertEqual(legacy["dropped_by_reason"]["unstated"], 1)
+        self.assertEqual(legacy["dropped_share"], 1.0)
         overall = ledger["overall"]
         self.assertEqual((overall["beats"], overall["flags"], overall["dropped"]), (6, 4, 2))
+        self.assertAlmostEqual(overall["dropped_share"], 0.667)
         self.assertEqual(overall["dropped_by_reason"]["pre-existing"], 1)
         self.assertEqual(overall["dropped_by_reason"]["unstated"], 1)
+
+    def test_a_replaced_round_counts_its_open_flags_once_in_the_total(self):
+        first = self.walked()
+        second = self.reviews / "acme-widget-pr1-r2"
+        store = session_store.SessionStore(second, create=True)
+        store.put_session(dict(SESSION, cursor=1))
+        store.put_beat(self.beat(1, "flag"))
+        with sqlite3.connect(str(second / "session.sqlite3")) as db:
+            body = json.loads(db.execute("SELECT body_json FROM session").fetchone()[0])
+            body["predecessor"] = {"session": first.name, "round": 2}
+            db.execute("UPDATE session SET body_json = ?", (json.dumps(body),))
+
+        ledger = self.stats()
+
+        replaced, current = ledger["sessions"]
+        self.assertEqual(replaced["superseded_by"], "acme-widget-pr1-r2")
+        self.assertEqual((replaced["flags"], replaced["open"]), (3, 1))
+        self.assertNotIn("superseded_by", current)
+        overall = ledger["overall"]
+        self.assertEqual((overall["flags"], overall["open"]), (3, 1))
+        self.assertEqual((overall["accepted"], overall["dropped"]), (1, 1))
 
     def test_reading_the_ledger_never_writes_a_session(self):
         root = self.walked()

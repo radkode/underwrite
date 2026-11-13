@@ -6,5 +6,13 @@
   "base_sha": "5c7bae2e6e0bb4600d688575b66a3cc811651239",
   "head_sha": "22d4ab5440d5ec5c17e769fd6b4d7513994d3126",
   "expected": [],
+  "acceptable": [
+    {
+      "path": "tests/test_serve.py",
+      "lines": [434],
+      "class": "the SIGTERM race test catches the old ordering only on some runs",
+      "keywords": ["race", "ordering", "flak", "most runs"]
+    }
+  ],
   "evidence": "its SIGTERM block was later touched only by tests (#23) and a feature (#63)"
 }

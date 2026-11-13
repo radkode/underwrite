@@ -38,6 +38,12 @@ class Cases(unittest.TestCase):
                 kinds.add(case["kind"])
         self.assertEqual(kinds, {"miss", "clean"})
 
+    def test_the_skill_names_no_case_it_is_scored_on(self):
+        text = (ROOT / "skills" / "underwrite" / "SKILL.md").read_text(encoding="utf-8")
+        for path in sorted((EVALS / "cases").glob("*.json")):
+            with self.subTest(case=path.stem):
+                self.assertNotIn(path.stem, text)
+
     def test_a_misshapen_case_is_refused(self):
         good = {
             "id": "x", "kind": "miss", "repo": "acme/widget", "number": 1,
@@ -54,6 +60,8 @@ class Cases(unittest.TestCase):
             ({"expected": [{"path": "a.py", "lines": [3], "class": "c"}]}, "class and keywords"),
             ({"repo": ["acme/widget"]}, "repo must be nonempty text"),
             ({"number": True}, "number must be a positive integer"),
+            ({"acceptable": {}}, "acceptable must be a list"),
+            ({"acceptable": [{"path": "a.py"}]}, "each acceptable finding has"),
         ):
             with self.subTest(change=change):
                 self.assertIn(message, "; ".join(score.case_problems(dict(good, **change))))
@@ -208,6 +216,32 @@ class Scoring(unittest.TestCase):
         result = score.score(case, self.root)
         self.assertEqual((len(result["found"]), len(result["missed"])), (1, 1))
 
+    def test_a_flag_citing_two_sites_finds_a_miss_at_either(self):
+        self.store.put_beat(self.flag(1, 15, where="a.py:15 and a.py:5"))
+        result = score.score(self.case(), self.root)
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["found"][0]["beat"], 1)
+
+    def test_an_acceptable_finding_is_neither_required_nor_an_alarm(self):
+        self.store.put_beat(self.flag(1, 15, claim="the race test is flaky"))
+        case = dict(self.case("clean"), acceptable=[
+            {"path": "a.py", "lines": [15], "class": "weak test", "keywords": ["flaky"]},
+        ])
+        result = score.score(case, self.root)
+        self.assertTrue(result["pass"])
+        self.assertEqual(result["false_alarms"], [])
+        self.assertEqual([(a["n"], a["class"]) for a in result["acceptable"]], [(1, "weak test")])
+        self.assertTrue(score.score(self.case("clean"), self.root)["false_alarms"])
+
+    def test_an_acceptable_finding_does_not_stand_in_for_the_miss(self):
+        self.store.put_beat(self.flag(1, 15, claim="the race test is flaky"))
+        case = dict(self.case(), acceptable=[
+            {"path": "a.py", "lines": [15], "class": "weak test", "keywords": ["flaky"]},
+        ])
+        result = score.score(case, self.root)
+        self.assertFalse(result["pass"])
+        self.assertEqual(len(result["missed"]), 1)
+
 
 class Runner(unittest.TestCase):
     def test_the_walk_runs_in_eval_mode_with_a_narrow_tool_list(self):
@@ -270,6 +304,115 @@ class Runner(unittest.TestCase):
         self.assertIn("When `UNDERWRITE_REVIEWS` is set, it replaces `~/.claude/reviews`", text)
         self.assertIn("pass its path instead of piping it", text)
         self.assertIn("`eval_complete: true`", text)
+class RepeatedRuns(unittest.TestCase):
+    """One walk of a nondeterministic skill is one sample. Several runs of a case pass on
+    a majority and report mean counts, so a lone flip does not read as a regression."""
+
+    def setUp(self):
+        self.original = run.run_case
+        self.addCleanup(setattr, run, "run_case", self.original)
+
+    def scripted(self, *outcomes):
+        queue = list(outcomes)
+        run.run_case = lambda case, args: dict(queue.pop(0), case=case["id"])
+
+    def args(self, runs):
+        return argparse.Namespace(runs=runs)
+
+    def test_a_single_run_keeps_the_result_shape(self):
+        self.scripted({"pass": True, "finished": True, "missed": [], "false_alarms": []})
+        result = run.repeated({"id": "a"}, self.args(1))
+        self.assertNotIn("runs", result)
+        self.assertTrue(result["pass"])
+
+    def test_a_case_passes_on_a_majority_with_mean_counts(self):
+        alarm = [{"n": 1}]
+        self.scripted(
+            {"pass": True, "finished": True, "missed": [], "false_alarms": [], "cost_usd": 1.0},
+            {"pass": False, "finished": True, "missed": [], "false_alarms": alarm, "cost_usd": 1.5},
+            {"pass": True, "finished": True, "missed": [], "false_alarms": [], "cost_usd": 2.0},
+        )
+        result = run.repeated({"id": "a"}, self.args(3))
+        self.assertEqual((result["passes"], result["pass"]), (2, True))
+        self.assertEqual(result["pass_rate"], 0.667)
+        self.assertEqual(result["false_alarms"], 0.333)
+        self.assertEqual(result["cost_usd"], 4.5)
+        self.assertEqual(len(result["runs"]), 3)
+
+    def test_a_split_is_not_a_pass_and_an_errored_run_is_reported(self):
+        self.scripted(
+            {"pass": True, "finished": True, "missed": [], "false_alarms": []},
+            {"error": "walk exited 1; see walk.stderr"},
+        )
+        result = run.repeated({"id": "a"}, self.args(2))
+        self.assertFalse(result["pass"])
+        self.assertIn("1 of 2 runs errored", result["error"])
+
+
+class KeepingEvidence(unittest.TestCase):
+    """A scored failure is the run worth reading, so its work directory survives."""
+
+    def test_a_failed_walk_keeps_its_work_and_a_pass_cleans_up(self):
+        work_root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, work_root, True)
+        original_command, original_score = run.command, run.score
+        self.addCleanup(setattr, run, "command", original_command)
+        self.addCleanup(setattr, run, "score", original_score)
+        seed = work_root / "seed"
+        subprocess.run(["git", "init", "-q", str(seed)], check=True)
+        subprocess.run(
+            ["git", "-C", str(seed), "-c", "user.name=t", "-c", "user.email=t@e.test",
+             "-c", "commit.gpgsign=false", "commit", "-q", "--allow-empty", "-m", "b"],
+            check=True,
+        )
+        base = subprocess.run(
+            ["git", "-C", str(seed), "rev-parse", "HEAD"], check=True, capture_output=True, text=True,
+        ).stdout.strip()
+        walk = (
+            "import os, pathlib; root = pathlib.Path(os.environ['UNDERWRITE_REVIEWS']) / 's';"
+            "root.mkdir(); (root / 'session.sqlite3').write_bytes(b''); print('{}')"
+        )
+        run.command = lambda case, plugin, reviews, checkout, args: [sys.executable, "-c", walk]
+        case = {"id": "k", "repo": str(seed), "base_sha": base}
+        args = argparse.Namespace(work_root=str(work_root / "work"), keep=False, timeout=60)
+        clone = lambda argv, **kw: subprocess.run(
+            ["git", "clone", "-q", argv[3], argv[4]] if argv[:3] == ["gh", "repo", "clone"] else argv,
+            **kw,
+        )
+        original_run = run.subprocess.run
+        self.addCleanup(setattr, run.subprocess, "run", original_run)
+        run.subprocess.run = lambda argv, **kw: clone(argv, **kw) if argv[0] == "gh" else original_run(argv, **kw)
+        for passed in (False, True):
+            with self.subTest(passed=passed):
+                run.score = lambda case, root, passed=passed: {"pass": passed, "finished": True}
+                result = run.run_case(case, args)
+                self.assertNotIn("error", result)
+                self.assertEqual("work" in result, not passed)
+                if not passed:
+                    self.assertTrue(Path(result["work"]).is_dir())
+                    self.assertEqual(Path(result["work"]).parent, (work_root / "work").resolve())
+
+
+class Provenance(unittest.TestCase):
+    def test_a_report_names_the_skill_commit_and_the_settings(self):
+        args = argparse.Namespace(model="m", runs=3, bare=True, max_budget_usd=2.0)
+        found = run.provenance(args)
+        self.assertRegex(found["skill_commit"] or "", r"^[0-9a-f]{40}$")
+        self.assertEqual(
+            {k: found[k] for k in ("model", "runs", "bare", "max_budget_usd")},
+            {"model": "m", "runs": 3, "bare": True, "max_budget_usd": 2.0},
+        )
+        self.assertIsInstance(found["skill_dirty"], bool)
+
+
+class Labels(unittest.TestCase):
+    def test_the_weak_race_test_flag_on_17_is_acceptable_not_an_alarm(self):
+        case = score.load_case(EVALS / "cases" / "underwrite-17-sigterm.json")
+        beat = {
+            "n": 1, "where": "tests/test_serve.py:434",
+            "claim": "the race test passes on the old ordering most runs", "slots": {},
+        }
+        self.assertTrue(any(score.matches(item, beat) for item in case["acceptable"]))
 
 
 if __name__ == "__main__":

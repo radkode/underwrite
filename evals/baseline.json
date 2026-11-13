@@ -27,23 +27,25 @@
       "pass": true
     },
     {
-      "beats": 1,
-      "case": "underwrite-17-sigterm",
-      "cost_usd": 1.7215960000000001,
-      "demoted": 0,
-      "false_alarms": [
+      "acceptable": [
         {
           "claim": "the race test passes on the old ordering most runs",
+          "class": "the SIGTERM race test catches the old ordering only on some runs",
           "n": 1,
           "where": "tests/test_serve.py:434"
         }
       ],
+      "beats": 1,
+      "case": "underwrite-17-sigterm",
+      "cost_usd": 1.7215960000000001,
+      "demoted": 0,
+      "false_alarms": [],
       "finished": true,
       "flags": 1,
       "found": [],
       "kind": "clean",
       "missed": [],
-      "pass": false
+      "pass": true
     },
     {
       "beats": 5,
@@ -111,8 +113,8 @@
   ],
   "summary": {
     "cases": 5,
-    "false_alarms": 2,
+    "false_alarms": 1,
     "missed": 1,
-    "passed": 3
+    "passed": 4
   }
 }

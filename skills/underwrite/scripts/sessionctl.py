@@ -128,6 +128,17 @@ def add_counts(total, counts):
 def share(counts):
     beats = counts["beats"]
     counts["unverified_share"] = round(counts["unverified"] / beats, 3) if beats else None
+    settled = counts["accepted"] + counts["decided"] + counts["dropped"]
+    counts["dropped_share"] = round(counts["dropped"] / settled, 3) if settled else None
+    return counts
+
+
+def superseded(counts):
+    """A replaced round's open flags were carried into its successor or left behind with
+    the old head, so the total counts them once, in the round that still stands."""
+    counts = dict(counts, dropped_by_reason=dict(counts["dropped_by_reason"]))
+    counts["flags"] -= counts["open"]
+    counts["open"] = 0
     return counts
 
 
@@ -136,8 +147,7 @@ def ledger(reviews):
     reviews = Path(reviews).expanduser()
     if not reviews.is_dir():
         raise StoreError(f"no reviews directory at {reviews}")
-    sessions = []
-    overall = noise_counts(())
+    read = []
     for root in sorted(path for path in reviews.iterdir() if path.is_dir()):
         if not ((root / "session.sqlite3").exists() or (root / "session.json").exists()):
             continue
@@ -146,12 +156,24 @@ def ledger(reviews):
             session, beats = SessionStore.detached_presentation_snapshot(root)
         except (OSError, sqlite3.Error, json.JSONDecodeError, StoreError) as error:
             entry["error"] = str(error)
-            sessions.append(entry)
+            read.append((entry, None, None))
             continue
         entry["repo"] = (session.get("target") or {}).get("repo") or session.get("repo")
-        counts = noise_counts(beats)
-        add_counts(overall, counts)
-        entry.update(share(counts))
+        read.append((entry, session, noise_counts(beats)))
+    replaced = {}
+    for entry, session, _counts in read:
+        predecessor = (session or {}).get("predecessor")
+        if isinstance(predecessor, dict) and isinstance(predecessor.get("session"), str):
+            replaced[predecessor["session"]] = entry["session"]
+    sessions = []
+    overall = noise_counts(())
+    for entry, _session, counts in read:
+        if counts is not None:
+            successor = replaced.get(entry["session"])
+            if successor:
+                entry["superseded_by"] = successor
+            add_counts(overall, superseded(counts) if successor else counts)
+            entry.update(share(counts))
         sessions.append(entry)
     return {"sessions": sessions, "overall": share(overall)}
 
