@@ -1292,6 +1292,24 @@ class Forgery(Served):
         """curl sends none, and the agent drives the same routes the page does."""
         self.assertEqual(self.post("/act", {"n": 1, "action": "accept"})[0], 200)
 
+    def test_every_response_forbids_framing(self):
+        for route in ("/", "/fragment", "/state", "/favicon.ico"):
+            with self.subTest(route=route):
+                with urllib.request.urlopen(self.url + route, timeout=5) as response:
+                    self.assertEqual(response.headers.get("X-Frame-Options"), "DENY")
+                    self.assertEqual(
+                        response.headers.get("Content-Security-Policy"),
+                        "frame-ancestors 'none'",
+                    )
+        with self.assertRaises(urllib.error.HTTPError) as err:
+            urllib.request.urlopen(self.url + "/missing", timeout=5)
+        with err.exception:
+            self.assertEqual(err.exception.headers.get("X-Frame-Options"), "DENY")
+            self.assertEqual(
+                err.exception.headers.get("Content-Security-Policy"),
+                "frame-ancestors 'none'",
+            )
+
 
 class Streaming(Served):
     """/events is the whole reason the page never polls: both directions of the walk
