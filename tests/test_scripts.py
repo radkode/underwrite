@@ -2728,6 +2728,59 @@ class AnchorCli(unittest.TestCase):
         self.assertEqual(done.returncode, 1)
         self.assertIn("validate-anchors:", done.stderr)
 
+    def test_folded_comments_land_before_the_marker_and_neutralize_quoted_markers(self):
+        foreign_marker = "<!-- underwrite-review:" + "0" * 32 + " -->"
+        payload = {
+            "body": "summary",
+            "event": "COMMENT",
+            "comments": [{
+                "path": "outside.py",
+                "line": 99,
+                "side": "RIGHT",
+                "body": f"Watch out for {foreign_marker} in body text.",
+            }],
+        }
+        (self.dir / "review.json").write_text(json.dumps(payload), encoding="utf-8")
+
+        first = self.run_cli(
+            "--session", str(self.dir), "--payload", "review.json", "--out", "fixed.json"
+        )
+        self.assertEqual(first.returncode, 2, first.stderr)
+        fixed = json.loads((self.dir / "fixed.json").read_text(encoding="utf-8"))
+        session_marker = va.SessionStore(self.dir).review_marker()
+        self.assertTrue(fixed["body"].endswith(session_marker), fixed["body"])
+        self.assertNotIn(foreign_marker, fixed["body"])
+        self.assertEqual(va.REVIEW_MARKER.findall(fixed["body"]), [session_marker])
+
+        second = self.run_cli("--session", str(self.dir), "--payload", "fixed.json")
+        self.assertEqual(second.returncode, 0, second.stderr)
+
+    def test_review_body_over_github_limit_is_refused_with_exit_1(self):
+        payload = {
+            "body": "x" * 65_537,
+            "event": "COMMENT",
+            "comments": [],
+        }
+        (self.dir / "review.json").write_text(json.dumps(payload), encoding="utf-8")
+        done = self.run_cli("--diff", "pr.diff", "--payload", "review.json")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("65,536", done.stderr)
+
+        payload_folded = {
+            "body": "x" * 65_500,
+            "event": "COMMENT",
+            "comments": [{
+                "path": "outside.py",
+                "line": 99,
+                "side": "RIGHT",
+                "body": "y" * 50,
+            }],
+        }
+        (self.dir / "review.json").write_text(json.dumps(payload_folded), encoding="utf-8")
+        done_session = self.run_cli("--session", str(self.dir), "--payload", "review.json")
+        self.assertEqual(done_session.returncode, 1)
+        self.assertIn("65,536", done_session.stderr)
+
 
 class Snapping(unittest.TestCase):
     def test_nearest_valid_line_wins(self):
