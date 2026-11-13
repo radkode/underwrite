@@ -131,9 +131,13 @@ for, and everything you are worth is in what they did not.
 ## Phase 0: scope and ingest
 
 Resolve the target from the argument: a number is a PR, a name is a branch
-(`git diff main...<branch>`), empty means the working tree (`git diff`, falling back to
-`git diff HEAD~1`). If the working directory is not a repository, ask which one before
-anything else; every `git` and `gh` call below has to run inside it.
+(`git diff main...<branch>`), empty means the working tree (`git diff HEAD` when `HEAD`
+exists so staged and unstaged tracked changes are both included, or `git diff --cached`
+plus `git diff` on an unborn branch; untracked files are excluded, so name that up front).
+When the working tree is clean, offer reviewing the previous commit (`git diff HEAD~1`) as
+a named choice and never substitute it automatically. If the working directory is not a
+repository, ask which one before anything else; every `git` and `gh` call below has to run
+inside it.
 
 **A PR session must bootstrap from a clean trusted-base controller checkout.** If the
 current checkout is the PR head or contains its changes, stop and tell the reviewer to
