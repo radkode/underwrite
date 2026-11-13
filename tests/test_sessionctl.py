@@ -675,7 +675,9 @@ class NoiseLedger(unittest.TestCase):
         self.assertEqual(overall["dropped_by_reason"]["pre-existing"], 1)
         self.assertEqual(overall["dropped_by_reason"]["unstated"], 1)
 
-    def test_a_replaced_round_counts_its_open_flags_once_in_the_total(self):
+    def test_a_replaced_round_is_marked_and_keeps_its_own_counts(self):
+        """Only settled findings carry into a replacement, so a replaced round's open flag is
+        still open nowhere else and stays in the total."""
         first = self.walked()
         second = self.reviews / "acme-widget-pr1-r2"
         store = session_store.SessionStore(second, create=True)
@@ -689,12 +691,11 @@ class NoiseLedger(unittest.TestCase):
         ledger = self.stats()
 
         replaced, current = ledger["sessions"]
-        self.assertEqual(replaced["superseded_by"], "acme-widget-pr1-r2")
+        self.assertEqual(replaced["superseded_by"], ["acme-widget-pr1-r2"])
         self.assertEqual((replaced["flags"], replaced["open"]), (3, 1))
         self.assertNotIn("superseded_by", current)
         overall = ledger["overall"]
-        self.assertEqual((overall["flags"], overall["open"]), (3, 1))
-        self.assertEqual((overall["accepted"], overall["dropped"]), (1, 1))
+        self.assertEqual((overall["flags"], overall["open"]), (4, 2))
 
     def test_reading_the_ledger_never_writes_a_session(self):
         root = self.walked()

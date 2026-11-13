@@ -37,8 +37,9 @@ jobs:
         run: npm install --global @anthropic-ai/claude-code@2.1.251 --no-audit --no-fund
       - if: env.ANTHROPIC_API_KEY != ''
         run: python3 evals/run.py --bare --max-budget-usd 3 --work-root evals-work --baseline evals/baseline.json
-      # A failed walk keeps its transcript and session; without them a regression is a number.
-      - if: failure() && env.ANTHROPIC_API_KEY != ''
+      # Every walk that did not pass keeps its transcript and session, a known miss included;
+      # without them a regression is a number. report.json ties them together.
+      - if: always() && env.ANTHROPIC_API_KEY != ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: eval-walks

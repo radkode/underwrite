@@ -10,6 +10,7 @@ import argparse
 import json
 import os
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -130,16 +131,20 @@ def run_case(case, args):
     except (subprocess.SubprocessError, OSError, CaseError) as error:
         result["error"] = str(error)
     finally:
-        # A scored failure is the run worth reading, so only a pass is cleaned away.
+        # A scored failure is the run worth reading, so only a pass is cleaned away. The
+        # clone is reproducible from the case, so a kept run keeps only what the walk wrote.
         if not args.keep and result.get("pass"):
             shutil.rmtree(work, ignore_errors=True)
             result.pop("work")
+        elif not args.keep:
+            shutil.rmtree(checkout, ignore_errors=True)
     return result
 
 
 def repeated(case, args):
     """One case walked `runs` times. Walks are not deterministic, so a case passes on a
-    majority of its runs and its counts are the mean, not one lucky or unlucky sample."""
+    majority of its runs and its counts are the median of its scored runs: one noisy or
+    lucky run moves neither, and a count stays a whole number the baseline can compare."""
     runs = [run_case(case, args) for _ in range(args.runs)]
     if len(runs) == 1:
         return runs[0]
@@ -152,8 +157,8 @@ def repeated(case, args):
         "pass_rate": round(passes / len(runs), 3),
         "pass": passes * 2 > len(runs),
         "finished": bool(scored) and all(r.get("finished") for r in scored),
-        "missed": mean_count(runs, "missed"),
-        "false_alarms": mean_count(runs, "false_alarms"),
+        "missed": median_count(scored, "missed"),
+        "false_alarms": median_count(scored, "false_alarms"),
         "cost_usd": round(sum(r.get("cost_usd") or 0 for r in runs), 4),
     }
     errors = [r["error"] for r in runs if r.get("error")]
@@ -162,12 +167,12 @@ def repeated(case, args):
     return result
 
 
-def mean_count(runs, key):
-    return round(sum(count(r.get(key)) for r in runs) / len(runs), 3)
+def median_count(runs, key):
+    return statistics.median_low([count(r.get(key)) for r in runs]) if runs else 0
 
 
 def count(value):
-    return value if isinstance(value, (int, float)) else len(value or ())
+    return value if isinstance(value, int) else len(value or ())
 
 
 def provenance(args):
@@ -214,15 +219,20 @@ def main(argv=None):
     summary = {
         "passed": sum(1 for r in results if r.get("pass")),
         "cases": len(results),
-        "missed": round(sum(count(r.get("missed")) for r in results), 3),
-        "false_alarms": round(sum(count(r.get("false_alarms")) for r in results), 3),
+        "missed": sum(count(r.get("missed")) for r in results),
+        "false_alarms": sum(count(r.get("false_alarms")) for r in results),
     }
     report = {"summary": summary, "provenance": provenance(args), "results": results}
     if args.baseline:
         report["regressions"] = regressions(json.loads(args.baseline.read_text(encoding="utf-8")), report)
-        print(json.dumps(report, indent=2, sort_keys=True))
+    out = json.dumps(report, indent=2, sort_keys=True)
+    if args.work_root:
+        root = Path(args.work_root)
+        root.mkdir(parents=True, exist_ok=True)
+        (root / "report.json").write_text(out + "\n", encoding="utf-8")
+    print(out)
+    if args.baseline:
         return 2 if report["regressions"] else 0
-    print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if summary["passed"] == summary["cases"] else 2
 
 

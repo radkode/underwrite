@@ -133,17 +133,10 @@ def share(counts):
     return counts
 
 
-def superseded(counts):
-    """A replaced round's open flags were carried into its successor or left behind with
-    the old head, so the total counts them once, in the round that still stands."""
-    counts = dict(counts, dropped_by_reason=dict(counts["dropped_by_reason"]))
-    counts["flags"] -= counts["open"]
-    counts["open"] = 0
-    return counts
-
-
 def ledger(reviews):
-    """Count what every stored session raised and how the reviewer answered it."""
+    """Count what every stored session raised and how the reviewer answered it. A round that
+    a replacement superseded is marked, and its counts stay its own: only settled findings
+    carry forward, so an open flag there is still open nowhere else."""
     reviews = Path(reviews).expanduser()
     if not reviews.is_dir():
         raise StoreError(f"no reviews directory at {reviews}")
@@ -164,15 +157,14 @@ def ledger(reviews):
     for entry, session, _counts in read:
         predecessor = (session or {}).get("predecessor")
         if isinstance(predecessor, dict) and isinstance(predecessor.get("session"), str):
-            replaced[predecessor["session"]] = entry["session"]
+            replaced.setdefault(predecessor["session"], []).append(entry["session"])
     sessions = []
     overall = noise_counts(())
     for entry, _session, counts in read:
         if counts is not None:
-            successor = replaced.get(entry["session"])
-            if successor:
-                entry["superseded_by"] = successor
-            add_counts(overall, superseded(counts) if successor else counts)
+            if entry["session"] in replaced:
+                entry["superseded_by"] = sorted(replaced[entry["session"]])
+            add_counts(overall, counts)
             entry.update(share(counts))
         sessions.append(entry)
     return {"sessions": sessions, "overall": share(overall)}

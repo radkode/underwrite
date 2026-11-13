@@ -41,8 +41,12 @@ class Cases(unittest.TestCase):
     def test_the_skill_names_no_case_it_is_scored_on(self):
         text = (ROOT / "skills" / "underwrite" / "SKILL.md").read_text(encoding="utf-8")
         for path in sorted((EVALS / "cases").glob("*.json")):
+            case = score.load_case(path)
             with self.subTest(case=path.stem):
                 self.assertNotIn(path.stem, text)
+                for item in case["expected"] + case.get("acceptable", []):
+                    for line in item["lines"]:
+                        self.assertNotIn(f"{Path(item['path']).name}:{line}", text)
 
     def test_a_misshapen_case_is_refused(self):
         good = {
@@ -67,7 +71,9 @@ class Cases(unittest.TestCase):
                 self.assertIn(message, "; ".join(score.case_problems(dict(good, **change))))
 
 
-class Scoring(unittest.TestCase):
+class SessionFixture(unittest.TestCase):
+    FILES = ("a.py",)
+
     def setUp(self):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, self.tmp, True)
@@ -76,16 +82,22 @@ class Scoring(unittest.TestCase):
             ["git", "-C", str(repo), *a], check=True, capture_output=True, text=True
         ).stdout.strip()
         subprocess.run(["git", "init", "-q", str(repo)], check=True)
-        for key, value in (("user.name", "t"), ("user.email", "t@example.test"), ("commit.gpgsign", "false")):
+        for key, value in (
+            ("user.name", "t"), ("user.email", "t@example.test"), ("commit.gpgsign", "false"),
+            ("core.quotePath", "true"),
+        ):
             git("config", key, value)
-        (repo / "a.py").write_text("".join(f"line {n}\n" for n in range(1, 21)), encoding="utf-8")
-        git("add", "a.py")
+        for name in self.FILES:
+            (repo / name).parent.mkdir(parents=True, exist_ok=True)
+            (repo / name).write_text("".join(f"line {n}\n" for n in range(1, 21)), encoding="utf-8")
+        git("add", "-A")
         git("commit", "-q", "-m", "base")
         self.base = git("rev-parse", "HEAD")
-        (repo / "a.py").write_text(
-            "".join(f"{'CHANGED' if n in (5, 15) else 'line'} {n}\n" for n in range(1, 21)),
-            encoding="utf-8",
-        )
+        for name in self.FILES:
+            (repo / name).write_text(
+                "".join(f"{'CHANGED' if n in (5, 15) else 'line'} {n}\n" for n in range(1, 21)),
+                encoding="utf-8",
+            )
         git("commit", "-q", "-am", "head")
         self.head = git("rev-parse", "HEAD")
         self.root = self.tmp / "reviews" / "acme-widget-pr7"
@@ -107,7 +119,7 @@ class Scoring(unittest.TestCase):
                 "version": 1, "kind": "github_pr", "repo": "acme/widget", "number": 7,
                 "state": "closed", "merged_at": "2026-10-01T00:00:00Z", "base_sha": self.base,
                 "head_sha": self.head, "head_repo_id": 1, "head_repo": "acme/widget",
-                "head_ref": "f", "merge_base_sha": self.base, "changed_files": 1,
+                "head_ref": "f", "merge_base_sha": self.base, "changed_files": len(self.FILES),
             },
             inputs / "pr.diff", inputs / "pr.json", inputs / "trusted.json", inputs / "pr.bundle",
         )
@@ -131,6 +143,7 @@ class Scoring(unittest.TestCase):
             **extra,
         }
 
+class Scoring(SessionFixture):
     def test_a_flag_within_the_window_finds_the_miss(self):
         self.store.put_beat(self.flag(1, 7))
         result = score.score(self.case(), self.root)
@@ -242,6 +255,52 @@ class Scoring(unittest.TestCase):
         self.assertFalse(result["pass"])
         self.assertEqual(len(result["missed"]), 1)
 
+    def test_a_sentence_final_citation_still_counts(self):
+        self.store.put_beat(self.flag(1, 15, where="a.py:15 and a.py:5."))
+        self.assertTrue(score.score(self.case(), self.root)["pass"])
+
+    def test_an_acceptable_finding_excuses_one_flag_not_every_flag_near_it(self):
+        self.store.put_beat(self.flag(1, 15, claim="the race test is flaky"))
+        self.store.put_beat(self.flag(2, 16, claim="this race test is flaky too"))
+        case = dict(self.case("clean"), acceptable=[
+            {"path": "a.py", "lines": [15], "class": "weak test", "keywords": ["flaky"]},
+        ])
+        result = score.score(case, self.root)
+        self.assertEqual([a["n"] for a in result["acceptable"]], [1])
+        self.assertEqual([a["n"] for a in result["false_alarms"]], [2])
+        self.assertFalse(result["pass"])
+
+    def test_a_session_whose_frozen_diff_was_altered_is_refused(self):
+        (self.root / "pr.diff").write_text("tampered\n", encoding="utf-8")
+        with self.assertRaisesRegex(score.CaseError, "frozen diff does not match"):
+            score.score(self.case(), self.root)
+
+
+class SpacedPaths(SessionFixture):
+    """A path with a space is read whole, so a flag on one file never credits another whose
+    name is the tail of it."""
+
+    FILES = ("src/a.py", "other src/a.py")
+
+    def case(self, kind="miss", lines=(5,), path="src/a.py"):
+        return dict(super().case(kind, lines), expected=[] if kind == "clean" else [
+            {"path": path, "lines": list(lines), "class": "c", "keywords": ["guard"]}
+        ])
+
+    def flag(self, n, line, **extra):
+        extra.setdefault("where", f"src/a.py:{line}")
+        return super().flag(n, line, **extra)
+
+    def test_a_flag_on_the_spaced_file_does_not_credit_the_other(self):
+        self.store.put_beat(self.flag(1, 5, where="other src/a.py:5"))
+        result = score.score(self.case(), self.root)
+        self.assertEqual(len(result["missed"]), 1)
+        self.assertEqual([a["n"] for a in result["false_alarms"]], [1])
+
+    def test_a_flag_on_the_spaced_file_finds_a_miss_there(self):
+        self.store.put_beat(self.flag(1, 5, where="other src/a.py:5"))
+        self.assertTrue(score.score(self.case(path="other src/a.py"), self.root)["pass"])
+
 
 class Runner(unittest.TestCase):
     def test_the_walk_runs_in_eval_mode_with_a_narrow_tool_list(self):
@@ -304,9 +363,11 @@ class Runner(unittest.TestCase):
         self.assertIn("When `UNDERWRITE_REVIEWS` is set, it replaces `~/.claude/reviews`", text)
         self.assertIn("pass its path instead of piping it", text)
         self.assertIn("`eval_complete: true`", text)
+
+
 class RepeatedRuns(unittest.TestCase):
     """One walk of a nondeterministic skill is one sample. Several runs of a case pass on
-    a majority and report mean counts, so a lone flip does not read as a regression."""
+    a majority and report median counts, so a lone flip does not read as a regression."""
 
     def setUp(self):
         self.original = run.run_case
@@ -325,7 +386,7 @@ class RepeatedRuns(unittest.TestCase):
         self.assertNotIn("runs", result)
         self.assertTrue(result["pass"])
 
-    def test_a_case_passes_on_a_majority_with_mean_counts(self):
+    def test_a_case_passes_on_a_majority_and_one_noisy_run_moves_no_count(self):
         alarm = [{"n": 1}]
         self.scripted(
             {"pass": True, "finished": True, "missed": [], "false_alarms": [], "cost_usd": 1.0},
@@ -335,9 +396,42 @@ class RepeatedRuns(unittest.TestCase):
         result = run.repeated({"id": "a"}, self.args(3))
         self.assertEqual((result["passes"], result["pass"]), (2, True))
         self.assertEqual(result["pass_rate"], 0.667)
-        self.assertEqual(result["false_alarms"], 0.333)
+        self.assertEqual(result["false_alarms"], 0)
         self.assertEqual(result["cost_usd"], 4.5)
         self.assertEqual(len(result["runs"]), 3)
+
+    def test_majority_runs_hold_against_a_one_run_baseline(self):
+        """Three runs of every case where each passing case has one noisy run must not read
+        as a regression against the single-run baseline those cases already meet."""
+        alarm = [{"n": 1}]
+        quiet = {"pass": True, "finished": True, "missed": [], "false_alarms": []}
+        noisy = {"pass": False, "finished": True, "missed": [], "false_alarms": alarm}
+        known = {"pass": False, "finished": True, "missed": [{}], "false_alarms": alarm}
+        self.scripted(quiet, noisy, quiet, quiet, quiet, noisy, known, known, known)
+        results = [run.repeated({"id": case}, self.args(3)) for case in ("a", "b", "c")]
+        report = {
+            "summary": {
+                "missed": sum(run.count(r["missed"]) for r in results),
+                "false_alarms": sum(run.count(r["false_alarms"]) for r in results),
+            },
+            "results": results,
+        }
+        baseline = {
+            "summary": {"missed": 1, "false_alarms": 1},
+            "results": [{"case": "a", "pass": True}, {"case": "b", "pass": True},
+                        {"case": "c", "pass": False}],
+        }
+        self.assertEqual(run.regressions(baseline, report), [])
+
+    def test_an_errored_run_does_not_count_as_a_quiet_one(self):
+        alarm = [{"n": 1}]
+        self.scripted(
+            {"pass": False, "finished": True, "missed": [], "false_alarms": alarm},
+            {"error": "walk exited 1"},
+            {"error": "walk exited 1"},
+        )
+        result = run.repeated({"id": "a"}, self.args(3))
+        self.assertEqual(result["false_alarms"], 1)
 
     def test_a_split_is_not_a_pass_and_an_errored_run_is_reported(self):
         self.scripted(
@@ -389,8 +483,12 @@ class KeepingEvidence(unittest.TestCase):
                 self.assertNotIn("error", result)
                 self.assertEqual("work" in result, not passed)
                 if not passed:
-                    self.assertTrue(Path(result["work"]).is_dir())
-                    self.assertEqual(Path(result["work"]).parent, (work_root / "work").resolve())
+                    kept = Path(result["work"])
+                    self.assertTrue(kept.is_dir())
+                    self.assertEqual(kept.parent, (work_root / "work").resolve())
+                    self.assertFalse((kept / "checkout").exists())
+                    self.assertTrue((kept / "reviews" / "s").is_dir())
+                    self.assertTrue((kept / "walk.json").is_file())
 
 
 class Provenance(unittest.TestCase):
@@ -408,11 +506,29 @@ class Provenance(unittest.TestCase):
 class Labels(unittest.TestCase):
     def test_the_weak_race_test_flag_on_17_is_acceptable_not_an_alarm(self):
         case = score.load_case(EVALS / "cases" / "underwrite-17-sigterm.json")
-        beat = {
-            "n": 1, "where": "tests/test_serve.py:434",
-            "claim": "the race test passes on the old ordering most runs", "slots": {},
-        }
-        self.assertTrue(any(score.matches(item, beat) for item in case["acceptable"]))
+        paths = ["tests/test_serve.py"]
+        for claim in (
+            "the race test passes on the old ordering most runs",
+            "the SIGTERM test is timing dependent and rarely hits the window",
+        ):
+            with self.subTest(claim=claim):
+                beat = {"n": 1, "where": "tests/test_serve.py:434", "claim": claim, "slots": {}}
+                self.assertTrue(any(score.matches(item, beat, paths) for item in case["acceptable"]))
+
+    def test_the_baseline_summary_adds_up_and_names_only_known_cases(self):
+        baseline = json.loads((EVALS / "baseline.json").read_text(encoding="utf-8"))
+        results = baseline["results"]
+        known = {path.stem for path in (EVALS / "cases").glob("*.json")}
+        self.assertEqual({r["case"] for r in results}, known)
+        self.assertEqual(baseline["summary"], {
+            "cases": len(results),
+            "passed": sum(1 for r in results if r["pass"]),
+            "missed": sum(len(r["missed"]) for r in results),
+            "false_alarms": sum(len(r["false_alarms"]) for r in results),
+        })
+        for r in results:
+            with self.subTest(case=r["case"]):
+                self.assertEqual(r["pass"], r["finished"] and not r["missed"] and not r["false_alarms"])
 
 
 if __name__ == "__main__":

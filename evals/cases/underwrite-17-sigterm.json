@@ -11,7 +11,7 @@
       "path": "tests/test_serve.py",
       "lines": [434],
       "class": "the SIGTERM race test catches the old ordering only on some runs",
-      "keywords": ["race", "ordering", "flak", "most runs"]
+      "keywords": ["race", "ordering", "flak", "timing", "intermittent"]
     }
   ],
   "evidence": "its SIGTERM block was later touched only by tests (#23) and a feature (#63)"
