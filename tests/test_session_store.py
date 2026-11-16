@@ -3821,6 +3821,49 @@ class ChangedPathsAllowlist(unittest.TestCase):
             ["a/blob.bin", "a/copied.txt", "a/pure.txt", "b/blob.bin", "b/copied.txt", "b/pure.txt"],
         )
 
+    def test_changed_paths_preserves_significant_filename_whitespace_in_git_diff(self):
+        repo = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, repo, True)
+        env = {
+            name: value for name, value in os.environ.items()
+            if not name.startswith("GIT_")
+        }
+        env.update({
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        })
+        subprocess.run(["git", "init", "--template=", str(repo)], check=True, capture_output=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@example.test"], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "config", "commit.gpgsign", "false"], check=True, env=env)
+        (repo / "name ").write_text("before\n", encoding="utf-8")
+        (repo / "plain.txt").write_text("move me\n" * 8, encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "base"], check=True, capture_output=True, env=env)
+
+        (repo / "name ").write_text("after\n", encoding="utf-8")
+        (repo / "plain.txt").rename(repo / " leading.txt")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "head"], check=True, capture_output=True, env=env)
+
+        raw = subprocess.run(
+            [
+                "git", "-c", "core.quotePath=true", "-C", str(repo),
+                "diff", "-M", "--src-prefix=a/", "--dst-prefix=b/",
+                "HEAD~1...HEAD", "--",
+            ],
+            check=True,
+            capture_output=True,
+            env=env,
+        ).stdout
+        store = self.store_for_diff(raw)
+
+        self.assertEqual(
+            store.changed_paths(),
+            [" leading.txt", "name ", "plain.txt"],
+        )
+
 
 class FlagAnchorsWithoutATarget(StoreCase):
     def test_a_branch_walk_has_no_frozen_diff_to_check(self):

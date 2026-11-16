@@ -26,7 +26,7 @@ _GIT_ESCAPES = {
 
 
 def unquote_git_path(raw, strict_utf8=False):
-    text = raw.strip()
+    text = raw.rstrip("\r\n")
     if text.startswith('"') and text.endswith('"') and len(text) >= 2:
         inner = text[1:-1]
         raw_bytes = bytearray()
@@ -219,7 +219,7 @@ def diff_paths(data):
             prefix = "rename to " if line.startswith("rename to ") else "copy to "
             add_decoded(line[len(prefix):])
         elif line.startswith(("--- ", "+++ ")):
-            target = line[4:].split("\t")[0].strip()
+            target = line[4:].split("\t", 1)[0]
             if target != "/dev/null":
                 saw_explicit_path = True
                 add_decoded(target, strip_side=True)
