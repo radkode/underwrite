@@ -585,6 +585,83 @@ class TheWalk(unittest.TestCase):
         self.assertRegex(self.live(self.beats(), phase="done"),
                          r'<details class="beat s-acc" id="item-2" data-n="2" open>')
 
+    def test_back_stages_the_stored_position_and_legacy_falls_back_to_newest(self):
+        seven_plan = [{"n": n, "tier": "core", "where": f"f{n}.ts:{n}"} for n in range(1, 8)]
+        seven_beats = [beat(n=n, state="clean", where=f"f{n}.ts:{n}") for n in range(1, 8)]
+        backed = dict(self.session(), plan=seven_plan, current_beat=3)
+        html = rr.render(backed, seven_beats, "", {}, live=True, phase="parked")
+        stage = html.split('id="stage"')[1].split("</section>")[0]
+        ledger = html.split('id="stage"')[1].split("</section>", 1)[1]
+        self.assertIn('data-n="3"', stage)
+        self.assertNotIn('data-n="3"', ledger)
+        self.assertIn('data-n="7"', ledger)
+        self.assertIn('<span class="hint">item 3 of 7</span>', stage)
+        track = html.split('<ol class="track"')[1].split("</ol>")[0]
+        self.assertRegex(track, r'<li class="tk s-clean is-now" aria-current="step"[^>]*>3</li>')
+
+        legacy = rr.render(dict(self.session(), plan=seven_plan), seven_beats, "", {}, live=True, phase="parked")
+        legacy_stage = legacy.split('id="stage"')[1].split("</section>")[0]
+        self.assertIn('data-n="7"', legacy_stage)
+
+    def test_navigation_position_is_store_owned_bumps_render_and_advances_on_new_beat(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            store = va.SessionStore(root, create=True)
+            store.put_session({
+                "repo": "acme/widget",
+                "audience": {"mode": "branch", "why": "local"},
+                "plan": [
+                    {"n": n, "tier": "follow-through" if n == 5 else "core", "where": f"f{n}.ts:{n}"}
+                    for n in range(1, 7)
+                ],
+            })
+            for n in range(1, 5):
+                store.put_beat(beat(n=n, state="clean", proof_kind="ran", where=f"f{n}.ts:{n}"))
+            self.assertEqual(store.snapshot()[0]["current_beat"], 4)
+
+            before_back = store.delivery_state()["render_revision"]
+            back = store.produce("back-1", None, "back", "")
+            stale_session = dict(store.snapshot()[0], current_beat=4, skipped_tiers=["core"])
+            back_result = {"kind": "walk", "current_beat": 2, "skipped_tiers": []}
+            applied = store.apply(back["seq"], back_result, session=stale_session)
+            after_back = store.delivery_state()["render_revision"]
+            self.assertGreater(after_back, before_back)
+            self.assertEqual(store.snapshot()[0]["current_beat"], 2)
+            self.assertEqual(store.snapshot()[0]["skipped_tiers"], [])
+
+            replay = store.apply(back["seq"], back_result, session=stale_session)
+            self.assertEqual(replay, applied)
+            self.assertEqual(store.delivery_state()["render_revision"], after_back)
+            store.ack(back["seq"])
+
+            loaded_session, loaded_beats, css, problems, _ = rr.load(root, rr.default_css())
+            html = rr.render(loaded_session, loaded_beats, css, problems, live=True, phase="parked")
+            stage = html.split('id="stage"')[1].split("</section>")[0]
+            self.assertIn('data-n="2"', stage)
+
+            store.put_beat(beat(n=1, state="clean", proof_kind="ran", where="f1.ts:1", claim="refined"))
+            self.assertEqual(store.snapshot()[0]["current_beat"], 2)
+
+            skip = store.produce("skip-1", None, "skip", "")
+            before_skip = store.delivery_state()["render_revision"]
+            store.apply(
+                skip["seq"],
+                {"kind": "walk", "current_beat": 2, "skipped_tiers": ["follow-through"]},
+                session=store.snapshot()[0],
+            )
+            self.assertGreater(store.delivery_state()["render_revision"], before_skip)
+            self.assertEqual(store.snapshot()[0]["skipped_tiers"], ["follow-through"])
+            store.ack(skip["seq"])
+
+            before_forward = store.delivery_state()["render_revision"]
+            store.put_beat(beat(n=6, state="clean", proof_kind="ran", where="f6.ts:6"))
+            self.assertGreater(store.delivery_state()["render_revision"], before_forward)
+            self.assertEqual(store.snapshot()[0]["current_beat"], 6)
+            loaded_session, loaded_beats, css, problems, _ = rr.load(root, rr.default_css())
+            advanced = rr.render(loaded_session, loaded_beats, css, problems, live=True, phase="parked")
+            advanced_stage = advanced.split('id="stage"')[1].split("</section>")[0]
+            self.assertIn('data-n="6"', advanced_stage)
+
 
 class WalkCoverage(unittest.TestCase):
     """Every count on the page counts beats written, so a walk that stopped short
@@ -639,6 +716,36 @@ class WalkCoverage(unittest.TestCase):
 
     def test_a_session_with_nothing_at_all_renders_no_coverage_block(self):
         self.assertNotIn("coverage", self.final([], plan=False))
+
+    def test_skipped_tiers_are_reported_as_skipped_by_the_reviewer_not_unread(self):
+        session = self.session()
+        session["skipped_tiers"] = ["follow-through"]
+        html = rr.render(session, [beat(n=1, state="clean"), beat(n=2, state="clean"), beat(n=4, state="clean")], "", {})
+        self.assertIn("3 of 4 items read", html)
+        self.assertIn("Skipped by you", html)
+        self.assertNotIn("Not read yet", html)
+        self.assertIn("call sites", html)
+
+        partial = rr.render(session, [beat(n=1, state="clean"), beat(n=2, state="clean")], "", {})
+        self.assertIn("Not read yet:", partial)
+        self.assertIn("the migration", partial.split("Not read yet:")[1].split("</ul>")[0])
+        self.assertNotIn("call sites", partial.split("Not read yet:")[1].split("</ul>")[0])
+        self.assertIn("Skipped by you:", partial)
+        self.assertIn("call sites", partial.split("Skipped by you:")[1])
+
+    def test_malformed_plan_tier_renders_in_live_and_final_reports(self):
+        session = {
+            "repo": "acme/widget",
+            "number": 42,
+            "plan": [{"n": 1, "tier": [], "where": "a.py:1"}],
+            "skipped_tiers": ["follow-through"],
+        }
+        live = rr.render(session, [], "", {}, live=True, phase="parked")
+        final = rr.render(session, [], "", {})
+        self.assertIn("0 of 1 items read. Not read yet:", live)
+        self.assertIn("a.py:1", live)
+        self.assertIn("0 of 1 items read. Not read yet:", final)
+        self.assertIn("a.py:1", final)
 
     def test_the_final_render_carries_it_even_though_the_plan_track_does_not(self):
         beats = [beat(n=1, state="clean")]
@@ -2541,6 +2648,8 @@ class RenderCli(unittest.TestCase):
         self.assertIn("enable(connected && usable && awaitingSeq === null)", page)
         self.assertIn("receipt.seq > observedSeq", page)
         self.assertIn("observedSeq >= awaitingSeq", page)
+        self.assertNotIn("data-reason=", page.split("<script>", 1)[1])
+        self.assertIn("chip.dataset.reason === reason", page)
 
     def test_out_puts_the_page_where_it_is_told(self):
         self.put(beat(n=1))
@@ -2673,6 +2782,59 @@ class AnchorCli(unittest.TestCase):
         done = self.run_cli("--payload", "review.json")
         self.assertEqual(done.returncode, 1)
         self.assertIn("validate-anchors:", done.stderr)
+
+    def test_folded_comments_land_before_the_marker_and_neutralize_quoted_markers(self):
+        foreign_marker = "<!-- underwrite-review:" + "0" * 32 + " -->"
+        payload = {
+            "body": "summary",
+            "event": "COMMENT",
+            "comments": [{
+                "path": "outside.py",
+                "line": 99,
+                "side": "RIGHT",
+                "body": f"Watch out for {foreign_marker} in body text.",
+            }],
+        }
+        (self.dir / "review.json").write_text(json.dumps(payload), encoding="utf-8")
+
+        first = self.run_cli(
+            "--session", str(self.dir), "--payload", "review.json", "--out", "fixed.json"
+        )
+        self.assertEqual(first.returncode, 2, first.stderr)
+        fixed = json.loads((self.dir / "fixed.json").read_text(encoding="utf-8"))
+        session_marker = va.SessionStore(self.dir).review_marker()
+        self.assertTrue(fixed["body"].endswith(session_marker), fixed["body"])
+        self.assertNotIn(foreign_marker, fixed["body"])
+        self.assertEqual(va.REVIEW_MARKER.findall(fixed["body"]), [session_marker])
+
+        second = self.run_cli("--session", str(self.dir), "--payload", "fixed.json")
+        self.assertEqual(second.returncode, 0, second.stderr)
+
+    def test_review_body_over_github_limit_is_refused_with_exit_1(self):
+        payload = {
+            "body": "x" * 65_537,
+            "event": "COMMENT",
+            "comments": [],
+        }
+        (self.dir / "review.json").write_text(json.dumps(payload), encoding="utf-8")
+        done = self.run_cli("--diff", "pr.diff", "--payload", "review.json")
+        self.assertEqual(done.returncode, 1)
+        self.assertIn("65,536", done.stderr)
+
+        payload_folded = {
+            "body": "x" * 65_500,
+            "event": "COMMENT",
+            "comments": [{
+                "path": "outside.py",
+                "line": 99,
+                "side": "RIGHT",
+                "body": "y" * 50,
+            }],
+        }
+        (self.dir / "review.json").write_text(json.dumps(payload_folded), encoding="utf-8")
+        done_session = self.run_cli("--session", str(self.dir), "--payload", "review.json")
+        self.assertEqual(done_session.returncode, 1)
+        self.assertIn("65,536", done_session.stderr)
 
 
 class Snapping(unittest.TestCase):

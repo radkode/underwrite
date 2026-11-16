@@ -131,9 +131,13 @@ for, and everything you are worth is in what they did not.
 ## Phase 0: scope and ingest
 
 Resolve the target from the argument: a number is a PR, a name is a branch
-(`git diff main...<branch>`), empty means the working tree (`git diff`, falling back to
-`git diff HEAD~1`). If the working directory is not a repository, ask which one before
-anything else; every `git` and `gh` call below has to run inside it.
+(`git diff main...<branch>`), empty means the working tree (`git diff HEAD` when `HEAD`
+exists so staged and unstaged tracked changes are both included, or `git diff --cached`
+plus `git diff` on an unborn branch; untracked files are excluded, so name that up front).
+When the working tree is clean, offer reviewing the previous commit (`git diff HEAD~1`) as
+a named choice and never substitute it automatically. If the working directory is not a
+repository, ask which one before anything else; every `git` and `gh` call below has to run
+inside it.
 
 **A PR session must bootstrap from a clean trusted-base controller checkout.** If the
 current checkout is the PR head or contains its changes, stop and tell the reviewer to
@@ -197,7 +201,6 @@ For a PR, initialize the store and capture its exact base and head before starti
 contextual reads:
 
 ```bash
-mkdir -p "$R"
 $S/scripts/sessionctl.py init "$R"
 $S/scripts/sessionctl.py snapshot-pr "$R" <owner/repo> <n> --controller-root "$PWD"
 ```
@@ -610,16 +613,16 @@ still sees it, and a question can raise it again. A no on whether a senior engin
 stop does not demote it: write the flag with `second_read: {verdict: "confirmed",
 evidence}` and put that doubt in the evidence, because what is worth stopping for is the
 reviewer's call. Otherwise the evidence is the settling line. Either way it is at most 25
-words. The eval set settled this: a read that also demoted on worth demoted the one
-real defect in `underwrite-83-legacy-guard`. A stored flag cannot be demoted by a
+words. Demoting on worth was tried and removed: it hid a real defect the reviewer
+needed to see. A stored flag cannot be demoted by a
 rewrite, which is why the read comes first. Where the harness has no subagent tool, write
 the flag with `second_read: {verdict: "unread", evidence}` naming why, so the page says
 it was not read twice.
 
 **Persist the beat in the same turn you present it.** Not at the end. Send the complete
-beat object, `proof_kind` included, to `$S/scripts/sessionctl.py put-beat "$R" -`, then
-patch `cursor` through `patch-session`. Read an existing document only through
-`get-session` or `get-beat`.
+beat object, `proof_kind` included, to `$S/scripts/sessionctl.py put-beat "$R" -`, which
+advances `current_beat` for a new beat, then patch `cursor` through `patch-session`. Read
+an existing document only through `get-session` or `get-beat`.
 Real reviews get interrupted, and a walk that stops should lose nothing it already found.
 The renderer reports a mismatch between `cursor` and the beats the store contains.
 Lead each terminal handoff with the current recommendation and the count of decisions
@@ -662,7 +665,8 @@ $S/scripts/sessionctl.py apply "$R" <seq> application.json
 ```
 
 `application.json` is `{result, session, beats}`. `result` names the absolute outcome,
-for example `{"kind":"walk","current_beat":6,"skipped_tiers":[]}`. `session` is the
+for example `{"kind":"walk","current_beat":6,"skipped_tiers":[]}`, and the store writes
+`current_beat` and `skipped_tiers` from it into the session. `session` is the
 complete resulting session object read through `get-session`, and `beats` contains only
 new beat objects first presented by that move. Navigation cannot replace an existing
 beat; reviewer-owned state would otherwise be vulnerable to a stale snapshot.
@@ -1140,7 +1144,7 @@ re-publish the updated artifact; otherwise make the publishing offer above now.
 ## Session state
 
 `~/.claude/reviews/<owner>-<repo>-pr<N>/` (`-<branch>` when there is no PR). Outside every
-repo, so it never shows up in `git status`. `mkdir -p` it on first write. When
+repo, so it never shows up in `git status`. `sessionctl.py init` creates it. When
 `UNDERWRITE_REVIEWS` is set, it replaces `~/.claude/reviews` everywhere in this skill; the
 eval runner points it at a scratch directory.
 
