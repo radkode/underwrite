@@ -345,7 +345,10 @@ replacement is required, without causing another effect.
 `sessionctl.py stats ~/.claude/reviews` is the noise ledger. For every stored session and
 in total it counts beats, flags raised, flags still open, accepted, decided, dropped by
 reason, unverified beats and their share, flags a second read confirmed or disputed, and
-questions asked. A drop recorded before reasons existed counts as unstated. It reads each
+questions asked, plus the dropped share of settled flags. A drop recorded before reasons
+existed counts as unstated. A round that a replacement superseded is marked with its
+successors; its counts stay its own, since a replacement carries earlier findings as notes
+beside its own beats, never as beats the ledger counts again. It reads each
 session from a backup copy, so counting never upgrades an old session in place. Read it
 before and after a change to the skill: a change that raises the dropped share is a
 regression even when it finds more.
@@ -377,16 +380,24 @@ audience, and eval mode delivers nothing.
 ```bash
 python3 evals/run.py                         # every case
 python3 evals/run.py underwrite-83-legacy-guard --keep --max-budget-usd 3
+python3 evals/run.py --runs 3                # each case three times
 ```
 
 A case passes when every expected finding is found, by place and by the keywords of its class,
-and nothing else stands. `--baseline evals/baseline.json` fails only on a regression: a case
+and nothing else stands. A flag that cites several sites counts at any of them. A case may also
+list `acceptable` findings: a fair question a reviewer could keep, which neither satisfies an
+expected finding nor counts as a false alarm; each one excuses one flag. Walks are not
+deterministic, so `--runs N` walks each case N times; it passes on a majority and its counts
+are the median of its scored runs. A run that does not pass keeps its transcript and session,
+the report records the skill commit and settings it ran with, and `--work-root` collects both
+with a `report.json`. `--baseline evals/baseline.json` fails only on a regression: a case
 that passed and now fails, or more misses or false alarms than the committed baseline. Keep a
 change to `SKILL.md` only when it passes that, and commit a new baseline when it improves. The
 `evals` workflow runs this on pull requests that touch the skill or the evals, but only once
-an `ANTHROPIC_API_KEY` secret is set, because each run spends model budget; CI checks the cases
-and the scorer either way. `--bare` keeps hooks and personal instructions
-out of the run and needs `ANTHROPIC_API_KEY`. `docs/misses.md` records what each miss lacked.
+an `ANTHROPIC_API_KEY` secret is set, because each run spends model budget, and uploads every
+walk that did not pass; CI checks the cases and the scorer either way. `--bare` keeps hooks and personal
+instructions out of the run and needs `ANTHROPIC_API_KEY`. `docs/misses.md` records what each
+miss lacked. The skill never names a case: a prompt that knows the answer scores nothing.
 
 ## License
 

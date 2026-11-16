@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Score one finished walk against an eval case: did it flag what mattered, and nothing else."""
 
+import hashlib
 import json
 import sqlite3
 import sys
@@ -10,7 +11,7 @@ SCRIPTS = Path(__file__).resolve().parent.parent / "skills" / "underwrite" / "sc
 if str(SCRIPTS) not in sys.path:
     sys.path.insert(0, str(SCRIPTS))
 
-from diff_lines import LOCATION_LINE  # noqa: E402
+from diff_lines import LOCATION_LINE, parse_diff, resolve_path  # noqa: E402
 from session_store import FLAG_STATES, SessionStore  # noqa: E402
 
 # A dropped flag was put in front of the reviewer and refused, so it no longer stands.
@@ -58,25 +59,81 @@ def case_problems(case):
         problems.append("a miss case names what the walk should have flagged")
     if case["kind"] == "clean" and expected:
         problems.append("a clean case expects no finding")
-    for item in expected:
-        if not (
-            isinstance(item, dict)
-            and isinstance(item.get("path"), str)
-            and isinstance(item.get("lines"), list)
-            and item["lines"]
-            and all(isinstance(n, int) and n > 0 for n in item["lines"])
-            and isinstance(item.get("class"), str)
-            and isinstance(item.get("keywords"), list)
-            and item["keywords"]
-            and all(isinstance(k, str) and k.strip() for k in item["keywords"])
-        ):
-            problems.append("each expected finding has path, lines, class and keywords")
+    acceptable = case.get("acceptable", [])
+    if not isinstance(acceptable, list):
+        return problems + ["acceptable must be a list"]
+    for field, items in (("expected", expected), ("acceptable", acceptable)):
+        for item in items:
+            if not finding_shape(item):
+                problems.append(f"each {field} finding has path, lines, class and keywords")
     return problems
 
 
-def cited(where):
-    match = LOCATION_LINE.match(str(where or "").strip())
-    return (match["path"], int(match["line"])) if match else (None, None)
+def finding_shape(item):
+    return (
+        isinstance(item, dict)
+        and isinstance(item.get("path"), str)
+        and isinstance(item.get("lines"), list)
+        and item["lines"]
+        and all(isinstance(n, int) and n > 0 for n in item["lines"])
+        and isinstance(item.get("class"), str)
+        and isinstance(item.get("keywords"), list)
+        and item["keywords"]
+        and all(isinstance(k, str) and k.strip() for k in item["keywords"])
+    )
+
+
+def citations(where, paths):
+    """Every diff location a `where` names, read the way the store reads a flag's anchor: the
+    whole string when it resolves to a frozen path, so a path with a space survives, and
+    otherwise each token, so `a.py:907 and a.py:1550` cites both lines. Surrounding
+    punctuation is shed only when the text as written does not resolve."""
+    text = str(where or "").strip()
+
+    def located(candidate):
+        for form in (candidate.rstrip(",;+\u00b7"), candidate.lstrip("(").rstrip(".),;+\u00b7")):
+            match = LOCATION_LINE.match(form)
+            path = resolve_path(match["path"], paths) if match else None
+            if path:
+                return path, int(match["line"])
+        return None
+
+    whole = located(text)
+    if whole:
+        return [whole]
+    return [found for found in map(located, text.split(" ")) if found]
+
+
+def frozen_paths(root, target):
+    """The paths of the frozen diff, read only once its size and digest match the target."""
+    try:
+        data = (Path(root) / "pr.diff").read_bytes()
+    except OSError as error:
+        raise CaseError(f"the session has no frozen diff: {error}") from error
+    if len(data) != target.get("diff_bytes") or hashlib.sha256(data).hexdigest() != target.get("diff_sha256"):
+        raise CaseError("the session's frozen diff does not match its target")
+    return sorted(parse_diff(data.decode("utf-8", "replace")))
+
+
+def assign(items, beats, paths):
+    """The largest one-to-one pairing of findings to flags that match them, so which flag
+    answers which finding never depends on the order the case lists them in."""
+    owner = {}
+
+    def claim(i, seen):
+        for beat in beats:
+            n = beat["n"]
+            if n in seen or not matches(items[i], beat, paths):
+                continue
+            seen.add(n)
+            if n not in owner or claim(owner[n], seen):
+                owner[n] = i
+                return True
+        return False
+
+    for i in range(len(items)):
+        claim(i, set())
+    return {i: n for n, i in owner.items()}
 
 
 def words(beat):
@@ -84,13 +141,14 @@ def words(beat):
     return " ".join(str(v) for v in (beat.get("claim"), *slots.values()) if v).lower()
 
 
-def matches(item, beat):
+def matches(item, beat, paths):
     """Near the defect and about it: the flag's own words name at least one of the class's
     keywords, so a different finding that happens to sit close by earns nothing."""
-    path, line = cited(beat.get("where"))
-    if path is None or not (path == item["path"] or item["path"].endswith("/" + path)):
-        return False
-    if not any(abs(line - n) <= WINDOW for n in item["lines"]):
+    near = any(
+        path == item["path"] and any(abs(line - n) <= WINDOW for n in item["lines"])
+        for path, line in citations(beat.get("where"), paths)
+    )
+    if not near:
         return False
     text = words(beat)
     return any(keyword.lower() in text for keyword in item["keywords"])
@@ -106,27 +164,27 @@ def score(case, session_root):
         target.get("repo"), target.get("number"), target.get("base_sha"), target.get("head_sha")
     ) != (case["repo"], case["number"], case["base_sha"], case["head_sha"]):
         raise CaseError("the session did not walk this case's pull request, base and head")
+    paths = frozen_paths(session_root, target)
     standing = [beat for beat in beats if beat.get("state") in STANDING_STATES]
     demoted = [
         beat for beat in beats
         if (beat.get("second_read") or {}).get("verdict") == "disputed"
     ]
-    found, missed, used = [], [], set()
-    for item in case["expected"]:
-        hit = next(
-            (b for b in standing if b["n"] not in used and matches(item, b)),
-            None,
-        )
-        if hit:
-            used.add(hit["n"])
-            found.append(dict(item, beat=hit["n"]))
+    expected = list(case["expected"])
+    hits = assign(expected, standing, paths)
+    found = [dict(item, beat=hits[i]) for i, item in enumerate(expected) if i in hits]
+    missed = [item for i, item in enumerate(expected) if i not in hits]
+    rest = [beat for beat in standing if beat["n"] not in hits.values()]
+    acceptable = list(case.get("acceptable", ()))
+    excused = assign(acceptable, rest, paths)
+    classes = {n: acceptable[i]["class"] for i, n in excused.items()}
+    false_alarms, accepted_alternates = [], []
+    for beat in rest:
+        entry = {"n": beat["n"], "where": beat.get("where"), "claim": beat.get("claim")}
+        if beat["n"] in classes:
+            accepted_alternates.append(dict(entry, **{"class": classes[beat["n"]]}))
         else:
-            missed.append(item)
-    false_alarms = [
-        {"n": beat["n"], "where": beat.get("where"), "claim": beat.get("claim")}
-        for beat in standing
-        if beat["n"] not in used
-    ]
+            false_alarms.append(entry)
     # A recommendation is written provisionally before the walk, so only the marker eval mode
     # writes last says the walk reached its end.
     finished = (
@@ -142,6 +200,7 @@ def score(case, session_root):
         "demoted": len(demoted),
         "found": found,
         "missed": missed,
+        "acceptable": accepted_alternates,
         "false_alarms": false_alarms,
         "finished": finished,
         "pass": finished and not missed and not false_alarms,
