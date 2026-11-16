@@ -206,10 +206,10 @@ class ReviewModeContract(unittest.TestCase):
         self.assertIn("post `decide`", decision_rule)
 
     def test_review_delivery_has_a_final_validation_and_publish_step(self):
-        text = self.skill()
+        text = " ".join(self.skill().split())
         self.assertIn("render-report.py $R --final", text)
-        self.assertIn("shared entry is added to `lands[]` only once", text)
-        self.assertIn("re-render the report", text)
+        self.assertIn("one shared `lands[]` entry, atomically", text)
+        self.assertIn("Pending or failed deliveries are not final", text)
         self.assertIn("re-publish the updated artifact", text)
 
     def test_the_audience_shape_is_explicit(self):
@@ -353,7 +353,7 @@ class DelegatedActionContract(unittest.TestCase):
         self.assertIn("$S/scripts/render-report.py $R --final", text)
         self.assertIn("pending and failed delivery are valid live states", text)
         self.assertIn("They are never shippable final states", text)
-        self.assertIn("Never mark an unknown outcome failed", text)
+        self.assertIn("An unknown outcome must never be marked failed", text)
 
     def test_readme_describes_delegated_actions(self):
         text = README.read_text(encoding="utf-8")
@@ -393,8 +393,8 @@ class ReportModeContract(unittest.TestCase):
         text = self.skill()
 
         self.assertNotIn("A 422 here means the audience call was wrong upstream", text)
-        self.assertIn("A 422 is ambiguous", text)
-        self.assertIn("stable marker and exact frozen head", text)
+        self.assertIn("Transport failures, 5xx, and 422 are uncertain", text)
+        self.assertIn("Never blindly post twice or infer a new audience from a 422", text)
         self.assertIn("author cannot approve their own PR", text)
 
 
@@ -477,26 +477,71 @@ class FrozenSnapshotContract(unittest.TestCase):
         self.assertIn("Never invoke it as review authorization", text)
         self.assertNotIn('check-worktree "$R" "$PWD"', text)
 
-    def test_review_validation_and_delivery_share_the_frozen_head(self):
-        text = self.skill()
-        start = text.index("**Review mode.**")
-        rule = text[start:]
+    def review_rule(self):
+        return self.skill().split("**Review mode.**", 1)[1].split("## Session state", 1)[0]
 
-        self.assertIn('"commit_id": "<frozen target.head_sha>"', rule)
-        self.assertIn('validate-anchors.py --session "$R"', rule)
+    def test_review_prepares_previews_and_approves_the_intent_before_submission(self):
+        rule = self.review_rule()
+        prose = " ".join(rule.split())
+        prepare = rule.index('prepare-review "$R"')
+        preview = rule.index("Show the preview:")
         approval = rule.index("one explicit yes")
-        preflight = rule.index('check-pr "$R" --require-open')
-        post = rule.index("pulls/<n>/reviews --method POST")
-        self.assertLess(approval, preflight)
-        self.assertLess(preflight, post)
-        self.assertIn('review-receipt "$R"', rule)
-        self.assertIn('--actor "$ACTOR"', rule)
-        self.assertIn("stable hidden delivery marker", rule)
-        self.assertIn("requires exactly one non-pending review", rule)
-        self.assertIn("`COMMENT`, `APPROVE`, or `REQUEST_CHANGES`", rule)
-        self.assertIn("`DISMISSED`\nproves the post happened", rule)
-        self.assertIn("Never match only `commit_id`", rule)
-        self.assertIn("posted but stale", rule)
+        submit = rule.index('submit-review "$R" --intent <intent-id>')
+        final = rule.index('render-report.py $R --final --standalone')
+
+        self.assertLess(prepare, preview)
+        self.assertLess(preview, approval)
+        self.assertLess(approval, submit)
+        self.assertLess(submit, final)
+        self.assertEqual(rule.count("one explicit yes"), 1)
+        self.assertIn('--body-file "$R/review-body.md"', rule)
+        self.assertIn('--comments-file "$R/review-comments.json"', rule)
+        self.assertIn('"1": {"path":', rule)
+        self.assertIn("exactly one entry per such beat, keyed by beat number", prose)
+        self.assertIn("event, covered beats, and the complete `$R/review.fixed.json` payload", prose)
+        self.assertIn("full frozen head to immutable payload bytes", prose)
+        self.assertIn("validates anchors against the hash-verified diff", prose)
+        self.assertIn("stable hidden delivery marker", prose)
+        self.assertNotIn("gh api", rule)
+        self.assertNotIn("review-receipt", rule)
+        self.assertNotIn('land "$R"', rule)
+        self.assertNotIn("validate-anchors.py", rule)
+        self.assertLess(len(rule.splitlines()), 100)
+
+    def test_review_submission_owns_verification_landing_and_reconciliation(self):
+        rule = self.review_rule()
+        prose = " ".join(rule.split())
+
+        self.assertIn("refuses changed preview bytes, runs `check-pr --require-open`", prose)
+        self.assertIn("marks the intent submitting before the POST", prose)
+        self.assertIn("authenticated actor, event/state, and comment count after folding", prose)
+        self.assertIn("lands exactly the intent's beats", prose)
+        self.assertIn("Beats accepted later stay pending", prose)
+        self.assertIn("Transport failures, 5xx, and 422 are uncertain", prose)
+        self.assertIn("reconciles every page of reviews", prose)
+        self.assertIn("more than one is a conflict", prose)
+        self.assertIn("Exit 3 leaves the intent submitting, not failed", prose)
+        self.assertIn("Repeat the same `submit-review` command to read again", prose)
+        self.assertIn("does not POST again without `--retry`", prose)
+        self.assertIn("repeat the read before seeking explicit approval for `--retry`", prose)
+        self.assertIn("`DISMISSED` records a receipt without landing", prose)
+        self.assertIn("definite other 4xx with no match records publication failure", prose)
+        self.assertIn("An unknown outcome must never be marked failed", prose)
+        self.assertNotIn("--paginate", rule)
+
+    def test_review_keeps_verdict_stale_receipt_and_page_publication_rules(self):
+        rule = self.review_rule()
+        prose = " ".join(rule.split())
+
+        self.assertIn("The verdict, approve versus request changes, is the reviewer's", prose)
+        self.assertIn("`COMMENT`, `APPROVE`, or `REQUEST_CHANGES`", prose)
+        self.assertIn("use `COMMENT` for self-review", prose)
+        self.assertLess(rule.index('submit-review "$R"'), rule.index('check-pr "$R"'))
+        self.assertIn("posted but stale", prose)
+        self.assertIn("preserve the durable receipt", prose)
+        self.assertIn("Do not retry the review", prose)
+        self.assertIn("replay its durable landing, not to create another review", prose)
+        self.assertIn("Publishing that page remains the separate opt-in above", prose)
 
 
 class DropReasons(unittest.TestCase):

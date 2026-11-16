@@ -1038,107 +1038,76 @@ or reconcile. Report mode does not create a GitHub effect and does not add a `la
 entry. `report.html` is a regenerable projection of the authoritative store, not a receipt
 and not a delivery target.
 
-**Review mode.** Build the payload at `$R/review.json`, never inside the repo being
-reviewed:
+**Review mode.** Write the review body to `$R/review-body.md` and per-beat comments to
+`$R/review-comments.json`, never inside the repo being reviewed. Use `sessionctl.py
+reconcile "$R"` to find the accepted beats still owed review delivery, including failed
+ones. The comments object must have exactly one entry per such beat, keyed by beat number:
 
 ```json
 {
-  "body": "...",
-  "commit_id": "<frozen target.head_sha>",
-  "event": "COMMENT",
-  "comments": [{"path": "src/auth/session.go", "line": 88, "side": "RIGHT", "body": "..."}]
+  "1": {"path": "src/auth/session.go", "line": 88, "side": "RIGHT", "body": "..."}
 }
 ```
 
 The verdict, approve versus request changes, is the reviewer's. Give your evidence-backed
-recommendation first, then ask for it. A pull request author cannot approve their own PR,
-so use `COMMENT` for self-review. Validate anchors
-before anything else, because GitHub rejects the whole review if one anchor is outside
-the diff:
+recommendation first, then ask for it. Use `COMMENT`, `APPROVE`, or `REQUEST_CHANGES` as
+chosen. A pull request author cannot approve their own PR, so use `COMMENT` for self-review.
+Prepare the store-owned intent:
 
 ```bash
-$S/scripts/validate-anchors.py --session "$R" --payload $R/review.json --out $R/review.fixed.json
+$S/scripts/sessionctl.py prepare-review "$R" --event COMMENT \
+  --body-file "$R/review-body.md" --comments-file "$R/review-comments.json"
 ```
 
-Exit 2 means anchors were snapped or folded into the body. Report what moved in one line
-and carry on; a bad anchor must never cost the session's work. Session mode reads and
-hashes the same diff bytes it validates, requires the payload's full `commit_id` to match
-the frozen head, requires a final `COMMENT`, `APPROVE`, or `REQUEST_CHANGES` event, and
-adds the session's stable hidden delivery marker to the body. Show the final payload and
-get one explicit yes. Recheck the open target after that yes,
-immediately before the only GitHub side effect:
+Preparation binds the covered beats and full frozen head to immutable payload bytes,
+validates anchors against the hash-verified diff, and adds the stable hidden delivery
+marker. It writes `$R/review.fixed.json` and returns the intent id, event, covered beats,
+anchor changes, and digest. Report snapped or folded anchors in one line. Show the preview:
+event, covered beats, and the complete `$R/review.fixed.json` payload. Get one explicit yes
+for that intent before submitting. If the reviewer changes it, prepare and preview again;
+`--replace` can replace only a never-posted prepared intent.
 
 ```bash
-set -e
-ACTOR=$(gh api user --jq .login)
-$S/scripts/sessionctl.py check-pr "$R" --require-open
-gh api repos/<owner>/<repo>/pulls/<n>/reviews --method POST \
-  --input "$R/review.fixed.json" > "$R/review-response.json"
-$S/scripts/sessionctl.py review-receipt "$R" "$R/review-response.json" \
-  --actor "$ACTOR"
+$S/scripts/sessionctl.py submit-review "$R" --intent <intent-id>
 ```
 
-`review-receipt` requires exactly one non-pending review with the frozen commit, stable
-delivery marker, and authenticated actor, then returns its URL. A transport failure or
-5xx has an unknown outcome. Reconcile every page of reviews before retrying:
+`submit-review` refuses changed preview bytes, runs `check-pr --require-open`, and durably
+marks the intent submitting before the POST. It verifies the frozen commit, marker,
+authenticated actor, event/state, and comment count after folding. A verified receipt
+lands exactly the intent's beats and adds one shared `lands[]` entry, atomically. Beats
+accepted later stay pending and need a separate approved intent. Never POST or land review
+beats by hand.
 
-```bash
-gh api --paginate --slurp repos/<owner>/<repo>/pulls/<n>/reviews \
-  > "$R/review-candidates.json"
-$S/scripts/sessionctl.py review-receipt "$R" "$R/review-candidates.json" \
-  --actor "$ACTOR"
-```
+Transport failures, 5xx, and 422 are uncertain. The command reconciles every page of
+reviews: one verified match lands, more than one is a conflict. Exit 3 leaves the intent
+submitting, not failed. Repeat the same `submit-review` command to read again; it does not
+POST again without `--retry`. Allow for API visibility and repeat the read before seeking
+explicit approval for `--retry`; retry only after reconciliation finds no review. A retry
+rechecks the open target. Never blindly post twice or infer a new audience from a 422.
+`DISMISSED` records a receipt without landing: stop for supervised handling and do not
+retry. A definite other 4xx with no match records publication failure for every covered
+beat, preserving the accepted findings. An unknown outcome must never be marked failed.
 
-One exact match proves the delivery landed. More than one is a conflict. No match is not
-permission to post immediately: allow for API visibility, repeat the read, then re-run the
-final target check and obtain approval before a retry. Never match only `commit_id` and
-never blindly post the review twice. The receipt includes the review state. `DISMISSED`
-proves the post happened but is no longer an active delivery: preserve that receipt, stop
-for supervised handling, and do not retry or mark the pending beats landed.
-
-Only after a response or reconciliation proves that no review was created, use
-`sessionctl.py reconcile "$R"` to list the pending `cause_seq` values, then record each
-definite publication failure with `sessionctl.py fail "$R" <cause_seq> '<failure>'
-'<owed>'`. The page will show Review publication failed while preserving the accepted
-finding. Never mark an unknown outcome failed. A later verified post can still land the
-same accepts.
-
-A 422 is ambiguous: GitHub uses it for validation failures and abuse limits. Reconcile by
-searching every review page for the stable marker and exact frozen head. If one exact match
-is not established, preserve the pending delivery and stop for supervised handling. Do
-not infer that the audience is wrong, reclassify the session, downgrade the event, or
-blindly retry.
-
-Use the verified response's review URL. Write one land-entry JSON object with
-`state: landed`, what the review delivered, and that URL in `where`. Run
-`sessionctl.py reconcile "$R"` to obtain each pending accepted beat's `beat_n` and
-`cause_seq`, then record the same URL for each:
-
-```bash
-$S/scripts/sessionctl.py land "$R" <cause_seq> <beat_n> <review-url> \
-  --kind review --entry review-land.json
-```
-
-The shared entry is added to `lands[]` only once. Persist the outcome, review URL, and
-`status` as one `patch-session` object. Once that observed external effect is recorded,
-run `check-pr` again. Exit 2 now means the review was posted to the frozen commit but the
-PR moved during submission. Report it as posted but stale and stop before any new effect;
-never discard the durable landing receipt.
+After landing, persist the outcome, review URL, and `status` as one `patch-session` object.
+Recheck the target after posting:
 
 ```bash
 $S/scripts/sessionctl.py check-pr "$R"
 ```
 
-Then re-render the report with final delivery checks:
+Exit 2 now means posted but stale: report that the PR moved during submission, preserve
+the durable receipt, and stop before any new effect. Do not retry the review. Then render
+with final delivery checks:
 
 ```bash
 $S/scripts/render-report.py $R --final --standalone
 ```
 
-Exit 2 now means the review posted but its write-back is incomplete. Repair it through
-the idempotent `land` and `patch-session` commands, then run the render again. Once it
-passes, report the updated local file, which is the page the reviewer keeps with the review
-URL and What lands. If the reviewer already agreed to publish an earlier render,
+If write-back was interrupted, repeat `submit-review` for the same intent to reconcile or
+replay its durable landing, not to create another review. Repair session metadata through
+`patch-session` and render again. Pending or failed deliveries are not final. Once it
+passes, report the review URL and updated local page. Publishing that page remains the
+separate opt-in above. If the reviewer already agreed to publish an earlier render,
 re-publish the updated artifact; otherwise make the publishing offer above now.
 
 ## Session state
