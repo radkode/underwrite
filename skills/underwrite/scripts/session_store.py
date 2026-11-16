@@ -2884,7 +2884,7 @@ class SessionStore:
                 db.close()
         if row is None:
             raise Conflict("linked child database has no session")
-        if version != DB_SCHEMA_VERSION or row[1] != SCHEMA_VERSION:
+        if version not in range(1, DB_SCHEMA_VERSION + 1) or row[1] != SCHEMA_VERSION:
             raise Conflict("linked child database has an unsupported version")
         try:
             body = json.loads(row[2])
@@ -5230,6 +5230,17 @@ class SessionStore:
             ]
 
     def prepare_review(self, event, body, comments, *, replace=False):
+        with self._session_lock():
+            intent_doc, payload_bytes = self._prepare_review(
+                event, body, comments, replace=replace
+            )
+            payload_path = self.root / REVIEW_FIXED_FILE
+            if intent_doc["state"] != "submitting" or not os.path.lexists(payload_path):
+                _atomic_write(payload_path, payload_bytes)
+            intent_doc["payload_file"] = str(payload_path)
+            return intent_doc
+
+    def _prepare_review(self, event, body, comments, *, replace):
         if event not in REVIEW_EVENTS:
             raise StoreError(
                 f"review event must be one of {', '.join(REVIEW_EVENTS)}"
@@ -5239,7 +5250,7 @@ class SessionStore:
         parsed_comments = self._review_comments_input(comments)
         va = _validate_anchors()
 
-        with self._first_work_write() as db:
+        with self._write() as db:
             session_row = self._session_row(db)
             session, execution_policy = self._session_execution_policy(db)
             if self._expected_delivery_kind(session) != "review":
@@ -5314,10 +5325,7 @@ class SessionStore:
                     and active["payload_sha256"] == payload_sha256
                     and active_beats == covered
                 ):
-                    intent_doc = self._review_intent_document(active)
-                    _atomic_write(self.root / REVIEW_FIXED_FILE, payload_bytes)
-                    intent_doc["payload_file"] = str(self.root / REVIEW_FIXED_FILE)
-                    return intent_doc
+                    return self._review_intent_document(active), payload_bytes
                 if not replace:
                     raise Conflict(
                         f"non-terminal review intent {active['intent_id']} is already "
@@ -5362,10 +5370,7 @@ class SessionStore:
                 ),
             )
             row = self._review_intent_row(db, intent_id)
-            intent_doc = self._review_intent_document(row)
-            _atomic_write(self.root / REVIEW_FIXED_FILE, payload_bytes)
-            intent_doc["payload_file"] = str(self.root / REVIEW_FIXED_FILE)
-            return intent_doc
+            return self._review_intent_document(row), payload_bytes
 
     def land_intent(self, intent_id, review_url, entry=None):
         if not isinstance(review_url, str) or not review_url.strip():
@@ -5537,7 +5542,9 @@ class SessionStore:
             expected_sha256 = row["payload_sha256"]
         payload_path = self.root / REVIEW_FIXED_FILE
         try:
-            disk = payload_path.read_bytes()
+            disk = _bounded_file_bytes(
+                payload_path, len(expected), REVIEW_FIXED_FILE, mismatch_on_size=True
+            )
         except OSError as error:
             raise Conflict(
                 f"could not read {REVIEW_FIXED_FILE} for review intent {intent_id}: {error}"

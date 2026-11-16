@@ -4067,6 +4067,29 @@ class LinkedImplementations(unittest.TestCase):
             )
             self.assertEqual(db.execute("SELECT * FROM beats WHERE n = 1").fetchone(), beat_before)
 
+    def test_v8_linked_child_upgrades_on_create_replay_and_link_completion(self):
+        link = self.authorize()
+        created = self.source.create_linked_implementation(link["link_id"])
+        database = Path(created["child_root"]) / "session.sqlite3"
+        for operation in ("create", "complete"):
+            with self.subTest(operation=operation):
+                with connected(str(database)) as db:
+                    db.execute("PRAGMA user_version = 8")
+                if operation == "create":
+                    self.assertEqual(
+                        self.source.create_linked_implementation(link["link_id"]), created
+                    )
+                else:
+                    ready = self.source.complete_implementation_link(
+                        link["link_id"], created["child_session_id"]
+                    )
+                    self.assertEqual(ready["state"], "ready")
+                with connected(str(database)) as db:
+                    self.assertEqual(
+                        db.execute("PRAGMA user_version").fetchone()[0],
+                        session_store.DB_SCHEMA_VERSION,
+                    )
+
     def test_create_is_recoverable_and_seeds_one_immutable_gateway_child(self):
         link = self.authorize()
         with connected(str(self.source_root / "session.sqlite3")) as db:
@@ -4997,6 +5020,99 @@ class ReviewIntents(unittest.TestCase):
         )
         self.assertTrue(payload["body"].startswith("Review summary\n\n`outside.py:99` Folds into body."))
         self.assertTrue(payload["body"].endswith("\n\n" + marker))
+
+    def test_prepare_review_writes_preview_only_after_commit(self):
+        self.accept(1)
+        prepared = self.store.prepare_review("COMMENT", "First", {"1": self.comment()})
+        preview = self.root / "review.fixed.json"
+        original = preview.read_bytes()
+        connect = self.store._connect
+
+        def fail_commit():
+            db = connect()
+            proxy = mock.Mock(wraps=db)
+
+            def execute(sql, *args):
+                if sql == "COMMIT":
+                    raise sqlite3.OperationalError("injected commit failure")
+                return db.execute(sql, *args)
+
+            proxy.execute.side_effect = execute
+            return proxy
+
+        with (
+            mock.patch.object(self.store, "_connect", side_effect=fail_commit),
+            mock.patch.object(session_store, "_atomic_write") as write,
+            self.assertRaisesRegex(sqlite3.OperationalError, "injected commit failure"),
+        ):
+            self.store.prepare_review("COMMENT", "Replacement", {"1": self.comment()}, replace=True)
+        write.assert_not_called()
+        self.assertEqual(preview.read_bytes(), original)
+        self.assertEqual(self.store.review_intents(), [self.store.review_intent(prepared["intent_id"])])
+        self.assertEqual(self.store.review_intent(prepared["intent_id"])["state"], "prepared")
+
+        atomic_write = session_store._atomic_write
+        observed_states = []
+
+        def check_commit(path, payload):
+            with connected(str(self.root / "session.sqlite3")) as db:
+                observed_states.extend(db.execute(
+                    "SELECT state FROM review_intents ORDER BY rowid"
+                ).fetchall())
+            atomic_write(path, payload)
+
+        with mock.patch.object(session_store, "_atomic_write", side_effect=check_commit):
+            self.store.prepare_review("COMMENT", "Replacement", {"1": self.comment()}, replace=True)
+        self.assertEqual(observed_states, [("replaced",), ("prepared",)])
+        self.assertNotEqual(preview.read_bytes(), original)
+
+    def test_prepare_review_preserves_submitting_preview_unless_missing(self):
+        self.accept(1)
+        prepared = self.store.prepare_review("COMMENT", "Summary", {"1": self.comment()})
+        with self.store.review_submission_lock():
+            self.store.begin_submit_intent(prepared["intent_id"])
+        preview = self.root / "review.fixed.json"
+        payload = preview.read_bytes()
+        for changed in (False, True):
+            with self.subTest(changed=changed):
+                if changed:
+                    preview.write_bytes(payload.replace(b"Summary", b"Changed"))
+                before = preview.stat()
+                with mock.patch.object(session_store, "_atomic_write") as write:
+                    replay = self.store.prepare_review("COMMENT", "Summary", {"1": self.comment()})
+                self.assertEqual(replay["state"], "submitting")
+                write.assert_not_called()
+                self.assertEqual(preview.stat(), before)
+        preview.unlink()
+        self.store.prepare_review("COMMENT", "Summary", {"1": self.comment()})
+        self.assertEqual(preview.read_bytes(), payload)
+        preview.unlink()
+        preview.symlink_to(self.root / "missing.json")
+        self.store.prepare_review("COMMENT", "Summary", {"1": self.comment()})
+        self.assertTrue(preview.is_symlink())
+
+    def test_verify_intent_payload_file_refuses_unsafe_or_unbounded_files(self):
+        self.accept(1)
+        prepared = self.store.prepare_review("COMMENT", "Summary", {"1": self.comment()})
+        preview = self.root / "review.fixed.json"
+        payload = preview.read_bytes()
+        other = self.root / "other.json"
+        other.write_bytes(payload)
+        for kind in ("symlink", "hardlink", "fifo", "oversized"):
+            with self.subTest(kind=kind):
+                preview.unlink()
+                if kind == "symlink":
+                    preview.symlink_to(other)
+                elif kind == "hardlink":
+                    os.link(other, preview)
+                elif kind == "fifo":
+                    os.mkfifo(preview)
+                else:
+                    preview.write_bytes(payload + b" " * 100_000)
+                with self.assertRaises(session_store.Conflict):
+                    self.store.verify_intent_payload_file(prepared["intent_id"])
+        preview.write_bytes(payload)
+        self.assertEqual(self.store.verify_intent_payload_file(prepared["intent_id"]), payload)
 
     def test_prepare_review_requires_exact_pending_accepted_beat_coverage(self):
         self.accept(1)
