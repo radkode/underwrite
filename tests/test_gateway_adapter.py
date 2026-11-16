@@ -6,6 +6,7 @@ import hashlib
 import io
 import json
 import os
+import shutil
 import stat
 import sys
 import tempfile
@@ -111,7 +112,11 @@ class GatewayAdapterCase(unittest.TestCase):
         }
 
     def configuration_value(self):
-        executable = "/usr/bin/true"
+        # Resolved: on Ubuntu 26.04 `true` is a symlink to the coreutils multi-call binary.
+        found = shutil.which("true")
+        if found is None:
+            self.skipTest("needs a `true` executable on PATH")
+        executable = str(Path(found).resolve())
         return {
             "version": 1,
             "privateKey": str(self.private_key),

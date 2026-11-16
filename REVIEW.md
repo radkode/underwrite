@@ -35,8 +35,8 @@ and the walk plan.
 ## What counts as evidence
 
 - A named unittest run: `python -m unittest discover -s tests -p '<file>'`, and the CI
-  matrix (Python 3.9 and 3.14) green on the exact head under review.
-- Stdlib only. A new third-party import fails the 3.9 job and the plugin's install story.
+  matrix (Python 3.11 and 3.15) green on the exact head under review.
+- Stdlib only. A new third-party import fails the CI jobs and the plugin's install story.
 - For anything the page shows, a cold read of a rendered session, not a screenshot
   judged for design.
 - For skill or README prose, the `test_skill.py` assertion that pins it.
