@@ -277,6 +277,8 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
 }
 .count.is-clean    { border-top-color: var(--clean); }
 .count.is-clean .n { color: var(--clean); }
+.count.is-unver    { border-top-color: var(--unver); }
+.count.is-unver .n { color: var(--unver); }
 .count.is-flag     { border-top-color: var(--flag); }
 .count.is-flag .n  { color: var(--flag); }
 .count.is-acc      { border-top-color: var(--accepted); }
@@ -969,9 +971,8 @@ footer {
 @media (max-width: 620px) {
   .bar { flex-wrap: wrap; gap: 8px 12px; }
   .bar .live { flex-basis: 100%; order: 3; }
-  /* Five tiles in two columns leave one alone; the total takes the whole row. */
+  /* Six tiles in two columns make three full rows. */
   .counts { grid-template-columns: 1fr 1fr; }
-  .count:last-child { grid-column: 1 / -1; }
   .sec-head { flex-wrap: wrap; }
   .sec-head .hint { margin-left: 0; flex-basis: 100%; }
   .beat > summary { grid-template-columns: 26px minmax(0, 1fr); }
