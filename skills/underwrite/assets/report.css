@@ -277,6 +277,8 @@ h1 .num { color: var(--ink-3); font-variant-numeric: tabular-nums; }
 }
 .count.is-clean    { border-top-color: var(--clean); }
 .count.is-clean .n { color: var(--clean); }
+.count.is-unver    { border-top-color: var(--unver); }
+.count.is-unver .n { color: var(--unver); }
 .count.is-flag     { border-top-color: var(--flag); }
 .count.is-flag .n  { color: var(--flag); }
 .count.is-acc      { border-top-color: var(--accepted); }

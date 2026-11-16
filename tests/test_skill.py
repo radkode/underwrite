@@ -160,17 +160,24 @@ class CleanMeansChecked(unittest.TestCase):
 
     def test_the_walk_parks_only_where_the_verdict_asks(self):
         text = self.skill()
-        self.assertIn("A `FLAG` or `UNVERIFIED` beat stops and waits for the reviewer", text)
-        self.assertIn("Moving past a clean beat", text)
+        self.assertIn("A `FLAG` beat stops and waits for the reviewer", text)
+        self.assertIn("`CLEAN` and `UNVERIFIED` beats do not", text)
+        self.assertIn("Moving past a clean or unverified beat", text)
         self.assertIn("`seq` above `handled_seq` means an action is queued", text)
         self.assertNotIn("One beat per turn", text)
         self.assertNotIn("One beat per turn", self.readme())
-        self.assertIn("Clean beats land on the page and the walk moves on", self.readme())
+        self.assertIn("stops only where it needs a decision from you: a flag", self.readme())
+        self.assertIn("land on the page and the walk moves on", self.readme())
         # the older instructions that parked after every beat, found by the #100 review
         self.assertNotIn("present the beat, then park.", text)
         self.assertNotIn("Advance only when the reviewer asks to move on.", text)
         self.assertNotIn("parks on the server between beats", self.readme())
-        self.assertIn("past a `CLEAN` beat, advance on your own", text)
+        self.assertIn("past a `CLEAN` or `UNVERIFIED` beat, advance on your own", text)
+        # a read-only beat asks for reading, not a decision, so nothing parks on it
+        self.assertNotIn("`FLAG` or `UNVERIFIED` beat stops", text)
+        self.assertNotIn("park on a `FLAG` or `UNVERIFIED`", text)
+        self.assertNotIn("Past a `FLAG` or `UNVERIFIED` beat", text)
+        self.assertNotIn("every flag and unverified beat", self.readme())
 
     def test_next_is_walk_global_because_the_page_sends_no_beat_number(self):
         text = self.skill()

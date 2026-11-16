@@ -57,7 +57,8 @@ STATE_STYLE = {
 SECTIONS = (
     ("Decisions owed", "out of item order, on purpose", ("flag",), True),
     ("Decided", "your call, and what came of it", ("accepted", "decided"), True),
-    ("Read and clean", "nothing owed, proof on each", ("clean", "unverified"), False),
+    ("Read, not run", "nothing owed; this is where your own reading goes", ("unverified",), False),
+    ("Checked", "a run backs each one", ("clean",), False),
     ("Dropped", "raised, then set aside", ("dropped",), False),
 )
 
@@ -1485,9 +1486,10 @@ def body_html(
     for beat in beats:
         counts[beat.get("state")] = counts.get(beat.get("state"), 0) + 1
 
-    # One tile per section, so the first four always sum to the last.
+    # One tile per section, so the first five always sum to the last.
     tiles = [
-        ("is-clean", counts.get("clean", 0) + counts.get("unverified", 0), "clean"),
+        ("is-clean", counts.get("clean", 0), "checked"),
+        ("is-unver", counts.get("unverified", 0), "read, not run"),
         ("is-flag", counts.get("flag", 0), "decisions owed"),
         ("is-acc", counts.get("accepted", 0) + counts.get("decided", 0), "decided"),
         ("is-drop", counts.get("dropped", 0), "dropped"),

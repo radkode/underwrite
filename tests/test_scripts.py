@@ -357,26 +357,29 @@ class ReportOrdering(unittest.TestCase):
     def render(self, beats):
         return rr.render({"repo": "acme/widget", "number": 42}, beats, "", {})
 
-    def test_sections_run_flags_then_accepted_then_clean_then_dropped(self):
+    def test_sections_run_flags_then_accepted_then_read_then_checked_then_dropped(self):
         html = self.render(
             [
                 beat(n=1, state="dropped"),
                 beat(n=2, state="clean"),
                 beat(n=3, state="accepted"),
                 beat(n=4, state="flag", slots={"what": "x", "risk": "r", "fix": "f"}),
+                beat(n=5, state="unverified"),
             ]
         )
         order = [
             html.index("<h2>Decisions owed</h2>"),
             html.index("<h2>Decided</h2>"),
-            html.index("Read and clean"),
+            html.index("<h2>Read, not run</h2>"),
+            html.index("<h2>Checked</h2>"),
             html.index("Dropped"),
         ]
         self.assertEqual(order, sorted(order))
 
     def test_empty_sections_are_omitted(self):
         html = self.render([beat(n=1, state="clean")])
-        self.assertIn("Read and clean", html)
+        self.assertIn("<h2>Checked</h2>", html)
+        self.assertNotIn("<h2>Read, not run</h2>", html)
         self.assertNotIn("<h2>Decisions owed</h2>", html)
         self.assertNotIn("Dropped", html)
 
@@ -388,9 +391,13 @@ class ReportOrdering(unittest.TestCase):
         self.assertRegex(flag, r'<details class="beat s-flag"[^>]*\sopen[\s>]')
         self.assertNotRegex(clean, r'<details class="beat s-clean"[^>]*\sopen[\s>]')
 
-    def test_unverified_beats_count_as_clean_in_the_tiles(self):
+    def test_unverified_beats_are_never_counted_as_checked(self):
+        """The clean tile used to add unverified beats, so a walk where nothing ran read as
+        all clean."""
         html = self.render([beat(n=1, state="clean"), beat(n=2, state="unverified")])
-        self.assertRegex(html, r'<div class="count is-clean"[^>]*>\s*<span class="n">2</span>')
+        self.assertRegex(html, r'<div class="count is-clean"[^>]*>\s*<span class="n">1</span>\s*<span class="k">checked</span>')
+        self.assertRegex(html, r'<div class="count is-unver"[^>]*>\s*<span class="n">1</span>\s*<span class="k">read, not run</span>')
+        self.assertNotIn('<span class="k">clean</span>', html)
 
     def test_the_tiles_partition_every_walked_beat(self):
         """decided and dropped counted nowhere, so a walk with one recorded decision
@@ -406,7 +413,8 @@ class ReportOrdering(unittest.TestCase):
         tiles = re.findall(r'<div class="count (is-[a-z]+)"[^>]*>\s*<span class="n">(\d+)</span>', html)
         self.assertEqual(
             tiles,
-            [("is-clean", "2"), ("is-flag", "1"), ("is-acc", "2"), ("is-drop", "1"), ("is-mute", "6")],
+            [("is-clean", "1"), ("is-unver", "1"), ("is-flag", "1"), ("is-acc", "2"),
+             ("is-drop", "1"), ("is-mute", "6")],
         )
         self.assertEqual(sum(int(n) for _cls, n in tiles[:-1]), int(tiles[-1][1]))
 
