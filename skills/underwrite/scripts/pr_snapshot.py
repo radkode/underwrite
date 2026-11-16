@@ -12,11 +12,12 @@ import shutil
 import stat
 import subprocess
 import tempfile
+from collections import Counter
 from pathlib import Path
 from urllib.parse import urlsplit
 
-from session_store import Conflict, StoreError
 from diff_lines import HUNK, clean_path, parse_diff
+from session_store import Conflict, StoreError
 
 
 _REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
@@ -67,9 +68,10 @@ class ReviewSubmissionUncertain(Conflict):
 
 
 class ReviewApiError(SnapshotError):
-    def __init__(self, message, status=None):
+    def __init__(self, message, status=None, response=None):
         super().__init__(message)
         self.status = status
+        self.response = response
 
 
 class _UncleanController(SnapshotError):
@@ -1479,15 +1481,18 @@ def gh_runner(command, stdin=None, timeout=None):
             if found:
                 status = int(found.group(1))
                 break
-        if status is None and stdout_text:
+        response = None
+        if stdout_text:
             try:
                 parsed = json.loads(stdout_text)
-                if isinstance(parsed, dict) and str(parsed.get("status", "")).isdigit():
-                    status = int(parsed["status"])
+                if isinstance(parsed, dict):
+                    response = parsed
+                    if status is None and str(parsed.get("status", "")).isdigit():
+                        status = int(parsed["status"])
             except json.JSONDecodeError:
                 pass
         detail = stderr_text or stdout_text or f"exit {completed.returncode}"
-        raise ReviewApiError(f"{command[0]} failed: {detail}", status=status)
+        raise ReviewApiError(f"{command[0]} failed: {detail}", status=status, response=response)
     return completed.stdout
 
 
@@ -1546,7 +1551,7 @@ def _runner_actor(runner):
     return actor
 
 
-def _review_comment_count(runner, repo, number, review_id):
+def _review_comments(runner, repo, number, review_id):
     raw = _runner_json(
         runner,
         [
@@ -1558,7 +1563,7 @@ def _review_comment_count(runner, repo, number, review_id):
         ],
         description="review comments",
     )
-    return len(_flatten_pages(raw, "review comments"))
+    return _flatten_pages(raw, "review comments")
 
 
 def _verified_review_receipt(runner, target, marker, actor, intent, response):
@@ -1577,33 +1582,53 @@ def _verified_review_receipt(runner, target, marker, actor, intent, response):
         "url": url,
     }
     review_id = response.get("id")
-    if isinstance(review_id, bool) or not isinstance(review_id, int):
-        review_id = None
-    if review_id is not None:
-        receipt["review_id"] = review_id
-    if state == "DISMISSED":
+    if type(review_id) is not int or review_id <= 0:
+        raise SnapshotError("review response has no positive integer id to verify comments")
+    receipt["review_id"] = review_id
+    stored_id = intent.get("review_id")
+    if stored_id is not None and review_id != stored_id:
+        raise Conflict(f"review response id {review_id} does not match stored review id {stored_id}")
+    if state == "DISMISSED" and stored_id == review_id:
         return receipt
     expected_state = _EVENT_STATE[intent["event"]]
-    if state != expected_state:
+    if state not in (expected_state, "DISMISSED"):
         raise Conflict(
             f"review response state {state!r} does not match intent event "
             f"{intent['event']!r} (expected {expected_state!r})"
         )
-    if review_id is None:
-        raise SnapshotError("review response has no integer id to verify comments")
-    observed_comments = _review_comment_count(
+    observed_comments = _review_comments(
         runner, target["repo"], target["number"], review_id
     )
-    if observed_comments != intent["comment_count"]:
+    expected_comments = json.loads(intent["payload"])["comments"]
+    if len(observed_comments) != len(expected_comments):
         raise Conflict(
-            f"review {review_id} has {observed_comments} comment(s); "
-            f"intent {intent['intent_id']} expected {intent['comment_count']}"
+            f"review {review_id} has {len(observed_comments)} comment(s); "
+            f"intent {intent['intent_id']} expected {len(expected_comments)}"
         )
-    receipt["comment_count"] = observed_comments
+
+    def comment_key(comment):
+        values = tuple(comment.get(key) for key in ("path", "side", "line", "body"))
+        if (
+            not all(isinstance(value, str) for value in (values[0], values[1], values[3]))
+            or type(values[2]) is not int
+        ):
+            raise Conflict(f"review {review_id} has malformed inline comment content")
+        return values
+
+    if Counter(map(comment_key, observed_comments)) != Counter(map(comment_key, expected_comments)):
+        raise Conflict(f"review {review_id} inline comments do not match intent {intent['intent_id']}")
+    receipt["comment_count"] = len(observed_comments)
     return receipt
 
 
-def _reconcile_reviews(runner, target, marker, actor, intent):
+def _reconcile_reviews(runner, target, marker, actor, intent, *, bound_review_ids=()):
+    if intent.get("review_id") is not None:
+        response = _runner_json(
+            runner,
+            ["gh", "api", f"repos/{target['repo']}/pulls/{target['number']}/reviews/{intent['review_id']}"],
+            description="stored review",
+        )
+        return _verified_review_receipt(runner, target, marker, actor, intent, response)
     raw = _runner_json(
         runner,
         [
@@ -1618,6 +1643,9 @@ def _reconcile_reviews(runner, target, marker, actor, intent):
     candidates = _flatten_pages(raw, "pull request reviews")
     matches = []
     for item in candidates:
+        review_id = item.get("id")
+        if type(review_id) is not int or review_id <= 0 or review_id in bound_review_ids:
+            continue
         if not _matching_review(item, target, marker, actor):
             continue
         if item["state"] not in (_EVENT_STATE[intent["event"]], "DISMISSED"):
@@ -1632,12 +1660,13 @@ def _reconcile_reviews(runner, target, marker, actor, intent):
     if len(matches) > 1:
         raise Conflict(
             "expected at most one review matching the frozen commit, marker, actor, "
-            f"event, and comment count; found {len(matches)}"
+            f"event, and inline comments; found {len(matches)}"
         )
     return matches[0] if matches else None
 
 
 def _land_or_dismiss(store, intent, receipt):
+    store.bind_review_id(intent["intent_id"], receipt["review_id"])
     if receipt["state"] == "DISMISSED":
         store.record_dismissed_intent(intent["intent_id"], receipt)
         raise Conflict(
@@ -1655,6 +1684,11 @@ def _land_or_dismiss(store, intent, receipt):
 
 
 def submit_review(store, intent_id, *, retry=False, runner=gh_runner, api=None):
+    with store.review_submission_lock():
+        return _submit_review(store, intent_id, retry=retry, runner=runner, api=api)
+
+
+def _submit_review(store, intent_id, *, retry, runner, api):
     intent = store.review_intent(intent_id, include_payload=True)
     state = intent["state"]
     if state == "landed":
@@ -1664,36 +1698,38 @@ def submit_review(store, intent_id, *, retry=False, runner=gh_runner, api=None):
 
     payload_bytes = store.verify_intent_payload_file(intent_id)
     pr_api = _runner_pr_loader(runner) if api is None else api
-
-    if state == "submitting":
-        target = store.frozen_target()
-        if target["kind"] != "github_pr":
-            raise SnapshotError("frozen target is not a GitHub pull request")
-        replacement_reason = store.replacement_reason()
-        if replacement_reason:
-            raise Conflict(
-                replacement_reason + "; start a supervised replacement session"
-            )
-        actor = _runner_actor(runner)
-        marker = store.review_marker()
-        try:
-            reconciled = _reconcile_reviews(runner, target, marker, actor, intent)
-        except ReviewApiError as error:
-            raise ReviewSubmissionUncertain(
-                f"review intent {intent_id} reconciliation failed ({error}); "
-                "repeat submit-review to reconcile before any retry"
-            ) from error
-        if reconciled is not None:
-            return _land_or_dismiss(store, intent, reconciled)
-        if not retry:
-            raise ReviewSubmissionUncertain(
-                f"review intent {intent_id} is already submitting and no matching review "
-                "is visible yet; repeat the read before passing --retry"
-            )
-
-    target = check(store, require_open=True, api=pr_api)
+    target = store.frozen_target()
+    if target["kind"] != "github_pr":
+        raise SnapshotError("frozen target is not a GitHub pull request")
+    replacement_reason = store.replacement_reason()
+    if replacement_reason:
+        raise Conflict(replacement_reason + "; start a supervised replacement session")
     actor = _runner_actor(runner)
     marker = store.review_marker()
+    bound_review_ids = {
+        item["review_id"] for item in store.review_intents()
+        if item["intent_id"] != intent_id and item["review_id"] is not None
+    }
+    try:
+        reconciled = _reconcile_reviews(
+            runner, target, marker, actor, intent, bound_review_ids=bound_review_ids
+        )
+    except StoreError as error:
+        if isinstance(error, Conflict) and intent["review_id"] is None:
+            raise
+        raise ReviewSubmissionUncertain(
+            f"review intent {intent_id} reconciliation failed ({error}); "
+            "repeat submit-review to reconcile before any retry"
+        ) from error
+    if reconciled is not None:
+        return _land_or_dismiss(store, intent, reconciled)
+    if state == "submitting" and not retry:
+        raise ReviewSubmissionUncertain(
+            f"review intent {intent_id} is already submitting and no matching review "
+            "is visible yet; repeat the read before passing --retry"
+        )
+
+    target = check(store, require_open=True, api=pr_api)
     intent = store.begin_submit_intent(
         intent_id, retry=state == "submitting" and retry, include_payload=True
     )
@@ -1707,9 +1743,13 @@ def submit_review(store, intent_id, *, retry=False, runner=gh_runner, api=None):
             description="review POST response",
         )
     except ReviewApiError as post_error:
+        if isinstance(post_error.response, dict) and type(post_error.response.get("id")) is int:
+            return _verify_posted_review(store, runner, target, marker, actor, intent, post_error.response)
         try:
-            reconciled = _reconcile_reviews(runner, target, marker, actor, intent)
-        except ReviewApiError as reconcile_error:
+            reconciled = _reconcile_reviews(
+                runner, target, marker, actor, intent, bound_review_ids=bound_review_ids
+            )
+        except StoreError as reconcile_error:
             raise ReviewSubmissionUncertain(
                 f"review POST outcome is unknown ({post_error}) and reconciliation "
                 f"failed ({reconcile_error}); repeat submit-review to reconcile before "
@@ -1718,7 +1758,7 @@ def submit_review(store, intent_id, *, retry=False, runner=gh_runner, api=None):
         if reconciled is not None:
             return _land_or_dismiss(store, intent, reconciled)
         status = post_error.status
-        if status is not None and 400 <= status < 500 and status != 422:
+        if status is not None and 400 <= status < 500 and status not in (408, 422, 429):
             store.fail_intent(
                 intent_id,
                 str(post_error),
@@ -1733,9 +1773,16 @@ def submit_review(store, intent_id, *, retry=False, runner=gh_runner, api=None):
             "visible yet; repeat submit-review to reconcile before passing --retry"
         ) from post_error
 
+    return _verify_posted_review(store, runner, target, marker, actor, intent, response)
+
+
+def _verify_posted_review(store, runner, target, marker, actor, intent, response):
     try:
+        if isinstance(response, dict) and type(response.get("id")) is int:
+            store.bind_review_id(intent["intent_id"], response["id"])
+            intent = store.review_intent(intent["intent_id"], include_payload=True)
         receipt = _verified_review_receipt(runner, target, marker, actor, intent, response)
-    except ReviewApiError as error:
+    except StoreError as error:
         raise ReviewSubmissionUncertain(
             f"review POST returned a receipt but comment verification failed ({error}); "
             "repeat submit-review to reconcile before any retry"

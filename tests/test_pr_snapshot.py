@@ -12,6 +12,7 @@ import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from collections.abc import Callable
 from pathlib import Path
@@ -1424,7 +1425,10 @@ class ReviewRunner:
         self.post_error = None
         self.read_error = None
         self.reviews = [[], []]
-        self.comments = {17: [[{"id": 101}], [{"id": 102}]]}
+        comments = json.loads(store.review_intent(intent_id, include_payload=True)["payload"])["comments"]
+        self.comments = {17: [[dict(comments[0], id=101)], [dict(comments[1], id=102)]]}
+        self.review_responses = {17: self.response}
+        self.on_comments: Callable[[], object] | None = None
         self.on_post: Callable[[], object] | None = None
         self.on_actor: Callable[[], object] | None = None
 
@@ -1456,9 +1460,16 @@ class ReviewRunner:
             if self.read_error:
                 raise self.read_error
             return json.dumps(self.reviews).encode()
+        for review_id, response in self.review_responses.items():
+            if command == ["gh", "api", endpoint + f"/reviews/{review_id}"]:
+                if self.read_error:
+                    raise self.read_error
+                return json.dumps(response).encode()
         prefix = ["gh", "api", "--paginate", "--slurp"]
         for review_id, comments in self.comments.items():
             if command == prefix + [endpoint + f"/reviews/{review_id}/comments"]:
+                if self.on_comments:
+                    self.on_comments()
                 if isinstance(comments, Exception):
                     raise comments
                 return json.dumps(comments).encode()
@@ -1538,6 +1549,10 @@ class SubmitReview(unittest.TestCase):
             )
         return code, output.getvalue(), error.getvalue()
 
+    def start_submitting(self):
+        with self.store.review_submission_lock():
+            self.store.begin_submit_intent(self.intent_id)
+
     def state(self):
         return self.store.review_intent(self.intent_id)["state"]
 
@@ -1580,9 +1595,12 @@ class SubmitReview(unittest.TestCase):
 
         code, _output, error = self.invoke()
 
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 3)
         self.assertIn("does not match intent event", error)
         self.assertEqual(self.state(), "submitting")
+        self.assertEqual(self.store.review_intent(self.intent_id)["review_id"], 17)
+        self.assertEqual(self.invoke("--retry")[0], 3)
+        self.assertEqual(len(self.runner.posts), 1)
         self.assertEqual(self.pending_beats(), [1, 2])
 
     def test_response_with_wrong_commit_marker_or_actor_refuses_landing(self):
@@ -1617,15 +1635,92 @@ class SubmitReview(unittest.TestCase):
         self.runner.response["state"] = state
         return pr_snapshot.submit_review(self.store, intent["intent_id"], runner=self.runner)
 
-    def test_comment_count_mismatch_refuses_landing(self):
+    def test_comment_count_mismatch_and_retry_never_post_again(self):
         self.runner.comments[17] = [[{"id": 101}]]
+        observed_ids = []
+        self.runner.on_comments = lambda: observed_ids.append(
+            session_store.SessionStore(self.root).review_intent(self.intent_id)["review_id"]
+        )
 
         code, _output, error = self.invoke()
 
-        self.assertEqual(code, 1)
+        self.assertEqual(code, 3)
         self.assertIn("has 1 comment(s)", error)
         self.assertIn("expected 2", error)
         self.assertEqual(self.state(), "submitting")
+        self.assertEqual(self.pending_beats(), [1, 2])
+        self.assertEqual(self.invoke("--retry")[0], 3)
+        self.assertEqual(observed_ids, [17, 17])
+        self.assertEqual(len(self.runner.posts), 1)
+        self.runner.comments[17] = [[dict(item) for item in self.comments.values()]]
+        self.assertEqual(self.invoke("--retry")[0], 0)
+        self.assertEqual(len(self.runner.posts), 1)
+
+    def test_posted_review_id_is_used_even_when_missing_from_review_listing(self):
+        self.runner.comments[17] = pr_snapshot.ReviewApiError("HTTP 503", status=503)
+        self.assertEqual(self.invoke()[0], 3)
+        self.runner.comments[17] = [[dict(item) for item in self.comments.values()]]
+        self.runner.read_error = pr_snapshot.ReviewApiError("HTTP 404", status=404)
+        self.assertEqual(self.invoke("--retry")[0], 3)
+        self.assertEqual(len(self.runner.posts), 1)
+        self.runner.read_error = None
+        self.assertEqual(self.invoke("--retry")[0], 0)
+        self.assertEqual(len(self.runner.posts), 1)
+        self.assertEqual(self.state(), "landed")
+
+    def test_gh_runner_preserves_a_review_object_from_an_http_error(self):
+        completed = subprocess.CompletedProcess(
+            ["gh", "api"], 1, stdout=json.dumps(self.runner.response).encode(),
+            stderr=b"HTTP 429: Too Many Requests",
+        )
+        with (
+            mock.patch.object(pr_snapshot.subprocess, "run", return_value=completed),
+            self.assertRaises(pr_snapshot.ReviewApiError) as raised,
+        ):
+            pr_snapshot.gh_runner(["gh", "api"])
+        self.assertEqual(raised.exception.status, 429)
+        self.assertEqual(raised.exception.response, self.runner.response)
+
+    def test_http_error_with_a_review_object_persists_id_before_comment_verification(self):
+        self.runner.post_error = pr_snapshot.ReviewApiError(
+            "HTTP 429", status=429, response=self.runner.response
+        )
+        self.runner.comments[17] = [[]]
+        observed_ids = []
+        self.runner.on_comments = lambda: observed_ids.append(
+            session_store.SessionStore(self.root).review_intent(self.intent_id)["review_id"]
+        )
+        self.assertEqual(self.invoke()[0], 3)
+        self.assertEqual(observed_ids, [17])
+        self.assertEqual(self.invoke("--retry")[0], 3)
+        self.assertEqual(len(self.runner.posts), 1)
+        self.assertEqual(self.state(), "submitting")
+        self.assertEqual(self.store.reconcile()["failed_deliveries"], [])
+
+    def test_stored_review_identity_mismatches_are_uncertain_and_never_reposted(self):
+        self.runner.response["commit_id"] = "c" * 40
+        self.assertEqual(self.invoke()[0], 3)
+        self.assertEqual(self.store.review_intent(self.intent_id)["review_id"], 17)
+        original = dict(self.runner.response, commit_id="b" * 40)
+        for change in (
+            {"commit_id": "c" * 40},
+            {"body": "missing marker"},
+            {"user": {"login": "another-reviewer"}},
+            {"id": 18},
+        ):
+            with self.subTest(change=change):
+                self.runner.review_responses[17] = dict(original, **change)
+                self.assertEqual(self.invoke("--retry")[0], 3)
+                self.assertEqual(self.state(), "submitting")
+                self.assertEqual(len(self.runner.posts), 1)
+
+    def test_post_comment_content_mismatch_is_uncertain_on_retry(self):
+        self.runner.comments[17][0][0]["body"] = "Not this intent's finding."
+        code, _output, error = self.invoke()
+        self.assertEqual(code, 3)
+        self.assertIn("inline comments do not match", error)
+        self.assertEqual(self.invoke("--retry")[0], 3)
+        self.assertEqual(len(self.runner.posts), 1)
         self.assertEqual(self.pending_beats(), [1, 2])
 
     def test_comment_read_failure_after_post_keeps_the_outcome_uncertain(self):
@@ -1642,7 +1737,7 @@ class SubmitReview(unittest.TestCase):
     def test_comment_count_is_the_count_after_anchor_folding(self):
         self.comments["2"]["path"] = "outside.py"
         intent = self.store.prepare_review("COMMENT", "Summary", self.comments, replace=True)
-        self.runner.comments[17] = [[{"id": 101}]]
+        self.runner.comments[17] = [[dict(self.comments["1"], id=101)]]
 
         result = self._submit_event(intent, "COMMENTED")
 
@@ -1652,12 +1747,13 @@ class SubmitReview(unittest.TestCase):
     def test_5xx_reconciles_every_page_and_lands_one_verified_match(self):
         self.runner.post_error = pr_snapshot.ReviewApiError("HTTP 503", status=503)
         match = self.runner.response
-        self.runner.reviews = [[
+        reviews = [[
             dict(match, id=1, body="other review"),
             dict(match, id=2, user={"login": "someone-else"}),
             dict(match, id=3, commit_id="c" * 40),
             dict(match, id=4, state="PENDING"),
         ], [match]]
+        self.runner.on_post = lambda: setattr(self.runner, "reviews", reviews)
 
         code, output, error = self.invoke()
 
@@ -1667,7 +1763,7 @@ class SubmitReview(unittest.TestCase):
         self.assertEqual(self.pending_beats(), [])
         self.assertEqual(len(self.runner.posts), 1)
 
-    def test_reconciliation_counts_only_event_and_comment_count_matches(self):
+    def test_reconciliation_matches_only_event_and_inline_comment_content(self):
         self.runner.post_error = pr_snapshot.ReviewApiError("HTTP 503", status=503)
         match = self.runner.response
         self.runner.reviews = [[dict(match, id=18, state="APPROVED")], [
@@ -1677,6 +1773,99 @@ class SubmitReview(unittest.TestCase):
 
         self.assertEqual(self.invoke()[0], 0)
         self.assertEqual(self.state(), "landed")
+
+    def test_reconciliation_checks_inline_bijection_and_fetches_every_cheap_match(self):
+        match = self.runner.response
+        candidates = []
+        expected = list(self.comments.values())
+        for review_id, change in enumerate((
+            {"path": "different.py"},
+            {"side": "LEFT"},
+            {"line": 12},
+            {"body": "A different finding."},
+        ), 20):
+            candidates.append(dict(match, id=review_id))
+            self.runner.comments[review_id] = [[dict(expected[0], **change), expected[1]]]
+        candidates.append(dict(match, id=24))
+        self.runner.comments[24] = [[expected[0], expected[0]]]
+        self.runner.comments[17] = [[expected[1]], [expected[0]]]
+        self.runner.reviews = [candidates, [match]]
+
+        code, output, error = self.invoke()
+
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output)["receipt"]["review_id"], 17)
+        self.assertEqual(self.runner.posts, [])
+        comment_reads = [command[-1] for command, _stdin in self.runner.calls
+                         if command[-1].endswith("/comments")]
+        self.assertEqual(comment_reads, [
+            f"repos/acme/widget/pulls/7/reviews/{review_id}/comments"
+            for review_id in (20, 21, 22, 23, 24, 17)
+        ])
+
+    def test_two_folded_zero_comment_intents_cannot_share_one_review(self):
+        folded = {key: dict(item, path="outside.py") for key, item in self.comments.items()}
+        self.intent = self.store.prepare_review("COMMENT", "Summary", folded, replace=True)
+        self.intent_id = self.intent["intent_id"]
+        self.runner.intent_id = self.intent_id
+        self.runner.comments[17] = [[]]
+        self.assertEqual(self.invoke()[0], 0)
+        first_id = self.intent_id
+        self.accept(3)
+        self.intent = self.store.prepare_review("COMMENT", "Later finding", {
+            "3": {"path": "outside.py", "side": "RIGHT", "line": 99, "body": "Fix three."}
+        })
+        self.intent_id = self.intent["intent_id"]
+        self.runner.intent_id = self.intent_id
+        self.runner.reviews = [[self.runner.response]]
+        self.runner.post_error = pr_snapshot.ReviewApiError("HTTP 503", status=503)
+        before = len(self.runner.calls)
+
+        code, _output, error = self.invoke()
+
+        self.assertEqual(code, 3)
+        self.assertIn("no matching review", error)
+        self.assertEqual(self.store.review_intent(first_id)["review_id"], 17)
+        self.assertIsNone(self.store.review_intent(self.intent_id)["review_id"])
+        self.assertEqual(self.state(), "submitting")
+        self.assertEqual(self.pending_beats(), [3])
+        self.assertEqual(len(self.runner.posts), 2)
+        self.assertFalse(any(command[-1].endswith("/comments")
+                             for command, _stdin in self.runner.calls[before:]))
+
+    def test_unbound_earlier_dismissed_review_requires_matching_inline_content(self):
+        self.runner.reviews = [[dict(self.runner.response, id=16, state="DISMISSED")]]
+        self.runner.comments[16] = [[dict(item, body="An older finding.")
+                                    for item in self.comments.values()]]
+        self.runner.post_error = pr_snapshot.ReviewApiError("HTTP 503", status=503)
+
+        self.assertEqual(self.invoke()[0], 3)
+        self.assertEqual(self.state(), "submitting")
+        self.assertEqual(self.pending_beats(), [1, 2])
+        self.assertFalse((self.root / "review.dismissed.json").exists())
+        self.assertEqual(len(self.runner.posts), 1)
+
+    def test_prepared_intent_adopts_an_existing_matching_review_after_v8_upgrade(self):
+        with connected(str(self.root / "session.sqlite3")) as db:
+            db.execute("DROP TABLE review_intents")
+            db.execute("PRAGMA user_version = 8")
+        self.store = session_store.SessionStore(self.root)
+        self.intent = self.store.prepare_review("COMMENT", "Summary", self.comments)
+        self.intent_id = self.intent["intent_id"]
+        self.runner.store = self.store
+        self.runner.intent_id = self.intent_id
+        self.runner.reviews = [[], [self.runner.response]]
+        self.assertEqual(self.pending_beats(), [1, 2])
+
+        code, output, error = self.invoke()
+
+        self.assertEqual((code, error), (0, ""))
+        result = json.loads(output)
+        self.assertEqual(result["state"], "landed")
+        self.assertEqual(result["review_id"], 17)
+        self.assertEqual([item["beat_n"] for item in result["deliveries"]], [1, 2])
+        self.assertEqual(self.runner.posts, [])
+        self.assertEqual(self.pending_beats(), [])
 
     def test_5xx_without_match_exits_3_and_rerun_does_not_post_again(self):
         self.runner.post_error = pr_snapshot.ReviewApiError("HTTP 503", status=503)
@@ -1697,6 +1886,17 @@ class SubmitReview(unittest.TestCase):
         self.assertEqual(self.state(), "submitting")
         self.assertEqual(self.pending_beats(), [1, 2])
 
+    def test_408_and_429_without_match_remain_submitting(self):
+        for index, status in enumerate((408, 429)):
+            with self.subTest(status=status):
+                self.runner.post_error = pr_snapshot.ReviewApiError(f"HTTP {status}", status=status)
+                code, _output, _error = self.invoke(*(["--retry"] if index else []))
+                self.assertEqual(code, 3)
+                self.assertEqual(self.state(), "submitting")
+                self.assertEqual(self.pending_beats(), [1, 2])
+                self.assertEqual(self.store.reconcile()["failed_deliveries"], [])
+                self.assertEqual(len(self.runner.posts), index + 1)
+
     def test_422_without_match_does_not_record_publication_failure(self):
         self.runner.post_error = pr_snapshot.ReviewApiError("HTTP 422", status=422)
         self.assertEqual(self.invoke()[0], 3)
@@ -1705,7 +1905,7 @@ class SubmitReview(unittest.TestCase):
         self.assertEqual(self.store.reconcile()["failed_deliveries"], [])
 
     def test_explicit_retry_reconciles_then_rechecks_before_posting(self):
-        self.store.begin_submit_intent(self.intent_id)
+        self.start_submitting()
 
         code, _output, error = self.invoke("--retry")
 
@@ -1720,7 +1920,7 @@ class SubmitReview(unittest.TestCase):
         self.assertLess(preflight, post)
 
     def test_submitting_reconciles_existing_receipt_even_if_pr_has_moved(self):
-        self.store.begin_submit_intent(self.intent_id)
+        self.start_submitting()
         self.runner.reviews = [[], [self.runner.response]]
         self.runner.metadata["head"]["sha"] = "c" * 40
 
@@ -1734,17 +1934,19 @@ class SubmitReview(unittest.TestCase):
     def test_two_verified_matches_are_a_conflict(self):
         self.runner.post_error = pr_snapshot.ReviewApiError("HTTP 503", status=503)
         self.runner.reviews = [[self.runner.response], [dict(self.runner.response, id=18)]]
-        self.runner.comments[18] = [[{"id": 201}, {"id": 202}]]
+        self.runner.comments[18] = [[dict(item) for item in self.comments.values()]]
 
         code, _output, error = self.invoke()
 
         self.assertEqual(code, 1)
         self.assertIn("found 2", error)
-        self.assertEqual(self.state(), "submitting")
+        self.assertEqual(self.state(), "prepared")
+        self.assertEqual(self.runner.posts, [])
         self.assertEqual(self.pending_beats(), [1, 2])
 
     def test_dismissed_response_records_receipt_without_landing(self):
         self.runner.response["state"] = "DISMISSED"
+        self.runner.comments[17] = pr_snapshot.ReviewApiError("comments unavailable")
         self._assert_dismissed()
 
     def test_dismissed_reconciliation_records_receipt_without_landing(self):
@@ -1756,26 +1958,29 @@ class SubmitReview(unittest.TestCase):
         code, _output, error = self.invoke()
         self.assertEqual(code, 1)
         self.assertIn("DISMISSED", error)
-        self.assertEqual(self.state(), "failed")
+        self.assertEqual(self.state(), "dismissed")
         self.assertEqual(self.pending_beats(), [1, 2])
         self.assertEqual(self.store.snapshot()[0].get("lands", []), [])
         receipt = json.loads((self.root / "review.dismissed.json").read_text(encoding="utf-8"))
         self.assertEqual(receipt["intent_id"], self.intent_id)
         self.assertEqual(receipt["receipt"]["state"], "DISMISSED")
         self.assertEqual(receipt["receipt"]["review_id"], 17)
+        with self.assertRaisesRegex(session_store.Conflict, "stop for supervised handling"):
+            self.store.prepare_review("COMMENT", "Retry", self.comments, replace=True)
         calls = len(self.runner.calls)
         self.assertEqual(self.invoke("--retry")[0], 1)
         self.assertEqual(len(self.runner.calls), calls)
 
-    def test_definite_4xx_fails_each_non_head_accept_through_fail(self):
+    def test_definite_4xx_fails_each_non_head_accept_atomically(self):
         later = self.store.produce("later-note", 3, "note", "still considering this")
         self.runner.post_error = pr_snapshot.ReviewApiError("HTTP 403", status=403)
         with (
-            mock.patch.object(self.store, "fail", wraps=self.store.fail) as fail,
+            mock.patch.object(self.store, "_fail_beat", wraps=self.store._fail_beat) as fail,
             self.assertRaisesRegex(session_store.Conflict, "confirmed no review was created"),
         ):
             pr_snapshot.submit_review(self.store, self.intent_id, runner=self.runner)
-        self.assertEqual([call.args[0] for call in fail.call_args_list], [1, 2])
+        self.assertEqual([call.args[1] for call in fail.call_args_list], [1, 2])
+        self.assertIs(fail.call_args_list[0].args[0], fail.call_args_list[1].args[0])
         self.assertEqual(self.state(), "failed")
         failed = self.store.reconcile()["failed_deliveries"]
         self.assertEqual([item["beat_n"] for item in failed], [1, 2])
@@ -1791,7 +1996,7 @@ class SubmitReview(unittest.TestCase):
         self.assertEqual(self.state(), "landed")
 
     def test_failed_intent_receipts_are_idempotent_for_non_head_accepts(self):
-        self.store.begin_submit_intent(self.intent_id)
+        self.start_submitting()
         self.store.produce("later-note", 3, "note", "still considering this")
 
         first = self.store.fail_intent(self.intent_id, "HTTP 403")
@@ -1811,18 +2016,43 @@ class SubmitReview(unittest.TestCase):
         self.assertEqual(self.runner.posts, [])
         self.assertEqual(self.state(), "prepared")
 
-    def test_concurrent_submit_transition_refuses_a_second_post(self):
-        self.runner.on_actor = lambda: self.store.begin_submit_intent(self.intent_id)
+    def test_concurrent_retry_is_refused_while_another_submit_holds_the_lock(self):
+        posting, release = threading.Event(), threading.Event()
+        results = []
 
-        code, _output, error = self.invoke()
+        def hold_post():
+            posting.set()
+            if not release.wait(5):
+                raise AssertionError("timed out waiting to release the POST")
 
-        self.assertEqual(code, 1)
-        self.assertIn("already submitting", error)
-        self.assertEqual(self.runner.posts, [])
-        self.assertEqual(self.state(), "submitting")
+        def submit():
+            try:
+                results.append(pr_snapshot.submit_review(self.store, self.intent_id, runner=self.runner))
+            except Exception as error:
+                results.append(error)
+
+        self.runner.on_post = hold_post
+        thread = threading.Thread(target=submit)
+        thread.start()
+        try:
+            self.assertTrue(posting.wait(5))
+            code, _output, error = self.invoke("--retry")
+            self.assertEqual(code, 1)
+            self.assertIn("another submit-review is already running", error)
+            self.assertEqual(len(self.runner.posts), 1)
+            self.assertEqual(self.state(), "submitting")
+            self.accept(3)
+        finally:
+            release.set()
+            thread.join(5)
+        self.assertFalse(thread.is_alive())
+        self.assertEqual(len(results), 1)
+        self.assertIsInstance(results[0], dict)
+        self.assertEqual(self.state(), "landed")
+        self.assertEqual(self.pending_beats(), [3])
 
     def test_reconciliation_transport_failure_exits_3_without_posting(self):
-        self.store.begin_submit_intent(self.intent_id)
+        self.start_submitting()
         self.runner.read_error = pr_snapshot.ReviewApiError("connection lost")
 
         code, _output, error = self.invoke("--retry")

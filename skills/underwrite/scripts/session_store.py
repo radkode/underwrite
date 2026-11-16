@@ -14,6 +14,7 @@ import sqlite3
 import stat
 import sys
 import tempfile
+import threading
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -780,6 +781,7 @@ class SessionStore:
         self.root.mkdir(parents=True, exist_ok=True)
         self.path = self.root / "session.sqlite3"
         self.lock_path = self.root / ".session.lock"
+        self._review_submission_owner = None
         with self._session_lock():
             if not self.path.exists():
                 self._migrate_legacy(handled_override)
@@ -821,6 +823,20 @@ class SessionStore:
             try:
                 yield
             finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+    @contextlib.contextmanager
+    def review_submission_lock(self):
+        with (self.root / ".review-submit.lock").open("a+b") as handle:
+            try:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise Conflict("another submit-review is already running for this session") from error
+            self._review_submission_owner = (os.getpid(), threading.get_ident())
+            try:
+                yield
+            finally:
+                self._review_submission_owner = None
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
 
     @contextlib.contextmanager
@@ -1086,7 +1102,8 @@ class SessionStore:
                 beats_json TEXT NOT NULL,
                 report_json TEXT NOT NULL,
                 state TEXT NOT NULL
-                    CHECK (state IN ('prepared', 'submitting', 'landed', 'failed', 'replaced')),
+                    CHECK (state IN ('prepared', 'submitting', 'landed', 'failed', 'replaced', 'dismissed')),
+                review_id INTEGER UNIQUE,
                 review_url TEXT,
                 land_entry_json TEXT,
                 failure TEXT,
@@ -1094,7 +1111,8 @@ class SessionStore:
                 submitting_at TEXT,
                 landed_at TEXT,
                 failed_at TEXT,
-                replaced_at TEXT
+                replaced_at TEXT,
+                dismissed_at TEXT
             )""")
         db.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS active_review_intent "
@@ -5048,43 +5066,45 @@ class SessionStore:
             raise StoreError("owed must be non-empty text")
         error, owed = error.strip(), owed.strip()
         with self._write() as db:
-            action = self._action_row(db, seq)
-            if action["kind"] != "accept" or action["beat_n"] is None:
-                raise Conflict(f"action {seq} is not an accept")
-            if action["state"] not in ("applied", "acked"):
-                raise Conflict(f"accept action {seq} is {action['state']}, not applied")
-            if action["state"] == "applied":
-                self._require_head(db, seq)
-            beat_n = action["beat_n"]
-            row = self._beat_row(db, beat_n)
-            beat = json.loads(row["body_json"])
-            current = json.loads(row["delivery_json"]) if row["delivery_json"] else None
-            session = json.loads(self._session_row(db)["body_json"])
-            if session.get("linked_implementation") is not None:
-                raise Conflict(
-                    "linked implementation failure must use the implementation gateway"
-                )
-            if self._audience_mode(session) == "report":
-                raise Conflict("report inclusion has no external delivery to fail")
-            desired = {
-                "error": error,
-                "owed": owed,
-                "cause_seq": seq,
-                "kind": None if current is None else current.get("kind"),
-            }
-            if row["delivery_state"] == "failed":
-                if current == desired:
-                    return self._delivery_receipt(seq, beat_n, "failed", current)
-            if row["delivery_state"] == "landed":
-                raise Conflict(f"beat {beat_n} has already landed")
-            if beat.get("state") != "accepted":
-                raise Conflict(f"beat {beat_n} is {beat.get('state')}, not accepted")
-            changed, _revision, _state, _detail = self._save_beat(
-                db, beat, "failed", desired
+            return self._fail_beat(db, seq, error, owed)
+
+    def _fail_beat(self, db, seq, error, owed):
+        action = self._action_row(db, seq)
+        if action["kind"] != "accept" or action["beat_n"] is None:
+            raise Conflict(f"action {seq} is not an accept")
+        if action["state"] not in ("applied", "acked"):
+            raise Conflict(f"accept action {seq} is {action['state']}, not applied")
+        if action["state"] == "applied":
+            self._require_head(db, seq)
+        beat_n = action["beat_n"]
+        row = self._beat_row(db, beat_n)
+        beat = json.loads(row["body_json"])
+        current = json.loads(row["delivery_json"]) if row["delivery_json"] else None
+        session = json.loads(self._session_row(db)["body_json"])
+        if session.get("linked_implementation") is not None:
+            raise Conflict(
+                "linked implementation failure must use the implementation gateway"
             )
-            if changed:
-                self._bump_render(db)
-            return self._delivery_receipt(seq, beat_n, "failed", desired)
+        if self._audience_mode(session) == "report":
+            raise Conflict("report inclusion has no external delivery to fail")
+        desired = {
+            "error": error,
+            "owed": owed,
+            "cause_seq": seq,
+            "kind": None if current is None else current.get("kind"),
+        }
+        if row["delivery_state"] == "failed" and current == desired:
+            return self._delivery_receipt(seq, beat_n, "failed", current)
+        if row["delivery_state"] == "landed":
+            raise Conflict(f"beat {beat_n} has already landed")
+        if beat.get("state") != "accepted":
+            raise Conflict(f"beat {beat_n} is {beat.get('state')}, not accepted")
+        changed, _revision, _state, _detail = self._save_beat(
+            db, beat, "failed", desired
+        )
+        if changed:
+            self._bump_render(db)
+        return self._delivery_receipt(seq, beat_n, "failed", desired)
 
     def _review_token(self, session_id):
         token = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
@@ -5178,6 +5198,7 @@ class SessionStore:
             "anchors_snapped": snapped,
             "anchors_folded": folded,
             "anchor_report": report,
+            "review_id": row["review_id"],
             "review_url": row["review_url"],
             "land_entry": (
                 None if row["land_entry_json"] is None else json.loads(row["land_entry_json"])
@@ -5188,6 +5209,7 @@ class SessionStore:
             "landed_at": row["landed_at"],
             "failed_at": row["failed_at"],
             "replaced_at": row["replaced_at"],
+            "dismissed_at": row["dismissed_at"],
         }
         if include_payload:
             document["payload"] = payload_bytes
@@ -5236,6 +5258,14 @@ class SessionStore:
             marker = self._review_token(session_row["session_id"])
 
             owed = self._pending_review_beats(db)
+            for dismissed in db.execute(
+                "SELECT intent_id, beats_json FROM review_intents WHERE state = 'dismissed'"
+            ):
+                if any(item["beat_n"] in owed for item in json.loads(dismissed["beats_json"])):
+                    raise Conflict(
+                        f"dismissed review intent {dismissed['intent_id']} covers pending beats; "
+                        "stop for supervised handling without reposting"
+                    )
             missing = sorted(set(owed) - set(parsed_comments))
             extra = sorted(set(parsed_comments) - set(owed))
             if missing or extra:
@@ -5520,7 +5550,29 @@ class SessionStore:
             )
         return disk
 
+    def bind_review_id(self, intent_id, review_id):
+        _positive(review_id, "review id")
+        with self._write() as db:
+            intent = self._review_intent_row(db, intent_id)
+            if intent["review_id"] is not None:
+                if intent["review_id"] != review_id:
+                    raise Conflict(f"review intent {intent_id} already has review id {intent['review_id']}")
+                return
+            if intent["state"] not in ("prepared", "submitting"):
+                raise Conflict(f"review intent {intent_id} is {intent['state']}, cannot bind a review")
+            bound = db.execute(
+                "SELECT intent_id FROM review_intents WHERE review_id = ?", (review_id,)
+            ).fetchone()
+            if bound is not None:
+                raise Conflict(f"review {review_id} is already bound to intent {bound['intent_id']}")
+            db.execute(
+                "UPDATE review_intents SET review_id = ? WHERE intent_id = ?",
+                (review_id, intent_id),
+            )
+
     def begin_submit_intent(self, intent_id, *, retry=False, include_payload=False):
+        if self._review_submission_owner != (os.getpid(), threading.get_ident()):
+            raise StoreError("begin_submit_intent requires the review submission lock")
         with self._write() as db:
             intent = self._review_intent_row(db, intent_id)
             session, execution_policy = self._session_execution_policy(db)
@@ -5532,6 +5584,11 @@ class SessionStore:
             if replacement_reason:
                 raise Conflict(
                     replacement_reason + "; start a supervised replacement session"
+                )
+            if intent["review_id"] is not None:
+                raise Conflict(
+                    f"review intent {intent_id} already has review id {intent['review_id']}; "
+                    "verify that review without reposting"
                 )
             if intent["state"] == "submitting":
                 if not retry:
@@ -5566,6 +5623,17 @@ class SessionStore:
         with self._write() as db:
             intent = self._review_intent_row(db, intent_id)
             covered = json.loads(intent["beats_json"])
+            for item in covered:
+                beat = json.loads(self._beat_row(db, item["beat_n"])["body_json"])
+                if beat.get("state") != "accepted":
+                    raise Conflict(f"beat {item['beat_n']} is {beat.get('state')}, not accepted")
+                pinned_sha256 = hashlib.sha256(
+                    self._pinned_beat(beat).encode("utf-8")
+                ).hexdigest()
+                if pinned_sha256 != item["beat_sha256"]:
+                    raise Conflict(
+                        f"beat {item['beat_n']} content changed since review intent {intent_id} was prepared"
+                    )
             if intent["state"] == "failed":
                 if intent["failure"] != error:
                     raise Conflict(
@@ -5593,28 +5661,16 @@ class SessionStore:
                 raise Conflict(
                     f"review intent {intent_id} is {intent['state']}, cannot fail"
                 )
-
-        deliveries = [
-            self.fail(item["action_seq"], error, owed) for item in covered
-        ]
-
-        with self._write() as db:
-            intent = self._review_intent_row(db, intent_id)
-            if intent["state"] == "failed":
-                if intent["failure"] != error:
-                    raise Conflict(
-                        f"review intent {intent_id} already failed with a different error"
-                    )
-            elif intent["state"] != "submitting":
-                raise Conflict(
-                    f"review intent {intent_id} is {intent['state']}, cannot fail"
-                )
-            else:
-                db.execute(
-                    "UPDATE review_intents SET state = 'failed', failure = ?, "
-                    "failed_at = ? WHERE intent_id = ?",
-                    (error, _now(), intent_id),
-                )
+            if intent["review_id"] is not None:
+                raise Conflict(f"review intent {intent_id} has a stored review id, cannot fail")
+            deliveries = [
+                self._fail_beat(db, item["action_seq"], error, owed) for item in covered
+            ]
+            db.execute(
+                "UPDATE review_intents SET state = 'failed', failure = ?, "
+                "failed_at = ? WHERE intent_id = ?",
+                (error, _now(), intent_id),
+            )
             updated = self._review_intent_row(db, intent_id)
             doc = self._review_intent_document(updated)
             doc["deliveries"] = deliveries
@@ -5631,10 +5687,10 @@ class SessionStore:
 
         with self._write() as db:
             intent = self._review_intent_row(db, intent_id)
-            if intent["state"] == "failed":
+            if intent["state"] == "dismissed":
                 if intent["review_url"] != url or intent["failure"] != failure:
                     raise Conflict(
-                        f"review intent {intent_id} already failed differently"
+                        f"review intent {intent_id} already dismissed differently"
                     )
             elif intent["state"] not in ("prepared", "submitting"):
                 raise Conflict(
@@ -5644,8 +5700,8 @@ class SessionStore:
                 timestamp = _now()
                 submitting_at = intent["submitting_at"] or timestamp
                 db.execute(
-                    "UPDATE review_intents SET state = 'failed', review_url = ?, "
-                    "failure = ?, submitting_at = ?, failed_at = ? WHERE intent_id = ?",
+                    "UPDATE review_intents SET state = 'dismissed', review_url = ?, "
+                    "failure = ?, submitting_at = ?, dismissed_at = ? WHERE intent_id = ?",
                     (url, failure, submitting_at, timestamp, intent_id),
                 )
             updated = self._review_intent_row(db, intent_id)
