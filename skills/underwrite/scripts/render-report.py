@@ -1213,7 +1213,7 @@ def walk_entries(session, beats):
                 "where": item.get("where", ""),
                 "what": item.get("what", ""),
                 "state": None,
-                "skipped": tier in skipped,
+                "skipped": isinstance(tier, str) and tier in skipped,
             }
     for beat in beats:
         n = beat.get("n")

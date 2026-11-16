@@ -728,6 +728,20 @@ class WalkCoverage(unittest.TestCase):
         self.assertIn("Skipped by you:", partial)
         self.assertIn("call sites", partial.split("Skipped by you:")[1])
 
+    def test_malformed_plan_tier_renders_in_live_and_final_reports(self):
+        session = {
+            "repo": "acme/widget",
+            "number": 42,
+            "plan": [{"n": 1, "tier": [], "where": "a.py:1"}],
+            "skipped_tiers": ["follow-through"],
+        }
+        live = rr.render(session, [], "", {}, live=True, phase="parked")
+        final = rr.render(session, [], "", {})
+        self.assertIn("0 of 1 items read. Not read yet:", live)
+        self.assertIn("a.py:1", live)
+        self.assertIn("0 of 1 items read. Not read yet:", final)
+        self.assertIn("a.py:1", final)
+
     def test_the_final_render_carries_it_even_though_the_plan_track_does_not(self):
         beats = [beat(n=1, state="clean")]
         html = self.final(beats)
