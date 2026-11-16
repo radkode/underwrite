@@ -6,6 +6,7 @@ import os
 import sqlite3
 import stat
 import tempfile
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -288,6 +289,20 @@ class ContentStore:
         return b"".join(chunks)
 
 
+@contextmanager
+def _connection(path):
+    """One ledger transaction scope: committed or rolled back, then always closed."""
+    database = sqlite3.connect(str(path), timeout=30, isolation_level=None)
+    try:
+        database.row_factory = sqlite3.Row
+        database.execute("PRAGMA foreign_keys = ON")
+        database.execute("PRAGMA synchronous = FULL")
+        with database:
+            yield database
+    finally:
+        database.close()
+
+
 class ReplayLedger:
     """Consume each replay identity once and persist one terminal result."""
 
@@ -299,11 +314,7 @@ class ReplayLedger:
         self._initialize()
 
     def _connect(self):
-        database = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)
-        database.row_factory = sqlite3.Row
-        database.execute("PRAGMA foreign_keys = ON")
-        database.execute("PRAGMA synchronous = FULL")
-        return database
+        return _connection(self.path)
 
     def _initialize(self):
         with self._connect() as database:

@@ -21,6 +21,11 @@ sys.path.insert(0, str(ROOT / "skills" / "underwrite" / "scripts"))
 import score  # noqa: E402
 import session_store  # noqa: E402
 
+if __package__:
+    from .sqlite_support import connected
+else:
+    from sqlite_support import connected
+
 spec = importlib.util.spec_from_file_location("eval_run", EVALS / "run.py")
 run = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(run)
@@ -196,7 +201,7 @@ class Scoring(SessionFixture):
 
     def test_a_walk_with_no_recommendation_is_unfinished(self):
         self.store.put_beat(self.flag(1, 5))
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             body = json.loads(db.execute("SELECT body_json FROM session").fetchone()[0])
             body.pop("recommendation")
             db.execute("UPDATE session SET body_json = ?", (json.dumps(body),))

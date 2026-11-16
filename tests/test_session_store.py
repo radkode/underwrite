@@ -15,6 +15,11 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+if __package__:
+    from .sqlite_support import connected
+else:
+    from sqlite_support import connected
+
 
 SCRIPTS = Path(__file__).resolve().parent.parent / "skills" / "underwrite" / "scripts"
 SPEC = importlib.util.spec_from_file_location("session_store", SCRIPTS / "session_store.py")
@@ -512,7 +517,7 @@ class FrozenTargets(unittest.TestCase):
         return self.store.freeze_target(self.target(suffix), diff, metadata)
 
     def set_historical_audience(self, mode):
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             row = db.execute(
                 "SELECT body_json FROM session WHERE singleton = 1"
             ).fetchone()
@@ -705,7 +710,7 @@ class FrozenTargets(unittest.TestCase):
             changed = self.store.snapshot()[1][0]
             changed["slots"]["proof"] = "changed.py:1"
             self.store.put_beat(changed)
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             db.execute(
                 "UPDATE beats SET delivery_state = 'pending', delivery_json = ? "
                 "WHERE n = 1",
@@ -713,7 +718,7 @@ class FrozenTargets(unittest.TestCase):
             )
         with self.assertRaisesRegex(session_store.Conflict, "has not landed"):
             self.store.ack(action["seq"])
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             db.execute(
                 "UPDATE beats SET delivery_state = 'none', delivery_json = NULL "
                 "WHERE n = 1"
@@ -780,7 +785,7 @@ class FrozenTargets(unittest.TestCase):
         )
         self.store.put_beat(FLAG)
         action = self.store.produce("accept-1", 1, "accept", "include it")
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             row = db.execute(
                 "SELECT body_json FROM beats WHERE n = 1"
             ).fetchone()
@@ -980,7 +985,7 @@ class FrozenTargets(unittest.TestCase):
             with self.assertRaisesRegex(OSError, "no space left"):
                 session_store.SessionStore(self.root)
 
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 5)
         retried = session_store.SessionStore(self.root)
         self.assertEqual(retried.snapshot()[1][0]["slots"], FLAG["slots"])
@@ -990,7 +995,7 @@ class FrozenTargets(unittest.TestCase):
 
     def shout_slots(self, n, downgrade=True):
         """Put a beat back the way a pre-SQLite walk wrote it, on a database to match."""
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             row = db.execute(
                 "SELECT body_json FROM beats WHERE n = ?", (n,)
             ).fetchone()
@@ -1336,7 +1341,7 @@ class FrozenTargets(unittest.TestCase):
         self.freeze()
         self.store.freeze_execution("no_exec")
         self.store.put_beat(FLAG)
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             row = db.execute(
                 "SELECT body_json FROM session WHERE singleton = 1"
             ).fetchone()
@@ -1360,7 +1365,7 @@ class FrozenTargets(unittest.TestCase):
 
     def test_a_v3_contextless_review_delivery_requires_replacement(self):
         self.freeze()
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             row = db.execute(
                 "SELECT body_json FROM session WHERE singleton = 1"
             ).fetchone()
@@ -1378,7 +1383,7 @@ class FrozenTargets(unittest.TestCase):
             self.store.freeze_execution("sandboxed")
             self.store.put_beat(FLAG)
             action = self.store.produce("accept-1", 1, "accept", "include it")
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             db.execute("PRAGMA user_version = 3")
 
         upgraded = session_store.SessionStore(self.root)
@@ -1397,7 +1402,7 @@ class FrozenTargets(unittest.TestCase):
         self.store.freeze_target(
             self.target(), diff, metadata, self.context_input()
         )
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             row = db.execute(
                 "SELECT body_json FROM session WHERE singleton = 1"
             ).fetchone()
@@ -1416,7 +1421,7 @@ class FrozenTargets(unittest.TestCase):
             self.set_historical_audience("branch")
             self.store.put_beat(FLAG)
             action = self.store.produce("accept-1", 1, "accept", "yes")
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             db.execute("PRAGMA user_version = 3")
 
         self.store = session_store.SessionStore(self.root)
@@ -1446,7 +1451,7 @@ class FrozenTargets(unittest.TestCase):
         result = {"kind": "walk", "cursor": 2, "current_beat": 2, "tier": "core"}
         applied = self.store.apply(action["seq"], result, session=moved)
 
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             row = db.execute(
                 "SELECT body_json FROM session WHERE singleton = 1"
             ).fetchone()
@@ -1482,7 +1487,7 @@ class FrozenTargets(unittest.TestCase):
         self.assertEqual(
             self.store.apply(action["seq"], result, session=current), applied
         )
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             row = db.execute(
                 "SELECT result_json FROM actions WHERE seq = ?", (action["seq"],)
             ).fetchone()
@@ -1501,7 +1506,7 @@ class FrozenTargets(unittest.TestCase):
         second = self.store.produce("nav-2", None, "back", "")
         original = dict(self.store.snapshot()[0])
         original.pop("execution_policy")
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             row = db.execute(
                 "SELECT body_json FROM session WHERE singleton = 1"
             ).fetchone()
@@ -1539,7 +1544,7 @@ class FrozenTargets(unittest.TestCase):
         self.store.freeze_target(
             self.target(), diff, metadata, self.context_input()
         )
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             row = db.execute(
                 "SELECT body_json FROM session WHERE singleton = 1"
             ).fetchone()
@@ -1561,7 +1566,7 @@ class FrozenTargets(unittest.TestCase):
             landed = self.store.land(
                 action["seq"], 1, "c" * 40, "commit", branch="feature"
             )
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             row = db.execute(
                 "SELECT body_json FROM session WHERE singleton = 1"
             ).fetchone()
@@ -1763,7 +1768,7 @@ class CreatingAndMigrating(StoreCase):
     def test_v3_produced_navigation_uses_the_migrated_legacy_marker(self):
         first = self.store.produce("nav-1", None, "next", "")
         second = self.store.produce("nav-2", None, "back", "")
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             row = db.execute(
                 "SELECT body_json FROM session WHERE singleton = 1"
             ).fetchone()
@@ -1838,7 +1843,7 @@ class CreatingAndMigrating(StoreCase):
         result = {"kind": "walk", "cursor": 2, "current_beat": 2}
         applied = self.store.apply(action["seq"], result, session=moved)
 
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             row = db.execute(
                 "SELECT body_json FROM session WHERE singleton = 1"
             ).fetchone()
@@ -1876,7 +1881,7 @@ class CreatingAndMigrating(StoreCase):
             "execution_policy": {"mode": "sandboxed"},
         })
 
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             row = db.execute(
                 "SELECT body_json FROM session WHERE singleton = 1"
             ).fetchone()
@@ -1983,7 +1988,7 @@ class CreatingAndMigrating(StoreCase):
             restored.produce("accept-1", 1, "accept", "yes")
 
     def test_v3_upgrade_discards_a_user_legacy_pr_field(self):
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             row = db.execute(
                 "SELECT body_json FROM session WHERE singleton = 1"
             ).fetchone()
@@ -2000,7 +2005,7 @@ class CreatingAndMigrating(StoreCase):
         self.assertNotIn("legacy_pr", upgraded.snapshot()[0])
 
     def test_v3_targetless_pr_discards_a_user_execution_policy(self):
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             row = db.execute(
                 "SELECT body_json FROM session WHERE singleton = 1"
             ).fetchone()
@@ -2021,7 +2026,7 @@ class CreatingAndMigrating(StoreCase):
         )
 
     def test_v3_targetless_non_pr_discards_a_user_execution_policy(self):
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             row = db.execute(
                 "SELECT body_json FROM session WHERE singleton = 1"
             ).fetchone()
@@ -2096,7 +2101,7 @@ class CreatingAndMigrating(StoreCase):
         self.assertEqual(store.snapshot()[1][0]["state"], "flag")
 
     def downgrade_to_pre_identity_v1(self, format_version=1):
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             db.execute("PRAGMA foreign_keys = OFF")
             db.execute("""CREATE TABLE legacy_session (
                 singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
@@ -2114,7 +2119,7 @@ class CreatingAndMigrating(StoreCase):
             db.execute("PRAGMA user_version = 1")
 
     def test_the_database_and_export_format_are_versioned(self):
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 8)
             self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "delete")
         db = self.store._connect()
@@ -2128,13 +2133,13 @@ class CreatingAndMigrating(StoreCase):
         self.assertEqual([beat["n"] for beat in beats], [1, 2])
 
     def test_v3_non_pr_sessions_do_not_gain_a_pr_execution_policy(self):
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             db.execute("PRAGMA user_version = 3")
 
         upgraded = session_store.SessionStore(self.root)
 
         self.assertNotIn("execution_policy", upgraded.snapshot()[0])
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 8)
 
     def test_the_session_identity_survives_restart_but_not_recreation(self):
@@ -2159,7 +2164,7 @@ class CreatingAndMigrating(StoreCase):
         self.assertEqual(upgraded.snapshot(), before)
         self.assertEqual(upgraded.head()["action_id"], action["action_id"])
         self.assertTrue(upgraded.delivery_state()["session_id"])
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 8)
             columns = {row[1] for row in db.execute("PRAGMA table_info(session)")}
         self.assertIn("session_id", columns)
@@ -2169,7 +2174,7 @@ class CreatingAndMigrating(StoreCase):
         self.store.fail(action["seq"], "tests failed", "retry with the fixture")
         beat = self.beat(1)
         beat["slots"]["fix"] = "retry with the fixture"
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             db.execute(
                 "UPDATE beats SET body_json = ? WHERE n = 1",
                 (json.dumps(beat),),
@@ -2181,7 +2186,7 @@ class CreatingAndMigrating(StoreCase):
         self.assertEqual(upgraded.snapshot()[1][0]["slots"]["fix"], "pin it")
         failed = upgraded.presentation_snapshot()[1][0]["delivery"]
         self.assertEqual(failed["owed"], "retry with the fixture")
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 8)
 
     def test_a_v2_upgrade_strips_a_failure_injected_fix_written_in_upper_case(self):
@@ -2195,7 +2200,7 @@ class CreatingAndMigrating(StoreCase):
         beat = self.beat(1)
         beat["slots"] = {key.upper(): value for key, value in beat["slots"].items()}
         beat["slots"]["FIX"] = "retry with the fixture"
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             db.execute(
                 "UPDATE beats SET body_json = ? WHERE n = 1",
                 (json.dumps(beat),),
@@ -2218,7 +2223,7 @@ class CreatingAndMigrating(StoreCase):
         self.store.fail(action["seq"], "tests failed", "retry with the fixture")
         beat = self.beat(1)
         beat["slots"]["fix"] = "retry with the fixture"
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             db.execute(
                 "UPDATE beats SET body_json = ? WHERE n = 1",
                 (json.dumps(beat),),
@@ -2239,7 +2244,7 @@ class CreatingAndMigrating(StoreCase):
         ):
             session_store.SessionStore(self.root)
 
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 1)
             columns = {row[1] for row in db.execute("PRAGMA table_info(session)")}
         self.assertNotIn("session_id", columns)
@@ -2253,7 +2258,7 @@ class CreatingAndMigrating(StoreCase):
             with self.assertRaisesRegex(OSError, "identity unavailable"):
                 session_store.SessionStore(self.root)
 
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 1)
             columns = {row[1] for row in db.execute("PRAGMA table_info(session)")}
         self.assertNotIn("session_id", columns)
@@ -2289,7 +2294,7 @@ class CreatingAndMigrating(StoreCase):
     def test_an_action_applied_before_the_repair_still_replays_after_it(self):
         """The action snapshot keeps the spelling it was written with, and a replay of
         an interrupted effect is the documented recovery."""
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             row = db.execute("SELECT body_json FROM beats WHERE n = 1").fetchone()
             beat = json.loads(row[0])
             beat["slots"] = {"WHAT": "does a thing", "RISK": "r", "FIX": "f"}
@@ -2301,7 +2306,7 @@ class CreatingAndMigrating(StoreCase):
         applied = self.store.apply(
             produced["seq"], {"kind": "walk", "cursor": 2}, session=session, beats=beats
         )
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             db.execute("PRAGMA user_version = 5")
 
         upgraded = session_store.SessionStore(self.root)
@@ -2314,7 +2319,7 @@ class CreatingAndMigrating(StoreCase):
 
     def test_a_v5_upgrade_reads_the_slots_a_pre_sqlite_walk_wrote_in_upper_case(self):
         """The prose was never lost, only unread: every reader iterates BEAT_SLOTS."""
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             row = db.execute("SELECT body_json FROM beats WHERE n = 1").fetchone()
             beat = json.loads(row[0])
             beat["slots"] = {"WHAT": "does a thing", "PROOF": "a.ts:1"}
@@ -2339,13 +2344,13 @@ class CreatingAndMigrating(StoreCase):
             + list((self.root / "beats").glob("*.json"))
         )
         before = {path: path.stat().st_mtime_ns for path in derived}
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             db.execute("PRAGMA user_version = 5")
 
         session_store.SessionStore(self.root)
 
         self.assertEqual({path: path.stat().st_mtime_ns for path in derived}, before)
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 8)
 
     def test_a_current_session_opens_in_a_directory_it_cannot_write(self):
@@ -2361,7 +2366,7 @@ class CreatingAndMigrating(StoreCase):
 
     def test_the_upgrade_leaves_a_beat_whose_keys_would_collide(self):
         """Folding one onto the other would drop a slot, which is the bug, not the fix."""
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             row = db.execute("SELECT body_json FROM beats WHERE n = 1").fetchone()
             beat = json.loads(row[0])
             beat["slots"] = {"what": "lower", "WHAT": "upper"}
@@ -2469,14 +2474,14 @@ class CreatingAndMigrating(StoreCase):
 
     def test_a_future_database_is_refused_without_changing_its_journal_mode(self):
         (self.root / "session.sqlite3").unlink()
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             self.assertEqual(db.execute("PRAGMA journal_mode = WAL").fetchone()[0], "wal")
             db.execute("PRAGMA user_version = 9")
 
         with self.assertRaisesRegex(session_store.StoreError, "newer than supported"):
             session_store.SessionStore(self.root)
 
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 9)
             self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
 
@@ -2983,7 +2988,7 @@ class ProducingAndApplying(StoreCase):
 
     def test_an_older_empty_decide_still_deduplicates_by_action_id(self):
         self.store.produce("decision-1", 1, "decide", "stays as is")
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             db.execute(
                 "UPDATE actions SET note = '' WHERE action_id = 'decision-1'"
             )
@@ -3993,7 +3998,7 @@ class LinkedImplementations(unittest.TestCase):
         }
 
     def test_authorization_is_distinct_idempotent_and_does_not_mutate_the_source(self):
-        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+        with connected(str(self.source_root / "session.sqlite3")) as db:
             before = db.execute(
                 "SELECT body_json, render_revision FROM session WHERE singleton = 1"
             ).fetchone()
@@ -4011,7 +4016,7 @@ class LinkedImplementations(unittest.TestCase):
         with self.assertRaisesRegex(session_store.Conflict, "not the accept"):
             self.source.authorize_implementation(self.source_action, 2, "reviewer", "yes")
 
-        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+        with connected(str(self.source_root / "session.sqlite3")) as db:
             self.assertEqual(
                 db.execute(
                     "SELECT body_json, render_revision FROM session WHERE singleton = 1"
@@ -4022,7 +4027,7 @@ class LinkedImplementations(unittest.TestCase):
 
     def test_create_is_recoverable_and_seeds_one_immutable_gateway_child(self):
         link = self.authorize()
-        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+        with connected(str(self.source_root / "session.sqlite3")) as db:
             source_before = db.execute(
                 "SELECT body_json, render_revision FROM session WHERE singleton = 1"
             ).fetchone()
@@ -4033,7 +4038,7 @@ class LinkedImplementations(unittest.TestCase):
         self.source.complete_implementation_link(
             link["link_id"], created["child_session_id"]
         )
-        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+        with connected(str(self.source_root / "session.sqlite3")) as db:
             self.assertEqual(
                 db.execute(
                     "SELECT body_json, render_revision FROM session WHERE singleton = 1"
@@ -4229,7 +4234,7 @@ class LinkedImplementations(unittest.TestCase):
 
     def test_changed_source_beat_cannot_seed_an_authorized_child(self):
         link = self.authorize()
-        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+        with connected(str(self.source_root / "session.sqlite3")) as db:
             row = db.execute("SELECT body_json FROM beats WHERE n = 1").fetchone()
             beat = json.loads(row[0])
             beat["slots"]["what"] = "changed after authorization"
@@ -4283,7 +4288,7 @@ class LinkedImplementations(unittest.TestCase):
             with self.subTest(name=name):
                 with self.assertRaises(session_store.StoreError):
                     child.reserve_implementation_attempt(1, profile)
-                with sqlite3.connect(str(child.root / "session.sqlite3")) as db:
+                with connected(str(child.root / "session.sqlite3")) as db:
                     self.assertEqual(
                         db.execute(
                             "SELECT COUNT(*) FROM implementation_attempts"
@@ -4352,7 +4357,7 @@ class LinkedImplementations(unittest.TestCase):
         """The repair passes over a beat an authorization froze, and the child it seeds
         gets the canonical spelling either way."""
         link = self.authorize()
-        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+        with connected(str(self.source_root / "session.sqlite3")) as db:
             row = db.execute("SELECT body_json FROM beats WHERE n = 1").fetchone()
             beat = json.loads(row[0])
             beat["slots"] = {"WHAT": "does a thing", "FIX": "pin it"}
@@ -4382,7 +4387,7 @@ class LinkedImplementations(unittest.TestCase):
         """Only the reading changes: the bytes stay as the link signed them, and it
         still creates the child it was signed for."""
         link = self.authorize()
-        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+        with connected(str(self.source_root / "session.sqlite3")) as db:
             row = db.execute("SELECT body_json FROM beats WHERE n = 1").fetchone()
             beat = json.loads(row[0])
             beat["slots"] = {"WHAT": "does a thing", "FIX": "pin it"}
@@ -4404,7 +4409,7 @@ class LinkedImplementations(unittest.TestCase):
 
     def shout_pinned_slots(self):
         """The beat as a pre-SQLite walk wrote it, with the link signed on those bytes."""
-        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+        with connected(str(self.source_root / "session.sqlite3")) as db:
             row = db.execute("SELECT body_json FROM beats WHERE n = 1").fetchone()
             beat = json.loads(row[0])
             beat["slots"] = {key.upper(): value for key, value in beat["slots"].items()}
@@ -4418,7 +4423,7 @@ class LinkedImplementations(unittest.TestCase):
         return beat["slots"]
 
     def frozen_row(self):
-        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+        with connected(str(self.source_root / "session.sqlite3")) as db:
             row = db.execute(
                 "SELECT revision, body_json FROM beats WHERE n = 1"
             ).fetchone()
@@ -4506,7 +4511,7 @@ class LinkedImplementations(unittest.TestCase):
         """A store an older build let drift is still readable, and the one write it takes
         is the one that puts the approved finding back."""
         link = self.authorize()
-        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+        with connected(str(self.source_root / "session.sqlite3")) as db:
             beat = json.loads(
                 db.execute("SELECT body_json FROM beats WHERE n = 1").fetchone()[0]
             )
@@ -4545,7 +4550,7 @@ class LinkedImplementations(unittest.TestCase):
 
     def test_v4_upgrade_adds_authority_tables_without_changing_session_state(self):
         before = self.source.snapshot()
-        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+        with connected(str(self.source_root / "session.sqlite3")) as db:
             db.execute("DROP TABLE implementation_attempts")
             db.execute("DROP TABLE implementation_links")
             db.execute("PRAGMA user_version = 4")
@@ -4554,7 +4559,7 @@ class LinkedImplementations(unittest.TestCase):
 
         self.assertEqual(upgraded.snapshot(), before)
         self.assertEqual(upgraded.implementation_links(), [])
-        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+        with connected(str(self.source_root / "session.sqlite3")) as db:
             names = {
                 row[0]
                 for row in db.execute(
