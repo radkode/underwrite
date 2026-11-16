@@ -4729,5 +4729,330 @@ class SecondRead(StoreCase):
         self.assertEqual(self.beat(3)["state"], "flag")
 
 
+class ReviewIntents(unittest.TestCase):
+    DIFF = (
+        "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n"
+        "@@ -10,2 +10,3 @@\n ctx\n+line eleven\n+line twelve\n"
+    )
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.store = session_store.SessionStore(self.root, create=True)
+        target = {
+            "version": 1,
+            "kind": "github_pr",
+            "repo": "acme/widget",
+            "number": 7,
+            "state": "open",
+            "merged_at": None,
+            "base_sha": "a" * 40,
+            "head_sha": "b" * 40,
+            "head_repo_id": 123,
+            "head_repo": "acme/widget",
+            "head_ref": "feature",
+            "merge_base_sha": "e" * 40,
+            "changed_files": 1,
+        }
+        diff = self.root / "source.diff"
+        metadata = self.root / "source.json"
+        context = self.root / "source-context.json"
+        diff.write_bytes(self.DIFF.encode("utf-8"))
+        metadata.write_text(json.dumps({"number": 7}), encoding="utf-8")
+        context.write_text(
+            json.dumps(
+                {"version": 1, "base_sha": target["base_sha"], "files": []},
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.target = self.store.freeze_target(target, diff, metadata, context)
+        self.store.freeze_execution("no_exec")
+        self.store.put_beat(dict(FLAG, n=1, where="a.py:11", claim="first finding"))
+        self.store.put_beat(dict(FLAG, n=2, where="a.py:12", claim="second finding"))
+
+    def accept(self, n):
+        action = self.store.produce(f"accept-{n}", n, "accept", f"yes {n}")
+        self.store.ack(action["seq"])
+        return action
+
+    def comment(self, line=11, path="a.py", body="Fix this."):
+        return {"path": path, "line": line, "side": "RIGHT", "body": body}
+
+    def test_prepare_review_persists_intent_validates_anchors_and_writes_fixed_json(self):
+        first = self.accept(1)
+        second = self.accept(2)
+
+        prepared = self.store.prepare_review(
+            "REQUEST_CHANGES",
+            "Review summary",
+            {
+                "1": self.comment(line=15, body="Near hunk snaps to 12."),
+                "2": self.comment(line=99, path="outside.py", body="Folds into body."),
+            },
+        )
+
+        self.assertEqual(prepared["event"], "REQUEST_CHANGES")
+        self.assertEqual(prepared["state"], "prepared")
+        self.assertEqual(prepared["comment_count"], 1)
+        self.assertEqual(prepared["anchors_snapped"], 1)
+        self.assertEqual(prepared["anchors_folded"], 1)
+        self.assertEqual(
+            [(item["beat_n"], item["action_seq"]) for item in prepared["beats"]],
+            [(1, first["seq"]), (2, second["seq"])],
+        )
+        for item in prepared["beats"]:
+            self.assertEqual(item["beat_revision"], 2)
+            self.assertRegex(item["beat_sha256"], r"^[0-9a-f]{64}$")
+
+        fixed_path = self.root / "review.fixed.json"
+        self.assertEqual(prepared["payload_file"], str(fixed_path))
+        disk_bytes = fixed_path.read_bytes()
+        self.assertEqual(
+            hashlib.sha256(disk_bytes).hexdigest(), prepared["payload_sha256"]
+        )
+        stored = self.store.review_intent(prepared["intent_id"], include_payload=True)
+        self.assertEqual(stored["payload"], disk_bytes)
+
+        payload = json.loads(disk_bytes.decode("utf-8"))
+        marker = self.store.review_marker()
+        self.assertEqual(payload["commit_id"], self.target["head_sha"])
+        self.assertEqual(payload["event"], "REQUEST_CHANGES")
+        self.assertEqual(
+            payload["comments"],
+            [{"path": "a.py", "line": 12, "side": "RIGHT", "body": "Near hunk snaps to 12."}],
+        )
+        self.assertTrue(payload["body"].startswith("Review summary\n\n`outside.py:99` Folds into body."))
+        self.assertTrue(payload["body"].endswith("\n\n" + marker))
+
+    def test_prepare_review_requires_exact_pending_accepted_beat_coverage(self):
+        self.accept(1)
+        self.accept(2)
+
+        with self.assertRaisesRegex(
+            session_store.Conflict, "missing beats 2"
+        ):
+            self.store.prepare_review("COMMENT", "Summary", {"1": self.comment()})
+
+        with self.assertRaisesRegex(
+            session_store.Conflict, "extra beats 3"
+        ):
+            self.store.prepare_review(
+                "COMMENT",
+                "Summary",
+                {"1": self.comment(), "2": self.comment(line=12), "3": self.comment()},
+            )
+
+        with self.assertRaisesRegex(
+            session_store.Conflict, "missing beats 2; extra beats 3"
+        ):
+            self.store.prepare_review(
+                "COMMENT",
+                "Summary",
+                {"1": self.comment(), "3": self.comment()},
+            )
+        self.assertEqual(self.store.review_intents(), [])
+
+    def test_prepare_review_covers_failed_review_deliveries_and_excludes_landed_ones(self):
+        first = self.accept(1)
+        prepared_one = self.store.prepare_review(
+            "COMMENT", "Round one", {"1": self.comment()}
+        )
+        self.store.land_intent(prepared_one["intent_id"], "https://example.test/r/1")
+
+        second = self.accept(2)
+        self.store.fail(second["seq"], "rejected", "retry review")
+
+        with self.assertRaisesRegex(session_store.Conflict, "extra beats 1"):
+            self.store.prepare_review(
+                "COMMENT", "Round two", {"1": self.comment(), "2": self.comment(line=12)}
+            )
+
+        prepared_two = self.store.prepare_review(
+            "COMMENT", "Round two", {"2": self.comment(line=12)}
+        )
+        self.assertEqual(
+            [(item["beat_n"], item["action_seq"]) for item in prepared_two["beats"]],
+            [(2, second["seq"])],
+        )
+        self.assertNotEqual(first["seq"], second["seq"])
+
+    def test_prepare_review_enforces_marker_neutralization_and_body_size_limit(self):
+        self.accept(1)
+        foreign = "<!-- underwrite-review:" + "0" * 32 + " -->"
+
+        with self.assertRaisesRegex(
+            session_store.StoreError, "conflicting delivery marker"
+        ):
+            self.store.prepare_review(
+                "COMMENT", f"Summary\n\n{foreign}", {"1": self.comment()}
+            )
+
+        with self.assertRaisesRegex(session_store.StoreError, "65,536"):
+            self.store.prepare_review(
+                "COMMENT", "x" * 65_530, {"1": self.comment()}
+            )
+
+        folded = self.store.prepare_review(
+            "COMMENT",
+            "Summary",
+            {"1": self.comment(path="outside.py", line=1, body=f"Quoted {foreign}")},
+        )
+        payload = json.loads(
+            self.store.review_intent(folded["intent_id"], include_payload=True)["payload"].decode("utf-8")
+        )
+        self.assertNotIn(foreign, payload["body"])
+        self.assertTrue(payload["body"].endswith(self.store.review_marker()))
+
+    def test_prepare_review_idempotency_single_nonterminal_and_replace_rules(self):
+        self.accept(1)
+        first = self.store.prepare_review(
+            "COMMENT", "Summary", {"1": self.comment()}
+        )
+        again = self.store.prepare_review(
+            "COMMENT", "Summary", {"1": self.comment()}
+        )
+        self.assertEqual(again["intent_id"], first["intent_id"])
+        self.assertEqual(len(self.store.review_intents()), 1)
+
+        with self.assertRaisesRegex(session_store.Conflict, "pass --replace"):
+            self.store.prepare_review(
+                "APPROVE", "Summary", {"1": self.comment()}
+            )
+
+        replaced = self.store.prepare_review(
+            "APPROVE", "Summary", {"1": self.comment()}, replace=True
+        )
+        self.assertNotEqual(replaced["intent_id"], first["intent_id"])
+        self.assertEqual(
+            self.store.review_intent(first["intent_id"])["state"], "replaced"
+        )
+        self.assertEqual(replaced["state"], "prepared")
+
+        with connected(str(self.root / "session.sqlite3")) as db:
+            db.execute(
+                "UPDATE review_intents SET state = 'submitting', submitting_at = '2026-01-01T00:00:00Z' "
+                "WHERE intent_id = ?",
+                (replaced["intent_id"],),
+            )
+        same_while_submitting = self.store.prepare_review(
+            "APPROVE", "Summary", {"1": self.comment()}
+        )
+        self.assertEqual(same_while_submitting["intent_id"], replaced["intent_id"])
+        self.assertEqual(same_while_submitting["state"], "submitting")
+
+        with self.assertRaisesRegex(
+            session_store.Conflict, "only a never-posted prepared intent can be replaced"
+        ):
+            self.store.prepare_review(
+                "REQUEST_CHANGES", "Summary", {"1": self.comment()}, replace=True
+            )
+
+    def test_land_intent_lands_only_covered_beats_atomically_and_leaves_later_accepts_pending(self):
+        self.accept(1)
+        prepared = self.store.prepare_review(
+            "COMMENT", "Summary", {"1": self.comment()}
+        )
+        later = self.accept(2)
+        entry = {
+            "state": "landed",
+            "what": "beat 1 review",
+            "where": "https://example.test/reviews/99",
+        }
+
+        landed = self.store.land_intent(
+            prepared["intent_id"], "https://example.test/reviews/99", entry=entry
+        )
+
+        self.assertEqual(landed["state"], "landed")
+        self.assertEqual(landed["review_url"], "https://example.test/reviews/99")
+        self.assertEqual(len(landed["deliveries"]), 1)
+        self.assertEqual(landed["deliveries"][0]["beat_n"], 1)
+
+        idempotent = self.store.land_intent(
+            prepared["intent_id"], "https://example.test/reviews/99", entry=entry
+        )
+        self.assertEqual(idempotent["state"], "landed")
+        with self.assertRaisesRegex(session_store.Conflict, "already landed"):
+            self.store.land_intent(
+                prepared["intent_id"], "https://example.test/reviews/other"
+            )
+
+        session, beats = self.store.snapshot()
+        by_n = {beat["n"]: beat for beat in beats}
+        self.assertEqual(by_n[1]["landed"], "https://example.test/reviews/99")
+        self.assertEqual(by_n[1]["delivery_kind"], "review")
+        self.assertNotIn("landed", by_n[2])
+        self.assertEqual(session["lands"], [entry])
+
+        reconciled = self.store.reconcile()
+        self.assertEqual(
+            [(item["beat_n"], item["cause_seq"]) for item in reconciled["pending_deliveries"]],
+            [(2, later["seq"])],
+        )
+
+    def test_land_intent_rolls_back_atomically_on_fault(self):
+        self.accept(1)
+        self.accept(2)
+        prepared = self.store.prepare_review(
+            "COMMENT",
+            "Summary",
+            {"1": self.comment(), "2": self.comment(line=12)},
+        )
+
+        with (
+            mock.patch.object(
+                self.store, "_save_session", side_effect=OSError("disk full")
+            ),
+            self.assertRaises(OSError),
+        ):
+            self.store.land_intent(
+                prepared["intent_id"], "https://example.test/reviews/5"
+            )
+
+        self.assertEqual(
+            self.store.review_intent(prepared["intent_id"])["state"], "prepared"
+        )
+        session, beats = self.store.snapshot()
+        self.assertEqual(session.get("lands", []), [])
+        for beat in beats:
+            self.assertNotIn("landed", beat)
+        self.assertEqual(
+            [item["beat_n"] for item in self.store.reconcile()["pending_deliveries"]],
+            [1, 2],
+        )
+
+    def test_prepare_review_allows_zero_pending_beats_when_comments_empty(self):
+        prepared = self.store.prepare_review("APPROVE", "Looks clean.", {})
+
+        self.assertEqual(prepared["beats"], [])
+        self.assertEqual(prepared["comment_count"], 0)
+        landed = self.store.land_intent(
+            prepared["intent_id"], "https://example.test/reviews/clean"
+        )
+        self.assertEqual(landed["state"], "landed")
+        self.assertEqual(landed["deliveries"], [])
+
+    def test_land_intent_refuses_if_covered_beat_changed_after_prepare(self):
+        self.accept(1)
+        prepared = self.store.prepare_review(
+            "COMMENT", "Summary", {"1": self.comment()}
+        )
+        changed = dict(self.store.snapshot()[1][0], claim="rewritten claim")
+        self.store.put_beat(changed)
+
+        with self.assertRaisesRegex(
+            session_store.Conflict, "content changed since review intent"
+        ):
+            self.store.land_intent(
+                prepared["intent_id"], "https://example.test/reviews/99"
+            )
+        self.assertEqual(
+            self.store.review_intent(prepared["intent_id"])["state"], "prepared"
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

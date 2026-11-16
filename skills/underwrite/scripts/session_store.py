@@ -4,6 +4,7 @@ import base64
 import contextlib
 import fcntl
 import hashlib
+import importlib.util
 import json
 import os
 import re
@@ -31,6 +32,21 @@ FINDINGS_FILE = "findings.md"
 EXECUTION_POLICY_VERSION = 1
 EXECUTION_MODES = ("no_exec", "gateway_attested")
 AUDIENCE_MODES = ("branch", "review", "report")
+REVIEW_EVENTS = ("COMMENT", "APPROVE", "REQUEST_CHANGES")
+REVIEW_FIXED_FILE = "review.fixed.json"
+_VALIDATE_ANCHORS_MODULE = None
+
+
+def _validate_anchors():
+    global _VALIDATE_ANCHORS_MODULE
+    if _VALIDATE_ANCHORS_MODULE is None:
+        spec = importlib.util.spec_from_file_location(
+            "validate_anchors", Path(HERE) / "validate-anchors.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _VALIDATE_ANCHORS_MODULE = module
+    return _VALIDATE_ANCHORS_MODULE
 BEAT_SLOTS = ("what", "why", "proof", "risk", "prior", "fix")
 BEAT_STATES = ("clean", "flag", "unverified", "accepted", "dropped", "decided")
 BLOCKED_COMMIT_DELIVERY_REASON = (
@@ -5045,6 +5061,420 @@ class SessionStore:
                 self._bump_render(db)
             return self._delivery_receipt(seq, beat_n, "failed", desired)
 
+    def _review_token(self, session_id):
+        token = hashlib.sha256(session_id.encode("utf-8")).hexdigest()[:32]
+        return f"<!-- underwrite-review:{token} -->"
+
+    def _review_comments_input(self, comments):
+        if not isinstance(comments, dict):
+            raise StoreError("review comments must be a JSON object keyed by beat number")
+        parsed = {}
+        for key, value in comments.items():
+            if not isinstance(key, str) or not re.fullmatch(r"[1-9][0-9]*", key):
+                raise StoreError(f"review comment key {key!r} must be a positive beat number")
+            beat_n = int(key)
+            if not isinstance(value, dict):
+                raise StoreError(f"review comment for beat {beat_n} must be an object")
+            path = value.get("path")
+            if not isinstance(path, str) or not path.strip():
+                raise StoreError(f"review comment for beat {beat_n} requires path")
+            line = value.get("line")
+            if type(line) is not int or line <= 0:
+                raise StoreError(f"review comment for beat {beat_n} requires a positive integer line")
+            side = value.get("side", "RIGHT")
+            if side not in ("LEFT", "RIGHT"):
+                raise StoreError(f"review comment for beat {beat_n} side must be LEFT or RIGHT")
+            comment_body = value.get("body")
+            if not isinstance(comment_body, str) or not comment_body.strip():
+                raise StoreError(f"review comment for beat {beat_n} requires non-empty body")
+            item = _copy(value)
+            item["side"] = side
+            if "start_line" in item and item["start_line"] is not None:
+                if type(item["start_line"]) is not int or item["start_line"] <= 0:
+                    raise StoreError(
+                        f"review comment for beat {beat_n} start_line must be a positive integer"
+                    )
+                start_side = item.get("start_side", side)
+                if start_side not in ("LEFT", "RIGHT"):
+                    raise StoreError(
+                        f"review comment for beat {beat_n} start_side must be LEFT or RIGHT"
+                    )
+                item["start_side"] = start_side
+            parsed[beat_n] = item
+        return parsed
+
+    def _pending_review_beats(self, db):
+        owed = {}
+        for row in db.execute(
+            "SELECT n, revision, body_json, delivery_state, delivery_json FROM beats "
+            "WHERE delivery_state IN ('pending', 'failed') ORDER BY n"
+        ):
+            beat = json.loads(row["body_json"])
+            detail = json.loads(row["delivery_json"]) if row["delivery_json"] else {}
+            if beat.get("state") != "accepted" or detail.get("kind") != "review":
+                continue
+            cause_seq = detail.get("cause_seq")
+            if type(cause_seq) is not int or cause_seq <= 0:
+                raise Conflict(f"beat {row['n']} has no valid accept action sequence")
+            owed[row["n"]] = {
+                "beat_n": row["n"],
+                "action_seq": cause_seq,
+                "beat_revision": row["revision"],
+                "beat_sha256": hashlib.sha256(
+                    self._pinned_beat(beat).encode("utf-8")
+                ).hexdigest(),
+                "claim": beat.get("claim", ""),
+            }
+        return owed
+
+    def _review_intent_row(self, db, intent_id):
+        if not isinstance(intent_id, str) or not _SHA256.fullmatch(intent_id):
+            raise StoreError("review intent id must be a SHA-256 digest")
+        row = db.execute(
+            "SELECT * FROM review_intents WHERE intent_id = ?", (intent_id,)
+        ).fetchone()
+        if row is None:
+            raise StoreError(f"no review intent {intent_id}")
+        return row
+
+    def _review_intent_document(self, row, *, include_payload=False):
+        payload_bytes = bytes(row["payload"])
+        payload_obj = json.loads(payload_bytes.decode("utf-8"))
+        report = json.loads(row["report_json"])
+        snapped = sum(1 for line in report if line.startswith("snap "))
+        folded = sum(1 for line in report if line.startswith("fold "))
+        document = {
+            "intent_id": row["intent_id"],
+            "event": row["event"],
+            "state": row["state"],
+            "payload_sha256": row["payload_sha256"],
+            "beats": json.loads(row["beats_json"]),
+            "comment_count": len(payload_obj.get("comments", ())),
+            "anchors_snapped": snapped,
+            "anchors_folded": folded,
+            "anchor_report": report,
+            "review_url": row["review_url"],
+            "land_entry": (
+                None if row["land_entry_json"] is None else json.loads(row["land_entry_json"])
+            ),
+            "failure": row["failure"],
+            "created_at": row["created_at"],
+            "submitting_at": row["submitting_at"],
+            "landed_at": row["landed_at"],
+            "failed_at": row["failed_at"],
+            "replaced_at": row["replaced_at"],
+        }
+        if include_payload:
+            document["payload"] = payload_bytes
+        return document
+
+    def review_intent(self, intent_id, *, include_payload=False):
+        with self._read() as db:
+            row = self._review_intent_row(db, intent_id)
+            return self._review_intent_document(row, include_payload=include_payload)
+
+    def review_intents(self):
+        with self._read() as db:
+            return [
+                self._review_intent_document(row)
+                for row in db.execute(
+                    "SELECT * FROM review_intents ORDER BY created_at, intent_id"
+                )
+            ]
+
+    def prepare_review(self, event, body, comments, *, replace=False):
+        if event not in REVIEW_EVENTS:
+            raise StoreError(
+                f"review event must be one of {', '.join(REVIEW_EVENTS)}"
+            )
+        if not isinstance(body, str):
+            raise StoreError("review body must be text")
+        parsed_comments = self._review_comments_input(comments)
+        va = _validate_anchors()
+
+        with self._first_work_write() as db:
+            session_row = self._session_row(db)
+            session, execution_policy = self._session_execution_policy(db)
+            if self._expected_delivery_kind(session) != "review":
+                raise Conflict(
+                    f"review preparation does not match {session.get('audience')!r}"
+                )
+            replacement_reason = self._replacement_reason(session, execution_policy)
+            if replacement_reason:
+                raise Conflict(
+                    replacement_reason + "; start a supervised replacement session"
+                )
+            target = session.get("target")
+            if not isinstance(target, dict):
+                raise Conflict("session has no frozen target")
+            diff = self._verified_diff_bytes(target).decode("utf-8")
+            marker = self._review_token(session_row["session_id"])
+
+            owed = self._pending_review_beats(db)
+            missing = sorted(set(owed) - set(parsed_comments))
+            extra = sorted(set(parsed_comments) - set(owed))
+            if missing or extra:
+                parts = []
+                if missing:
+                    parts.append("missing beats " + ", ".join(map(str, missing)))
+                if extra:
+                    parts.append("extra beats " + ", ".join(map(str, extra)))
+                raise Conflict(
+                    "review comments must cover pending accepted beats exactly: "
+                    + "; ".join(parts)
+                )
+
+            covered = [
+                {
+                    "beat_n": item["beat_n"],
+                    "action_seq": item["action_seq"],
+                    "beat_revision": item["beat_revision"],
+                    "beat_sha256": item["beat_sha256"],
+                }
+                for _, item in sorted(owed.items())
+            ]
+            ordered_comments = [
+                _copy(parsed_comments[beat_n]) for beat_n in sorted(parsed_comments)
+            ]
+            payload = {
+                "body": body,
+                "commit_id": target["head_sha"],
+                "event": event,
+                "comments": ordered_comments,
+            }
+            report = va.prepare_review_payload(
+                payload, diff, target=target, marker=marker, error_cls=StoreError
+            )
+            payload_bytes = (json.dumps(payload, indent=2) + "\n").encode("utf-8")
+            payload_sha256 = hashlib.sha256(payload_bytes).hexdigest()
+
+            active = db.execute(
+                "SELECT * FROM review_intents "
+                "WHERE state IN ('prepared', 'submitting')"
+            ).fetchone()
+            if active is not None:
+                active_beats = json.loads(active["beats_json"])
+                if (
+                    active["event"] == event
+                    and active["payload_sha256"] == payload_sha256
+                    and active_beats == covered
+                ):
+                    intent_doc = self._review_intent_document(active)
+                    _atomic_write(self.root / REVIEW_FIXED_FILE, payload_bytes)
+                    intent_doc["payload_file"] = str(self.root / REVIEW_FIXED_FILE)
+                    return intent_doc
+                if not replace:
+                    raise Conflict(
+                        f"non-terminal review intent {active['intent_id']} is already "
+                        f"{active['state']}; pass --replace to replace a prepared intent"
+                    )
+                if active["state"] != "prepared":
+                    raise Conflict(
+                        f"cannot replace review intent {active['intent_id']} in state "
+                        f"{active['state']}; only a never-posted prepared intent can be replaced"
+                    )
+                db.execute(
+                    "UPDATE review_intents SET state = 'replaced', replaced_at = ? "
+                    "WHERE intent_id = ?",
+                    (_now(), active["intent_id"]),
+                )
+
+            attempt = db.execute(
+                "SELECT COUNT(*) + 1 FROM review_intents"
+            ).fetchone()[0]
+            bound = {
+                "version": 1,
+                "session_id": session_row["session_id"],
+                "attempt": attempt,
+                "event": event,
+                "payload_sha256": payload_sha256,
+                "beats": covered,
+            }
+            intent_id = hashlib.sha256(_dump(bound).encode("utf-8")).hexdigest()
+            timestamp = _now()
+            db.execute(
+                "INSERT INTO review_intents "
+                "(intent_id, event, payload, payload_sha256, beats_json, report_json, "
+                "state, created_at) VALUES (?, ?, ?, ?, ?, ?, 'prepared', ?)",
+                (
+                    intent_id,
+                    event,
+                    payload_bytes,
+                    payload_sha256,
+                    _dump(covered),
+                    _dump(report),
+                    timestamp,
+                ),
+            )
+            row = self._review_intent_row(db, intent_id)
+            intent_doc = self._review_intent_document(row)
+            _atomic_write(self.root / REVIEW_FIXED_FILE, payload_bytes)
+            intent_doc["payload_file"] = str(self.root / REVIEW_FIXED_FILE)
+            return intent_doc
+
+    def land_intent(self, intent_id, review_url, entry=None):
+        if not isinstance(review_url, str) or not review_url.strip():
+            raise StoreError("review_url must be non-empty text")
+        review_url = review_url.strip()
+        if entry is not None and not isinstance(entry, dict):
+            raise StoreError("land entry must be an object")
+
+        with self._write() as db:
+            intent = self._review_intent_row(db, intent_id)
+            covered = json.loads(intent["beats_json"])
+            session, execution_policy = self._session_execution_policy(db)
+            if self._expected_delivery_kind(session) != "review":
+                raise Conflict(
+                    f"review delivery does not match {session.get('audience')!r}"
+                )
+            replacement_reason = self._replacement_reason(session, execution_policy)
+            if replacement_reason:
+                raise Conflict(
+                    replacement_reason + "; start a supervised replacement session"
+                )
+
+            if entry is not None:
+                land_entry = _copy(entry)
+            elif intent["land_entry_json"] is not None:
+                land_entry = json.loads(intent["land_entry_json"])
+            else:
+                land_entry = {
+                    "state": "landed",
+                    "what": "the accepted findings" if covered else "GitHub review",
+                    "where": review_url,
+                }
+
+            if intent["state"] == "landed":
+                stored_entry = (
+                    None
+                    if intent["land_entry_json"] is None
+                    else json.loads(intent["land_entry_json"])
+                )
+                if intent["review_url"] != review_url or (
+                    entry is not None and stored_entry != land_entry
+                ):
+                    raise Conflict(
+                        f"review intent {intent_id} already landed as {intent['review_url']}"
+                    )
+                receipts = []
+                for item in covered:
+                    beat_row = self._beat_row(db, item["beat_n"])
+                    current = (
+                        json.loads(beat_row["delivery_json"])
+                        if beat_row["delivery_json"]
+                        else None
+                    )
+                    if beat_row["delivery_state"] != "landed" or current is None:
+                        raise Conflict(
+                            f"landed review intent beat {item['beat_n']} is no longer landed"
+                        )
+                    receipts.append(
+                        self._delivery_receipt(
+                            item["action_seq"], item["beat_n"], "landed", current
+                        )
+                    )
+                doc = self._review_intent_document(intent)
+                doc["deliveries"] = receipts
+                return doc
+
+            if intent["state"] not in ("prepared", "submitting"):
+                raise Conflict(
+                    f"review intent {intent_id} is {intent['state']}, cannot land"
+                )
+
+            any_beat_changed = False
+            receipts = []
+            timestamp = _now()
+            for item in covered:
+                seq = item["action_seq"]
+                beat_n = item["beat_n"]
+                action = self._action_row(db, seq)
+                if action["kind"] != "accept" or action["beat_n"] != beat_n:
+                    raise Conflict(f"action {seq} is not the accept for beat {beat_n}")
+                if action["state"] not in ("applied", "acked"):
+                    raise Conflict(
+                        f"accept action {seq} is {action['state']}, not applied"
+                    )
+                if action["state"] == "applied":
+                    self._require_head(db, seq)
+                    db.execute(
+                        "UPDATE actions SET state = 'acked', acked_at = ? WHERE seq = ?",
+                        (timestamp, seq),
+                    )
+                beat_row = self._beat_row(db, beat_n)
+                beat = json.loads(beat_row["body_json"])
+                current = (
+                    json.loads(beat_row["delivery_json"])
+                    if beat_row["delivery_json"]
+                    else None
+                )
+                if current and current.get("kind") not in (None, "review"):
+                    raise Conflict(
+                        f"beat {beat_n} expects {current.get('kind')} delivery, not review"
+                    )
+                if beat.get("state") != "accepted":
+                    raise Conflict(
+                        f"beat {beat_n} is {beat.get('state')}, not accepted"
+                    )
+                pinned_sha256 = hashlib.sha256(
+                    self._pinned_beat(beat).encode("utf-8")
+                ).hexdigest()
+                if pinned_sha256 != item["beat_sha256"]:
+                    raise Conflict(
+                        f"beat {beat_n} content changed since review intent {intent_id} was prepared"
+                    )
+                desired = {
+                    "artifact": review_url,
+                    "branch": None,
+                    "cause_seq": seq,
+                    "kind": "review",
+                    "entry": land_entry,
+                    "intent_id": intent_id,
+                }
+                if beat_row["delivery_state"] == "landed":
+                    if current != desired:
+                        raise Conflict(
+                            f"beat {beat_n} already landed as {(current or {}).get('artifact')}"
+                        )
+                    receipts.append(
+                        self._delivery_receipt(seq, beat_n, "landed", current)
+                    )
+                    continue
+                beat["landed"] = review_url
+                beat["delivery_kind"] = "review"
+                beat.pop("branch", None)
+                beat_changed, _revision, _state, _detail = self._save_beat(
+                    db, beat, "landed", desired
+                )
+                any_beat_changed = any_beat_changed or beat_changed
+                receipts.append(
+                    self._delivery_receipt(seq, beat_n, "landed", desired)
+                )
+
+            session_row = self._session_row(db)
+            session = json.loads(session_row["body_json"])
+            lands = session.setdefault("lands", [])
+            if not isinstance(lands, list):
+                raise StoreError("session lands must be a list")
+            session_changed = False
+            if covered and land_entry not in lands:
+                lands.append(land_entry)
+                session_changed = self._save_session(
+                    db, session, allow_new_lands=True
+                )
+
+            db.execute(
+                "UPDATE review_intents SET state = 'landed', review_url = ?, "
+                "land_entry_json = ?, landed_at = ? WHERE intent_id = ?",
+                (review_url, _dump(land_entry), timestamp, intent_id),
+            )
+            if any_beat_changed or session_changed:
+                self._bump_render(db)
+            updated = self._review_intent_row(db, intent_id)
+            doc = self._review_intent_document(updated)
+            doc["deliveries"] = receipts
+            return doc
+
     def delivery_state(self):
         with self._read() as db:
             produced = db.execute("SELECT COALESCE(MAX(seq), 0) FROM actions").fetchone()[0]
@@ -5210,9 +5640,8 @@ class SessionStore:
     # ---- compatibility export ----------------------------------------
 
     def export_json(self):
-        with self._session_lock():
-            with self._read() as db:
-                return self._export_locked(db)
+        with self._session_lock(), self._read() as db:
+            return self._export_locked(db)
 
     def _export_locked(self, db):
         session_row = self._session_row(db)

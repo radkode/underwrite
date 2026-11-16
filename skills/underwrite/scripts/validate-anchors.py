@@ -19,11 +19,19 @@ import re
 import sys
 from pathlib import Path
 
-
 HERE = Path(__file__).resolve().parent
 if str(HERE) not in sys.path:
     sys.path.insert(0, str(HERE))
 
+from diff_lines import (  # noqa: E402,F401
+    HUNK,
+    SNAP_WINDOW,
+    clean_path,
+    hunk_holding,
+    mark,
+    parse_diff,
+    snap,
+)
 from session_store import SessionStore, StoreError  # noqa: E402
 
 REVIEW_MARKER = re.compile(r"<!-- underwrite-review:[0-9a-f]{32} -->")
@@ -37,10 +45,6 @@ def _neutralize_marker(text):
         text,
         flags=re.IGNORECASE,
     )
-
-from diff_lines import (  # noqa: E402,F401
-    HUNK, SNAP_WINDOW, clean_path, hunk_holding, mark, parse_diff, snap,
-)
 
 
 def validate(payload, files):
@@ -62,12 +66,12 @@ def validate(payload, files):
                 if sides is None:
                     why = "file not in diff"
                 elif not valid:
-                    why = "file has no %s lines in the diff" % side
+                    why = f"file has no {side} lines in the diff"
                 else:
-                    why = "no hunk within %d lines" % SNAP_WINDOW
-                report.append("fold  %s:%s %s  (%s)" % (path, line, side, why))
+                    why = f"no hunk within {SNAP_WINDOW} lines"
+                report.append(f"fold  {path}:{line} {side}  ({why})")
                 continue
-            report.append("snap  %s %s  %s -> %s" % (path, side, line, fixed))
+            report.append(f"snap  {path} {side}  {line} -> {fixed}")
             c["line"] = fixed
 
         # A multiline comment carries its start too, and GitHub rejects the whole
@@ -92,7 +96,7 @@ def validate(payload, files):
                 c.pop("start_line", None)
                 c.pop("start_side", None)
                 report.append(
-                    "      dropped start_line %s on %s:%s (%s)" % (start, path, fixed, why)
+                    f"      dropped start_line {start} on {path}:{fixed} ({why})"
                 )
         kept.append(c)
 
@@ -100,15 +104,50 @@ def validate(payload, files):
 
     if folded:
         lines = [
-            "`%s:%s` %s" % (
-                c.get("path"),
-                c.get("line"),
-                _neutralize_marker(str(c.get("body", "")).strip()),
-            )
+            f"`{c.get('path')}:{c.get('line')}` {_neutralize_marker(str(c.get('body', '')).strip())}"
             for c in folded
         ]
         payload["body"] = ((payload.get("body") or "").rstrip() + "\n\n" + "\n".join(lines)).strip()
 
+    return report
+
+
+def prepare_review_payload(payload, diff, target=None, marker="", error_cls=StoreError):
+    if not isinstance(payload, dict):
+        raise error_cls("review payload must be an object")
+    body = payload.get("body", "")
+    if body is None:
+        body = ""
+    if not isinstance(body, str):
+        raise error_cls("review payload body must be text")
+    if target is not None:
+        if payload.get("event") not in (
+            "COMMENT",
+            "APPROVE",
+            "REQUEST_CHANGES",
+        ):
+            raise error_cls(
+                "review payload event must submit a final review, not leave it pending"
+            )
+        commit_id = payload.get("commit_id")
+        if commit_id is None:
+            payload["commit_id"] = target["head_sha"]
+        elif commit_id != target["head_sha"]:
+            raise error_cls("review payload commit_id does not match the frozen head")
+        markers = REVIEW_MARKER.findall(body)
+        if markers and markers != [marker]:
+            raise error_cls("review payload has a conflicting delivery marker")
+        body = REVIEW_MARKER.sub("", body).rstrip()
+    payload["body"] = body
+    report = validate(payload, parse_diff(diff))
+    if target is not None:
+        payload["body"] = (payload.get("body", "").rstrip() + "\n\n" + marker).strip()
+    final_body = payload.get("body", "")
+    if len(final_body) > MAX_REVIEW_BODY_CHARS:
+        raise error_cls(
+            f"review payload body is {len(final_body):,} characters, "
+            f"over GitHub's {MAX_REVIEW_BODY_CHARS:,}-character limit"
+        )
     return report
 
 
@@ -149,43 +188,9 @@ def main():
 
         with open(args.payload, encoding="utf-8") as fh:
             payload = json.load(fh)
-        if not isinstance(payload, dict):
-            raise StoreError("review payload must be an object")
-        body = payload.get("body", "")
-        if body is None:
-            body = ""
-        if not isinstance(body, str):
-            raise StoreError("review payload body must be text")
-        if target is not None:
-            if payload.get("event") not in (
-                "COMMENT",
-                "APPROVE",
-                "REQUEST_CHANGES",
-            ):
-                raise StoreError(
-                    "review payload event must submit a final review, not leave it pending"
-                )
-            commit_id = payload.get("commit_id")
-            if commit_id is None:
-                payload["commit_id"] = target["head_sha"]
-            elif commit_id != target["head_sha"]:
-                raise StoreError("review payload commit_id does not match the frozen head")
-            markers = REVIEW_MARKER.findall(body)
-            if markers and markers != [marker]:
-                raise StoreError("review payload has a conflicting delivery marker")
-            body = REVIEW_MARKER.sub("", body).rstrip()
-        payload["body"] = body
-        report = validate(payload, parse_diff(diff))
-        if target is not None:
-            payload["body"] = (payload.get("body", "").rstrip() + "\n\n" + marker).strip()
-        final_body = payload.get("body", "")
-        if len(final_body) > MAX_REVIEW_BODY_CHARS:
-            raise StoreError(
-                f"review payload body is {len(final_body):,} characters, "
-                f"over GitHub's {MAX_REVIEW_BODY_CHARS:,}-character limit"
-            )
+        report = prepare_review_payload(payload, diff, target=target, marker=marker)
     except (OSError, UnicodeError, json.JSONDecodeError, StoreError) as e:
-        sys.exit("validate-anchors: %s" % e)
+        sys.exit(f"validate-anchors: {e}")
 
     out = json.dumps(payload, indent=2)
 
