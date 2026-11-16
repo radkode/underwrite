@@ -4952,6 +4952,28 @@ class SessionStore:
                 raise Conflict(
                     f"beat {beat_n} expects {current.get('kind')} delivery, not {kind}"
                 )
+            review_intent_id = None
+            if kind == "review":
+                replacement_reason = self._replacement_reason(session, execution_policy)
+                if replacement_reason:
+                    raise Conflict(
+                        replacement_reason + "; start a supervised replacement session"
+                    )
+                for intent in db.execute(
+                    "SELECT intent_id, beats_json FROM review_intents "
+                    "WHERE state = 'landed' AND review_url = ?", (artifact,)
+                ):
+                    if any(
+                        item["beat_n"] == beat_n and item["action_seq"] == seq
+                        for item in json.loads(intent["beats_json"])
+                    ):
+                        review_intent_id = intent["intent_id"]
+                        break
+                if review_intent_id is None:
+                    raise Conflict(
+                        f"beat {beat_n} is not covered by a landed review intent for "
+                        f"{artifact}; use land_intent / submit-review"
+                    )
             default_entry = {
                 "state": "landed",
                 "what": beat.get("claim", ""),
@@ -4970,6 +4992,8 @@ class SessionStore:
                 "kind": kind,
                 "entry": entry,
             }
+            if review_intent_id is not None:
+                desired["intent_id"] = review_intent_id
             if row["delivery_state"] == "landed":
                 if current != desired:
                     raise Conflict(f"beat {beat_n} already landed as {current.get('artifact')}")

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Composed tests for the prompt-owned branch and review workflows."""
 
+import importlib.util
 import json
 import stat
 import sys
@@ -10,6 +11,14 @@ if __package__:
     from .workflow_support import ROOT, WorkflowCase, flag
 else:
     from workflow_support import ROOT, WorkflowCase, flag
+
+
+SPEC = importlib.util.spec_from_file_location(
+    "session_store", ROOT / "skills" / "underwrite" / "scripts" / "session_store.py"
+)
+assert SPEC is not None and SPEC.loader is not None
+session_store = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(session_store)
 
 
 class BranchWorkflow(WorkflowCase):
@@ -297,33 +306,23 @@ class ReviewWorkflow(WorkflowCase):
         return actions
 
     def validated_payload(self, numbers):
-        source = self.session / "review.json"
+        body = self.session / "review-body.txt"
+        comments = self.session / "review-comments.json"
+        body.write_text("Underwrite findings", encoding="utf-8")
+        self.write_json(comments, {
+            str(number): {
+                "path": "app.py",
+                "line": number,
+                "side": "RIGHT",
+                "body": self.beats[number - 1]["claim"],
+            }
+            for number in numbers
+        })
+        self.prepared_intent = self.script_json(
+            "sessionctl.py", "prepare-review", self.session,
+            "--event", "COMMENT", "--body-file", body, "--comments-file", comments,
+        )
         fixed = self.session / "review.fixed.json"
-        self.write_json(
-            source,
-            {
-                "body": "Underwrite findings",
-                "event": "COMMENT",
-                "comments": [
-                    {
-                        "path": "app.py",
-                        "line": number,
-                        "side": "RIGHT",
-                        "body": self.beats[number - 1]["claim"],
-                    }
-                    for number in numbers
-                ],
-            },
-        )
-        self.script(
-            "validate-anchors.py",
-            "--session",
-            self.session,
-            "--payload",
-            source,
-            "--out",
-            fixed,
-        )
         return fixed, json.loads(fixed.read_text(encoding="utf-8"))
 
     def check_pr(self, expected=0, require_open=True):
@@ -381,32 +380,13 @@ class ReviewWorkflow(WorkflowCase):
         )
 
     def land_reconciled(self, url):
-        entry = self.session / "review-land.json"
-        self.write_json(
-            entry,
-            {
-                "state": "landed",
-                "what": "the accepted findings",
-                "where": url,
-            },
-        )
-        recovery = self.script_json("sessionctl.py", "reconcile", self.session)
-        deliveries = (
-            recovery["pending_deliveries"] + recovery["failed_deliveries"]
-        )
-        for delivery in deliveries:
-            self.script_json(
-                "sessionctl.py",
-                "land",
-                self.session,
-                delivery["cause_seq"],
-                delivery["beat_n"],
-                url,
-                "--kind",
-                "review",
-                "--entry",
-                entry,
-            )
+        store = session_store.SessionStore(self.session)
+        store.land_intent(self.prepared_intent["intent_id"], url, entry={
+            "state": "landed",
+            "what": "the accepted findings",
+            "where": url,
+        })
+        store.export_json()
 
     def persist_review_outcome(self, url, status="complete"):
         patch = {

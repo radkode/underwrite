@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Command-line contracts for the transactional session store."""
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -411,6 +412,108 @@ class TargetCommands(SessionCtlCase):
         )
         script.chmod(0o755)
         return dict(os.environ, PATH=f"{binary}:{os.environ.get('PATH', '')}")
+
+    def review_inputs(self):
+        store = self.store()
+        for number in (1, 2):
+            store.put_beat(dict(FLAG, n=number))
+            action = store.produce(f"accept-{number}", number, "accept", "include it")
+            store.ack(action["seq"])
+        body = self.root / "body.txt"
+        comments = self.root / "comments.json"
+        body.write_text("Résumé", encoding="utf-8")
+        comments.write_text(json.dumps({
+            "1": {"path": "a.py", "line": 3, "side": "RIGHT", "body": "Snap it."},
+            "2": {"path": "outside.py", "line": 99, "side": "RIGHT", "body": "Fold it."},
+        }), encoding="utf-8")
+        return [
+            "prepare-review", self.root, "--event", "REQUEST_CHANGES",
+            "--body-file", body, "--comments-file", comments,
+        ]
+
+    def test_prepare_review_prints_the_bound_payload_summary(self):
+        result = self.success(*self.review_inputs())
+
+        self.assertRegex(result["intent_id"], r"^[0-9a-f]{64}$")
+        self.assertEqual(result["event"], "REQUEST_CHANGES")
+        self.assertEqual([item["beat_n"] for item in result["beats"]], [1, 2])
+        self.assertEqual(result["anchors_snapped"], 1)
+        self.assertEqual(result["anchors_folded"], 1)
+        fixed = self.root / "review.fixed.json"
+        self.assertEqual(result["payload_file"], str(fixed))
+        payload_bytes = fixed.read_bytes()
+        self.assertEqual(result["payload_sha256"], hashlib.sha256(payload_bytes).hexdigest())
+        payload = json.loads(payload_bytes)
+        self.assertEqual(payload["commit_id"], self.head)
+        self.assertEqual(payload["event"], "REQUEST_CHANGES")
+        self.assertTrue(payload["body"].startswith("Résumé\n\n`outside.py:99` Fold it."))
+        self.assertEqual(payload["comments"], [
+            {"path": "a.py", "line": 1, "side": "RIGHT", "body": "Snap it."}
+        ])
+        self.assertEqual(self.store().review_intent(result["intent_id"])["state"], "prepared")
+
+    def test_prepare_review_missing_beat_exits_one_without_an_intent(self):
+        args = self.review_inputs()
+        comments = self.root / "comments.json"
+        document = json.loads(comments.read_text(encoding="utf-8"))
+        del document["2"]
+        comments.write_text(json.dumps(document), encoding="utf-8")
+
+        refused = self.invoke(*args)
+
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("missing beats 2", refused.stderr)
+        self.assertEqual(self.store().review_intents(), [])
+        self.assertFalse((self.root / "review.fixed.json").exists())
+
+    def test_prepare_review_replace_is_required_for_a_changed_prepared_payload(self):
+        args = self.review_inputs()
+        first = self.success(*args)
+        (self.root / "body.txt").write_text("Changed summary", encoding="utf-8")
+
+        refused = self.invoke(*args)
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("--replace", refused.stderr)
+        replaced = self.success(*args, "--replace")
+
+        self.assertNotEqual(first["intent_id"], replaced["intent_id"])
+        self.assertEqual(self.store().review_intent(first["intent_id"])["state"], "replaced")
+        self.assertEqual(self.store().review_intent(replaced["intent_id"])["state"], "prepared")
+        self.assertTrue(json.loads((self.root / "review.fixed.json").read_bytes())["body"].startswith("Changed summary"))
+
+    def test_prepare_review_confines_session_and_input_paths_including_symlinks(self):
+        args = self.review_inputs()
+        env = dict(os.environ, UNDERWRITE_CONFINE=str(self.root))
+        with tempfile.TemporaryDirectory() as outside:
+            external = Path(outside) / "input"
+            external.write_text("{}", encoding="utf-8")
+            link = self.root / "escaped-input"
+            link.symlink_to(external)
+            for option in ("--body-file", "--comments-file"):
+                for path in (external, link):
+                    with self.subTest(option=option, path=path):
+                        changed = list(args)
+                        changed[changed.index(option) + 1] = path
+                        refused = self.invoke(*changed, env=env)
+                        self.assertEqual(refused.returncode, 1)
+                        self.assertIn("outside UNDERWRITE_CONFINE", refused.stderr)
+            changed = list(args)
+            changed[1] = outside
+            refused = self.invoke(*changed, env=env)
+            self.assertEqual(refused.returncode, 1)
+            self.assertIn("outside UNDERWRITE_CONFINE", refused.stderr)
+        accepted = self.invoke(*args, env=env)
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+
+    def test_prepare_review_requires_comments_to_be_a_json_object(self):
+        args = self.review_inputs()
+        (self.root / "comments.json").write_text("[]", encoding="utf-8")
+
+        refused = self.invoke(*args)
+
+        self.assertEqual(refused.returncode, 1)
+        self.assertIn("review comments must be a JSON object", refused.stderr)
+        self.assertEqual(self.store().review_intents(), [])
 
     def test_check_pr_uses_exit_two_for_target_movement(self):
         exact = self.invoke("check-pr", self.root, env=self.gh(self.metadata))

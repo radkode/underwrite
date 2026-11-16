@@ -292,6 +292,15 @@ def parser():
     marker = commands.add_parser("review-marker")
     marker.add_argument("session")
 
+    prepare = commands.add_parser("prepare-review")
+    prepare.add_argument("session")
+    prepare.add_argument(
+        "--event", choices=("COMMENT", "REQUEST_CHANGES", "APPROVE"), required=True
+    )
+    prepare.add_argument("--body-file", required=True)
+    prepare.add_argument("--comments-file", required=True)
+    prepare.add_argument("--replace", action="store_true")
+
     receipt = commands.add_parser("review-receipt")
     receipt.add_argument("session")
     receipt.add_argument("source")
@@ -369,7 +378,7 @@ def confine(args):
     if not root:
         return
     boundary = Path(root).resolve()
-    for name in ("session", "predecessor", "reviews"):
+    for name in ("session", "predecessor", "reviews", "body_file", "comments_file"):
         value = getattr(args, name, None)
         if value is None:
             continue
@@ -426,6 +435,13 @@ def run(args):
     elif args.command == "review-marker":
         store = SessionStore(args.session)
         return review_identity(store)
+    elif args.command == "prepare-review":
+        body = Path(args.body_file).read_text(encoding="utf-8")
+        comments = object_input(args.comments_file, "review comments")
+        store = SessionStore(args.session)
+        result = store.prepare_review(
+            args.event, body, comments, replace=args.replace
+        )
     elif args.command == "review-receipt":
         store = SessionStore(args.session)
         return review_receipt(store, args.source, args.actor)

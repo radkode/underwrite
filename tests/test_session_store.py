@@ -1328,10 +1328,13 @@ class FrozenTargets(unittest.TestCase):
         accepted = self.store.produce("accept-1", 1, "accept", "include it")
         self.assertEqual(self.store.ack(accepted["seq"]), {"handled_seq": 1})
         self.assertTrue(self.store.delivery_state()["recovery"])
-        landed = self.store.land(
-            accepted["seq"], 1, "https://example.test/review/1", "review"
+        intent = self.store.prepare_review("COMMENT", "Summary", {
+            "1": {"path": "a.py", "line": 1, "side": "RIGHT", "body": "Pin it."}
+        })
+        landed = self.store.land_intent(
+            intent["intent_id"], "https://example.test/review/1"
         )
-        self.assertEqual(landed["kind"], "review")
+        self.assertEqual(landed["deliveries"][0]["kind"], "review")
         self.assertFalse(self.store.delivery_state()["recovery"])
         session = self.store.snapshot()[0]
         self.assertEqual(session["audience"]["mode"], "review")
@@ -4483,7 +4486,10 @@ class LinkedImplementations(unittest.TestCase):
         created = self.source.create_linked_implementation(link["link_id"])
         store = session_store.SessionStore(self.source_root)
         store.produce("note-1", 1, "note", "worth doing first")
-        store.land(self.source_action, 1, "review-url", "review")
+        intent = store.prepare_review("COMMENT", "Summary", {
+            "1": {"path": "a.py", "line": 1, "side": "RIGHT", "body": "Pin it."}
+        })
+        store.land_intent(intent["intent_id"], "review-url")
 
         resumed = store.authorize_implementation(
             self.source_action, 1, "reviewer", "implement this finding"
@@ -4566,7 +4572,10 @@ class LinkedImplementations(unittest.TestCase):
         """Nothing about an authorization may stand between a review and its PR."""
         _child, link, _created = self.create_child()
 
-        landed = self.source.land(self.source_action, 1, "review-url", "review")
+        intent = self.source.prepare_review("COMMENT", "Summary", {
+            "1": {"path": "a.py", "line": 1, "side": "RIGHT", "body": "Pin it."}
+        })
+        landed = self.source.land_intent(intent["intent_id"], "review-url")
 
         self.assertEqual(landed["state"], "landed")
         self.assertEqual(self.source.implementation_link(link["link_id"])["state"], "ready")
@@ -4780,6 +4789,29 @@ class ReviewIntents(unittest.TestCase):
 
     def comment(self, line=11, path="a.py", body="Fix this."):
         return {"path": path, "line": line, "side": "RIGHT", "body": body}
+
+    def test_direct_review_land_requires_a_landed_intent_for_the_same_beat_and_url(self):
+        first = self.accept(1)
+        url = "https://example.test/review/1"
+        with self.assertRaisesRegex(session_store.Conflict, "land_intent / submit-review"):
+            self.store.land(first["seq"], 1, url, "review")
+        intent = self.store.prepare_review(
+            "COMMENT", "Summary", {"1": self.comment()}
+        )
+        with self.assertRaisesRegex(session_store.Conflict, "land_intent / submit-review"):
+            self.store.land(first["seq"], 1, url, "review")
+        self.store.land_intent(intent["intent_id"], url)
+        replay = self.store.land(first["seq"], 1, url, "review")
+        self.assertEqual(replay["state"], "landed")
+        self.assertEqual(replay["intent_id"], intent["intent_id"])
+        with self.assertRaisesRegex(session_store.Conflict, "land_intent / submit-review"):
+            self.store.land(first["seq"], 1, url + "-other", "review")
+        second = self.accept(2)
+        with self.assertRaisesRegex(session_store.Conflict, "land_intent / submit-review"):
+            self.store.land(second["seq"], 2, url, "review")
+        self.assertEqual(
+            [item["beat_n"] for item in self.store.reconcile()["pending_deliveries"]], [2]
+        )
 
     def test_prepare_review_persists_intent_validates_anchors_and_writes_fixed_json(self):
         first = self.accept(1)
