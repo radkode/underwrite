@@ -4635,6 +4635,8 @@ class SessionStore:
     def _same_application(self, row, application, db=None):
         current = json.loads(row["result_json"])
         session = current.get("session")
+        if not isinstance(session, dict) and db is not None:
+            session = json.loads(self._session_row(db)["body_json"])
         for value in (current, application):
             normalized = []
             for beat in value.get("beats", []):

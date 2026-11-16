@@ -580,6 +580,34 @@ class AttestedBeats(AttestedProofCase):
                 beats=[dict(stored, attestation={"proof": 1, "exit_code": 0})],
             )
 
+    def test_beats_only_attested_reconcile_replays_raw_and_refuses_forged_attestation(self):
+        self.verified(beat=1)
+        raw_beat = self.attested_beat(n=1, proof=1)
+        stored = self.store.put_beat(raw_beat)
+        action = self.store.produce("nav-1", None, "next", "")
+        result = {"kind": "walk", "current_beat": 1, "skipped_tiers": []}
+
+        reconciled = self.store.reconcile_action(
+            action["seq"], result, beats=[raw_beat], evidence="attested beat 1 is on disk"
+        )
+        replayed = self.store.reconcile_action(
+            action["seq"], result, beats=[raw_beat], evidence="attested beat 1 is on disk"
+        )
+        self.assertEqual(reconciled, replayed)
+
+        self.store.ack(action["seq"])
+        replayed_after_ack = self.store.reconcile_action(
+            action["seq"], result, beats=[raw_beat], evidence="attested beat 1 is on disk"
+        )
+        self.assertEqual(replayed_after_ack["state"], "acked")
+        self.assertEqual(replayed_after_ack["result"], reconciled["result"])
+
+        forged = dict(raw_beat, attestation=dict(stored["attestation"], exit_code=0))
+        with self.assertRaisesRegex(Conflict, "different application"):
+            self.store.reconcile_action(
+                action["seq"], result, beats=[forged], evidence="attested beat 1 is on disk"
+            )
+
 
 class OneCallProof(AttestedProofCase):
     """`prove` reserves, hands the request to the host adapter, and consumes."""
