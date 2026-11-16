@@ -28,6 +28,7 @@ from gateway import artifacts  # noqa: E402
 from gateway.signing import OpenSSLSigner  # noqa: E402
 from pr_snapshot import capture  # noqa: E402
 from session_store import Conflict, SessionStore, StoreError  # noqa: E402
+from tests.sqlite_support import connected  # noqa: E402
 
 _spec = importlib.util.spec_from_file_location("render_report", SCRIPTS / "render-report.py")
 render_report = importlib.util.module_from_spec(_spec)
@@ -723,26 +724,17 @@ class AttestedReportFindings(AttestedProofCase):
 
 class Upgrading(AttestedProofCase):
     def test_a_version_7_session_gains_the_proof_table_and_keeps_its_state(self):
-        import sqlite3
-
         before = self.store.snapshot()
-        db = sqlite3.connect(str(self.store.path))
-        try:
+        with connected(str(self.store.path)) as db:
             db.execute("DROP TABLE proof_attempts")
             db.execute("PRAGMA user_version = 7")
-            db.commit()
-        finally:
-            db.close()
 
         reopened = SessionStore(self.session_root)
 
         self.assertEqual(reopened.snapshot(), before)
         self.assertEqual(reopened.proof_attempts(), [])
-        db = sqlite3.connect(str(self.store.path))
-        try:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 8)
-        finally:
-            db.close()
+        with connected(str(self.store.path)) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 9)
 
 
 class CommandLine(AttestedProofCase):

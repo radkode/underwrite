@@ -24,7 +24,7 @@ if HERE not in sys.path:
 from diff_lines import anchor_line, diff_paths, parse_diff, untouched_anchor  # noqa: E402
 
 
-DB_SCHEMA_VERSION = 8
+DB_SCHEMA_VERSION = 9
 SCHEMA_VERSION = 1
 DELIVERY_VERSION = 1
 FINDINGS_FILE = "findings.md"
@@ -901,6 +901,7 @@ class SessionStore:
         for statement in statements:
             db.execute(statement)
         self._create_proof_table(db)
+        self._create_review_intent_table(db)
         db.execute(f"PRAGMA user_version = {DB_SCHEMA_VERSION}")
 
     def _actions_schema(self, name):
@@ -983,6 +984,7 @@ class SessionStore:
                 self._default_legacy_execution_policy(db)
             self._create_implementation_tables(db)
             self._create_proof_table(db)
+            self._create_review_intent_table(db)
             if db.total_changes != before:
                 # Derived from rows a repair just rewrote, and before the commit, so a
                 # failed write takes the repair with it and the next open retries both.
@@ -1057,6 +1059,30 @@ class SessionStore:
                 verified_at TEXT,
                 failed_at TEXT
             )""")
+
+    def _create_review_intent_table(self, db):
+        db.execute("""CREATE TABLE IF NOT EXISTS review_intents (
+                intent_id TEXT PRIMARY KEY,
+                event TEXT NOT NULL CHECK (event IN ('COMMENT', 'APPROVE', 'REQUEST_CHANGES')),
+                payload BLOB NOT NULL,
+                payload_sha256 TEXT NOT NULL,
+                beats_json TEXT NOT NULL,
+                report_json TEXT NOT NULL,
+                state TEXT NOT NULL
+                    CHECK (state IN ('prepared', 'submitting', 'landed', 'failed', 'replaced')),
+                review_url TEXT,
+                land_entry_json TEXT,
+                failure TEXT,
+                created_at TEXT NOT NULL,
+                submitting_at TEXT,
+                landed_at TEXT,
+                failed_at TEXT,
+                replaced_at TEXT
+            )""")
+        db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS active_review_intent "
+            "ON review_intents ((1)) WHERE state IN ('prepared', 'submitting')"
+        )
 
     def _default_legacy_execution_policy(self, db):
         row = self._session_row(db)
