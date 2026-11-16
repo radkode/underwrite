@@ -414,7 +414,7 @@ class ReportModeContract(unittest.TestCase):
         text = self.skill()
 
         self.assertNotIn("A 422 here means the audience call was wrong upstream", text)
-        self.assertIn("Transport failures, 5xx, and 422 are uncertain", text)
+        self.assertIn("Transport failures, 408, 429, 5xx, and 422 are uncertain", text)
         self.assertIn("Never blindly post twice or infer a new audience from a 422", text)
         self.assertIn("author cannot approve their own PR", text)
 
@@ -535,10 +535,10 @@ class FrozenSnapshotContract(unittest.TestCase):
 
         self.assertIn("refuses changed preview bytes, runs `check-pr --require-open`", prose)
         self.assertIn("marks the intent submitting before the POST", prose)
-        self.assertIn("authenticated actor, event/state, and comment count after folding", prose)
+        self.assertIn("authenticated actor, event/state, and inline comment content after folding", prose)
         self.assertIn("lands exactly the intent's beats", prose)
         self.assertIn("Beats accepted later stay pending", prose)
-        self.assertIn("Transport failures, 5xx, and 422 are uncertain", prose)
+        self.assertIn("Transport failures, 408, 429, 5xx, and 422 are uncertain", prose)
         self.assertIn("reconciles every page of reviews", prose)
         self.assertIn("more than one is a conflict", prose)
         self.assertIn("Exit 3 leaves the intent submitting, not failed", prose)
@@ -548,7 +548,18 @@ class FrozenSnapshotContract(unittest.TestCase):
         self.assertIn("`DISMISSED` records a receipt without landing", prose)
         self.assertIn("definite other 4xx with no match records publication failure", prose)
         self.assertIn("An unknown outcome must never be marked failed", prose)
+        self.assertIn("A stored review id is verified without reposting, even with `--retry`", prose)
         self.assertNotIn("--paginate", rule)
+
+    def test_review_distinguishes_pre_post_drift_and_safe_retirement(self):
+        rule = self.review_rule()
+        prose = " ".join(rule.split())
+        self.assertIn("Exit 4 means the target moved before POST: nothing posted, intent unchanged", prose)
+        self.assertIn('sessionctl.py retire-review "$R" --intent <intent-id>', prose)
+        self.assertIn("before a supervised replacement", prose)
+        self.assertIn("Retirement accepts a prepared intent, or a submitting one only after zero-match", prose)
+        self.assertIn("reconciliation under the submission lock; it refuses any stored review id", prose)
+        self.assertIn("Exit 2 now means posted but stale", prose)
 
     def test_review_keeps_verdict_stale_receipt_and_page_publication_rules(self):
         rule = self.review_rule()

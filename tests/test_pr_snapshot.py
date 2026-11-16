@@ -1541,10 +1541,13 @@ class SubmitReview(unittest.TestCase):
         return action
 
     def invoke(self, *args):
+        return self.invoke_command("submit-review", *args)
+
+    def invoke_command(self, command, *args):
         output, error = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
             code = sessionctl.main(
-                ["submit-review", str(self.root), "--intent", self.intent_id, *args],
+                [command, str(self.root), "--intent", self.intent_id, *args],
                 runner=self.runner,
             )
         return code, output.getvalue(), error.getvalue()
@@ -1603,22 +1606,24 @@ class SubmitReview(unittest.TestCase):
         self.assertEqual(len(self.runner.posts), 1)
         self.assertEqual(self.pending_beats(), [1, 2])
 
-    def test_response_with_wrong_commit_marker_or_actor_refuses_landing(self):
-        target = self.store.frozen_target()
-        for change in (
-            {"commit_id": "c" * 40},
-            {"body": "Review without a marker"},
-            {"user": {"login": "someone-else"}},
-        ):
-            with self.subTest(change=change), self.assertRaisesRegex(
-                session_store.Conflict, "did not match"
-            ):
-                pr_snapshot._verified_review_receipt(
-                    self.runner, target, self.store.review_marker(), "reviewer",
-                    self.intent, dict(self.runner.response, **change),
-                )
-        self.assertEqual(self.state(), "prepared")
-        self.assertEqual(self.runner.calls, [])
+    def test_submit_review_with_wrong_post_commit_is_uncertain_without_reposting(self):
+        self.assert_mismatched_post({"commit_id": "c" * 40})
+
+    def test_submit_review_with_wrong_post_marker_is_uncertain_without_reposting(self):
+        self.assert_mismatched_post({"body": "Review without a marker"})
+
+    def test_submit_review_with_wrong_post_actor_is_uncertain_without_reposting(self):
+        self.assert_mismatched_post({"user": {"login": "someone-else"}})
+
+    def assert_mismatched_post(self, change):
+        self.runner.response.update(change)
+        with self.assertRaisesRegex(pr_snapshot.ReviewSubmissionUncertain, "did not match"):
+            pr_snapshot.submit_review(self.store, self.intent_id, runner=self.runner)
+        self.assertEqual(self.state(), "submitting")
+        self.assertEqual(self.store.review_intent(self.intent_id)["review_id"], 17)
+        self.assertEqual(self.pending_beats(), [1, 2])
+        self.assertEqual(self.invoke("--retry")[0], 3)
+        self.assertEqual(len(self.runner.posts), 1)
 
     def test_approve_requires_approved_receipt(self):
         intent = self.store.prepare_review("APPROVE", "Summary", self.comments, replace=True)
@@ -2006,15 +2011,96 @@ class SubmitReview(unittest.TestCase):
         self.assertEqual(first["state"], "failed")
         self.assertEqual([item["beat_n"] for item in first["deliveries"]], [1, 2])
 
-    def test_check_pr_drift_refuses_before_post(self):
+    def test_check_pr_drift_exits_4_before_post_without_changing_prepared_intent(self):
         self.runner.metadata["head"]["sha"] = "c" * 40
+        before = self.store.review_intent(self.intent_id)
 
         code, _output, error = self.invoke()
 
-        self.assertEqual(code, 2)
+        self.assertEqual(code, 4)
         self.assertIn("head_sha changed", error)
+        self.assertIn("nothing posted, intent unchanged", error)
         self.assertEqual(self.runner.posts, [])
-        self.assertEqual(self.state(), "prepared")
+        self.assertEqual(self.store.review_intent(self.intent_id), before)
+
+    def test_check_pr_drift_on_retry_exits_4_without_changing_submitting_intent(self):
+        self.start_submitting()
+        self.runner.metadata["head"]["sha"] = "c" * 40
+        before = self.store.review_intent(self.intent_id)
+
+        code, _output, error = self.invoke("--retry")
+
+        self.assertEqual(code, 4)
+        self.assertIn("nothing posted, intent unchanged", error)
+        self.assertEqual(self.runner.posts, [])
+        self.assertEqual(self.store.review_intent(self.intent_id), before)
+
+    def test_retire_prepared_intent_without_github_calls_then_prepare_again(self):
+        code, output, error = self.invoke_command("retire-review")
+        self.assertEqual((code, error), (0, ""))
+        retired = json.loads(output)
+        self.assertEqual(retired["state"], "retired")
+        self.assertTrue(retired["retired_at"])
+        self.assertIsNone(retired["retirement_reconciliation"])
+        self.assertEqual(self.runner.calls, [])
+        replacement = self.store.prepare_review("COMMENT", "Summary", self.comments)
+        self.assertNotEqual(replacement["intent_id"], self.intent_id)
+
+    def test_retire_submitting_intent_reconciles_under_lock_even_when_head_moved(self):
+        self.start_submitting()
+        self.runner.metadata["head"]["sha"] = "c" * 40
+        self.runner.reviews = [[dict(self.runner.response, body="another intent")]]
+        self.runner.on_actor = lambda: self.assertEqual(self.invoke()[0], 1)
+
+        code, output, error = self.invoke_command("retire-review")
+
+        self.assertEqual((code, error), (0, ""))
+        retired = json.loads(output)
+        self.assertEqual(retired["state"], "retired")
+        self.assertEqual(retired["retirement_reconciliation"]["candidates_examined"], 1)
+        self.assertTrue(retired["retirement_reconciliation"]["reconciled_at"])
+        self.assertEqual(self.pending_beats(), [1, 2])
+        self.assertEqual(self.runner.posts, [])
+        self.assertFalse(any("-H" in command for command, _stdin in self.runner.calls))
+
+    def test_retire_submitting_with_match_lands_receipt_instead_of_retiring(self):
+        self.start_submitting()
+        self.runner.reviews = [[self.runner.response]]
+        code, _output, error = self.invoke_command("retire-review")
+        self.assertEqual(code, 1)
+        self.assertIn("a matching review exists; cannot retire", error)
+        self.assertEqual(self.state(), "landed")
+        self.assertEqual(self.pending_beats(), [])
+        self.assertEqual(self.runner.posts, [])
+
+    def test_retire_submitting_with_dismissed_match_records_receipt(self):
+        self.start_submitting()
+        self.runner.reviews = [[dict(self.runner.response, state="DISMISSED")]]
+        code, _output, error = self.invoke_command("retire-review")
+        self.assertEqual(code, 1)
+        self.assertIn("stop for supervised handling", error)
+        self.assertEqual(self.state(), "dismissed")
+        self.assertEqual(self.pending_beats(), [1, 2])
+        self.assertEqual(self.runner.posts, [])
+
+    def test_retire_refuses_stored_review_id_without_github_calls(self):
+        self.start_submitting()
+        self.store.bind_review_id(self.intent_id, 17)
+        code, _output, error = self.invoke_command("retire-review")
+        self.assertEqual(code, 1)
+        self.assertIn("has a stored review id; cannot retire", error)
+        self.assertEqual(self.state(), "submitting")
+        self.assertEqual(self.runner.calls, [])
+
+    def test_retire_refuses_when_reconciliation_cannot_complete(self):
+        self.start_submitting()
+        self.runner.read_error = pr_snapshot.ReviewApiError("HTTP 503", status=503)
+        before = self.store.review_intent(self.intent_id)
+        code, _output, error = self.invoke_command("retire-review")
+        self.assertEqual(code, 1)
+        self.assertIn("HTTP 503", error)
+        self.assertEqual(self.store.review_intent(self.intent_id), before)
+        self.assertEqual(self.runner.posts, [])
 
     def test_concurrent_retry_is_refused_while_another_submit_holds_the_lock(self):
         posting, release = threading.Event(), threading.Event()

@@ -19,6 +19,7 @@ from session_store import DROP_REASONS, FLAG_STATES, SessionStore, StoreError  #
 from diff_lines import LOCATION_LINE, resolve_path  # noqa: E402
 from pr_snapshot import (  # noqa: E402
     ReviewSubmissionUncertain,
+    ReviewTargetMovedBeforePost,
     TargetMoved,
     capture,
     check,
@@ -31,6 +32,7 @@ from pr_snapshot import (  # noqa: E402
     read_blob,
     review_identity,
     review_receipt,
+    retire_review,
     submit_review,
 )
 
@@ -309,6 +311,10 @@ def parser():
     submit.add_argument("--intent", required=True)
     submit.add_argument("--retry", action="store_true")
 
+    retire = commands.add_parser("retire-review")
+    retire.add_argument("session")
+    retire.add_argument("--intent", required=True)
+
     receipt = commands.add_parser("review-receipt")
     receipt.add_argument("session")
     receipt.add_argument("source")
@@ -450,12 +456,15 @@ def run(args, *, runner=gh_runner):
         result = store.prepare_review(
             args.event, body, comments, replace=args.replace
         )
-    elif args.command == "submit-review":
+    elif args.command in ("submit-review", "retire-review"):
         store = SessionStore(args.session)
         try:
-            result = submit_review(
-                store, args.intent, retry=args.retry, runner=runner
-            )
+            if args.command == "retire-review":
+                result = retire_review(store, args.intent, runner=runner)
+            else:
+                result = submit_review(
+                    store, args.intent, retry=args.retry, runner=runner
+                )
         except BaseException:
             store.export_json()
             raise
@@ -557,6 +566,9 @@ def main(argv=None, *, runner=gh_runner):
     except ReviewSubmissionUncertain as error:
         print(f"sessionctl: {error}", file=sys.stderr)
         return 3
+    except ReviewTargetMovedBeforePost as error:
+        print(f"sessionctl: {error}", file=sys.stderr)
+        return 4
     except TargetMoved as error:
         print(f"sessionctl: {error}", file=sys.stderr)
         return 2

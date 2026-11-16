@@ -2022,6 +2022,51 @@ class RenderCli(unittest.TestCase):
             'href="https://github.com/acme/widget/commit/' + "b" * 40 + '"', self.page()
         )
 
+    def test_review_intent_states_render_from_store_without_claiming_delivery(self):
+        store = self.frozen_store(state="open")
+        store.put_beat(beat(n=1, state="flag", where="a.ts:1"))
+        action = store.produce("include", 1, "accept", "Include it")
+        store.ack(action["seq"])
+        comments = {"1": {"path": "a.ts", "line": 1, "side": "RIGHT", "body": "Fix it."}}
+        intent = store.prepare_review("COMMENT", "Summary", comments)
+        intent_id = intent["intent_id"]
+
+        def check_page(label):
+            rendered = self.run_cli("--standalone")
+            self.assertEqual(rendered.returncode, 0, rendered.stderr)
+            page = self.page()
+            self.assertIn(label, page)
+            self.assertNotIn("Included, review pending", page)
+            self.assertEqual(self.run_cli("--final").returncode, 2)
+            self.assertNotIn("landed", store.snapshot()[1][0])
+            return page
+
+        check_page("Review prepared, awaiting submission")
+        with store.review_submission_lock():
+            store.begin_submit_intent(intent_id)
+        check_page("Review submitting, outcome not yet verified")
+        with store.review_submission_lock():
+            store.retire_review_intent(
+                intent_id, reconcile=lambda _: {"candidates_examined": 0, "match": None}
+            )
+        check_page("Review intent retired, delivery still owed")
+        replacement = store.prepare_review("COMMENT", "Summary", comments)
+        check_page("Review prepared, awaiting submission")
+        store.bind_review_id(replacement["intent_id"], 17)
+        store.record_dismissed_intent(replacement["intent_id"], {
+            "state": "DISMISSED", "review_id": 17,
+            "url": "https://example.test/reviews/17?detail=<dismissed>",
+        })
+        page = check_page("Review dismissed, needs supervised handling")
+        self.assertIn("https://example.test/reviews/17?detail=&lt;dismissed&gt;", page)
+        self.assertIn("Do not retry or repost.", page)
+        store.put_beat(beat(n=2, state="flag", where="a.ts:1"))
+        action = store.produce("include-later", 2, "accept", "Include this later")
+        store.ack(action["seq"])
+        self.assertEqual(self.run_cli().returncode, 0)
+        self.assertEqual(self.page().count("Included, review pending"), 1)
+        self.assertEqual(self.page().count("Review dismissed, needs supervised handling"), 1)
+
     def test_persisted_recommendation_leads_terminal_and_page_output(self):
         store = self.frozen_store()
         store.patch_session({

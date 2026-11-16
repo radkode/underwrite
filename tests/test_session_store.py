@@ -2512,6 +2512,8 @@ class CreatingAndMigrating(StoreCase):
             columns = {row[1] for row in db.execute("PRAGMA table_info(review_intents)")}
             self.assertIn("review_id", columns)
             self.assertIn("dismissed_at", columns)
+            self.assertIn("retired_at", columns)
+            self.assertIn("retirement_reconciliation_json", columns)
             payload = b'{"comments": []}'
             db.execute(
                 "INSERT INTO review_intents "
@@ -2521,11 +2523,26 @@ class CreatingAndMigrating(StoreCase):
                 ("c" * 64, payload, hashlib.sha256(payload).hexdigest(),
                  "https://example.test/reviews/17", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"),
             )
+            db.execute(
+                "INSERT INTO review_intents "
+                "(intent_id, event, payload, payload_sha256, beats_json, report_json, "
+                "state, created_at, retired_at, retirement_reconciliation_json) "
+                "VALUES (?, 'COMMENT', ?, ?, '[]', '[]', 'retired', ?, ?, ?)",
+                ("d" * 64, payload, hashlib.sha256(payload).hexdigest(),
+                 "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z",
+                 json.dumps({"candidates_examined": 2, "reconciled_at": "2026-01-02T00:00:00Z"})),
+            )
         self.assertIn("review_intents", tables)
         dismissed = upgraded.review_intent("c" * 64)
         self.assertEqual(dismissed["state"], "dismissed")
         self.assertEqual(dismissed["review_id"], 17)
         self.assertEqual(dismissed["dismissed_at"], "2026-01-02T00:00:00Z")
+        retired = upgraded.review_intent("d" * 64)
+        self.assertEqual(retired["state"], "retired")
+        self.assertEqual(retired["retired_at"], "2026-01-02T00:00:00Z")
+        self.assertEqual(retired["retirement_reconciliation"], {
+            "candidates_examined": 2, "reconciled_at": "2026-01-02T00:00:00Z",
+        })
 
     def test_legacy_actions_without_an_ack_migrate_as_handled(self):
         (self.root / "session.sqlite3").unlink()
@@ -4853,6 +4870,64 @@ class ReviewIntents(unittest.TestCase):
         with self.store.review_submission_lock():
             retry = self.store.begin_submit_intent(intent_id, retry=True)
         self.assertEqual(retry["state"], "submitting")
+
+    def test_retire_review_intent_requires_submission_lock_and_zero_match_evidence(self):
+        intent_id = self.prepare_two_and_start()
+        with self.assertRaisesRegex(session_store.StoreError, "requires the review submission lock"):
+            self.store.retire_review_intent(intent_id, reconcile=lambda _: None)
+        with self.store.review_submission_lock():
+            with self.assertRaisesRegex(session_store.Conflict, "requires reconciliation"):
+                self.store.retire_review_intent(intent_id)
+            for result in (None, {}, {"candidates_examined": -1, "match": None},
+                           {"candidates_examined": True, "match": None}):
+                with self.subTest(result=result), self.assertRaisesRegex(
+                    session_store.Conflict, "requires reconciliation evidence"
+                ):
+                    self.store.retire_review_intent(intent_id, reconcile=lambda _, result=result: result)
+            with self.assertRaisesRegex(session_store.Conflict, "a matching review exists"):
+                self.store.retire_review_intent(
+                    intent_id, reconcile=lambda _: {"candidates_examined": 1, "match": {"review_id": 17}}
+                )
+        self.assertEqual(self.store.review_intent(intent_id)["state"], "submitting")
+
+    def test_retire_submitting_intent_persists_reconciliation_and_leaves_beats_pending(self):
+        intent_id = self.prepare_two_and_start()
+        calls = []
+
+        def reconcile(intent):
+            self.assertEqual(intent["intent_id"], intent_id)
+            self.assertEqual(self.store._review_submission_owner, (os.getpid(), threading.get_ident()))
+            with self.store._write():
+                calls.append(intent_id)
+            return {"candidates_examined": 3, "match": None}
+
+        with self.store.review_submission_lock():
+            retired = self.store.retire_review_intent(intent_id, reconcile=reconcile)
+        self.assertEqual(calls, [intent_id])
+        self.assertEqual(retired["state"], "retired")
+        self.assertTrue(retired["retired_at"])
+        self.assertEqual(retired["retirement_reconciliation"]["candidates_examined"], 3)
+        self.assertTrue(retired["retirement_reconciliation"]["reconciled_at"])
+        self.assertEqual(session_store.SessionStore(self.root).review_intent(intent_id), retired)
+        self.assertEqual([item["beat_n"] for item in self.store.reconcile()["pending_deliveries"]], [1, 2])
+        prepared = self.store.prepare_review(
+            "COMMENT", "Summary", {"1": self.comment(), "2": self.comment(line=12)}
+        )
+        self.assertEqual(prepared["state"], "prepared")
+        self.assertNotEqual(prepared["intent_id"], intent_id)
+
+    def test_retire_review_refuses_stored_id_even_on_prepared_intent(self):
+        self.accept(1)
+        prepared = self.store.prepare_review("COMMENT", "Summary", {"1": self.comment()})
+        intent_id = prepared["intent_id"]
+        self.store.bind_review_id(intent_id, 17)
+        reconcile = mock.Mock()
+        with self.store.review_submission_lock(), self.assertRaisesRegex(
+            session_store.Conflict, "has a stored review id; cannot retire"
+        ):
+            self.store.retire_review_intent(intent_id, reconcile=reconcile)
+        reconcile.assert_not_called()
+        self.assertEqual(self.store.review_intent(intent_id)["state"], "prepared")
 
     def test_review_id_binding_is_durable_unique_and_immutable(self):
         self.accept(1)

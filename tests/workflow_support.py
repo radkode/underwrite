@@ -66,13 +66,14 @@ if (
     and args[:4] == ["api", reviews_endpoint, "--method", "POST"]
     and args[4] == "--input"
 ):
-    source = Path(args[5])
-    payload = json.loads(source.read_text(encoding="utf-8"))
+    source = args[5]
+    payload = json.loads(sys.stdin.read() if source == "-" else Path(source).read_text(encoding="utf-8"))
     state.setdefault("post_attempts", []).append(payload)
     mode = state.get("post_mode", "success")
-    if mode == "definite_failure":
+    if mode in ("definite_failure", "rate_limited"):
         save()
-        print("review rejected before creation", file=sys.stderr)
+        status = 403 if mode == "definite_failure" else 429
+        print(f"gh: review rejected before creation (HTTP {status})", file=sys.stderr)
         raise SystemExit(1)
     review = {
         "id": len(state.setdefault("reviews", [])) + 1,
@@ -88,14 +89,26 @@ if (
         % (len(state["reviews"]) + 1),
     }
     state["reviews"].append(review)
+    state.setdefault("comments", {})[str(review["id"])] = payload["comments"]
     if state.get("move_after_post"):
         state["metadata"]["head"]["sha"] = state["moved_head_sha"]
     save()
     if mode == "create_then_fail":
-        print("connection lost after creation", file=sys.stderr)
+        print("gh: connection lost after creation (HTTP 503)", file=sys.stderr)
         raise SystemExit(1)
     print(json.dumps(review))
     raise SystemExit(0)
+
+for review in state.get("reviews", []):
+    endpoint = reviews_endpoint + "/" + str(review["id"])
+    if args == ["api", endpoint]:
+        save()
+        print(json.dumps(review))
+        raise SystemExit(0)
+    if args == ["api", "--paginate", "--slurp", endpoint + "/comments"]:
+        save()
+        print(json.dumps([state["comments"][str(review["id"])]]))
+        raise SystemExit(0)
 
 if args == ["api", "--paginate", "--slurp", reviews_endpoint]:
     reviews = state.get("reviews", [])

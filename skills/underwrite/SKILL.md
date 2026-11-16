@@ -1082,20 +1082,26 @@ $S/scripts/sessionctl.py submit-review "$R" --intent <intent-id>
 
 `submit-review` refuses changed preview bytes, runs `check-pr --require-open`, and durably
 marks the intent submitting before the POST. It verifies the frozen commit, marker,
-authenticated actor, event/state, and comment count after folding. A verified receipt
+authenticated actor, event/state, and inline comment content after folding. A verified receipt
 lands exactly the intent's beats and adds one shared `lands[]` entry, atomically. Beats
 accepted later stay pending and need a separate approved intent. Never POST or land review
 beats by hand.
 
-Transport failures, 5xx, and 422 are uncertain. The command reconciles every page of
+Transport failures, 408, 429, 5xx, and 422 are uncertain. The command reconciles every page of
 reviews: one verified match lands, more than one is a conflict. Exit 3 leaves the intent
 submitting, not failed. Repeat the same `submit-review` command to read again; it does not
 POST again without `--retry`. Allow for API visibility and repeat the read before seeking
 explicit approval for `--retry`; retry only after reconciliation finds no review. A retry
-rechecks the open target. Never blindly post twice or infer a new audience from a 422.
+rechecks the open target. A stored review id is verified without reposting, even with
+`--retry`. Never blindly post twice or infer a new audience from a 422.
 `DISMISSED` records a receipt without landing: stop for supervised handling and do not
 retry. A definite other 4xx with no match records publication failure for every covered
 beat, preserving the accepted findings. An unknown outcome must never be marked failed.
+
+Exit 4 means the target moved before POST: nothing posted, intent unchanged. Stop and use
+`sessionctl.py retire-review "$R" --intent <intent-id>` before a supervised replacement.
+Retirement accepts a prepared intent, or a submitting one only after zero-match
+reconciliation under the submission lock; it refuses any stored review id.
 
 After landing, persist the outcome, review URL, and `status` as one `patch-session` object.
 Recheck the target after posting:

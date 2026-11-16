@@ -63,6 +63,10 @@ class TargetMoved(Conflict):
     pass
 
 
+class ReviewTargetMovedBeforePost(TargetMoved):
+    pass
+
+
 class ReviewSubmissionUncertain(Conflict):
     pass
 
@@ -1622,13 +1626,22 @@ def _verified_review_receipt(runner, target, marker, actor, intent, response):
 
 
 def _reconcile_reviews(runner, target, marker, actor, intent, *, bound_review_ids=()):
+    return _review_reconciliation(
+        runner, target, marker, actor, intent, bound_review_ids=bound_review_ids
+    )["match"]
+
+
+def _review_reconciliation(runner, target, marker, actor, intent, *, bound_review_ids=()):
     if intent.get("review_id") is not None:
         response = _runner_json(
             runner,
             ["gh", "api", f"repos/{target['repo']}/pulls/{target['number']}/reviews/{intent['review_id']}"],
             description="stored review",
         )
-        return _verified_review_receipt(runner, target, marker, actor, intent, response)
+        return {
+            "candidates_examined": 1,
+            "match": _verified_review_receipt(runner, target, marker, actor, intent, response),
+        }
     raw = _runner_json(
         runner,
         [
@@ -1662,7 +1675,7 @@ def _reconcile_reviews(runner, target, marker, actor, intent, *, bound_review_id
             "expected at most one review matching the frozen commit, marker, actor, "
             f"event, and inline comments; found {len(matches)}"
         )
-    return matches[0] if matches else None
+    return {"candidates_examined": len(candidates), "match": matches[0] if matches else None}
 
 
 def _land_or_dismiss(store, intent, receipt):
@@ -1681,6 +1694,28 @@ def _land_or_dismiss(store, intent, receipt):
     result = store.land_intent(intent["intent_id"], receipt["url"], entry=entry)
     result["receipt"] = receipt
     return result
+
+
+def retire_review(store, intent_id, *, runner=gh_runner):
+    with store.review_submission_lock():
+        def reconcile(intent):
+            target = store.frozen_target()
+            if target["kind"] != "github_pr":
+                raise SnapshotError("frozen target is not a GitHub pull request")
+            actor = _runner_actor(runner)
+            bound_review_ids = {
+                item["review_id"] for item in store.review_intents()
+                if item["intent_id"] != intent_id and item["review_id"] is not None
+            }
+            result = _review_reconciliation(
+                runner, target, store.review_marker(), actor, intent,
+                bound_review_ids=bound_review_ids,
+            )
+            if result["match"] is not None:
+                _land_or_dismiss(store, intent, result["match"])
+            return result
+
+        return store.retire_review_intent(intent_id, reconcile=reconcile)
 
 
 def submit_review(store, intent_id, *, retry=False, runner=gh_runner, api=None):
@@ -1729,7 +1764,12 @@ def _submit_review(store, intent_id, *, retry, runner, api):
             "is visible yet; repeat the read before passing --retry"
         )
 
-    target = check(store, require_open=True, api=pr_api)
+    try:
+        target = check(store, require_open=True, api=pr_api)
+    except TargetMoved as error:
+        raise ReviewTargetMovedBeforePost(
+            f"target moved before POST; nothing posted, intent unchanged: {error}"
+        ) from error
     intent = store.begin_submit_intent(
         intent_id, retry=state == "submitting" and retry, include_payload=True
     )

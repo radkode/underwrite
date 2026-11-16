@@ -782,6 +782,26 @@ def delivery_html(beat, mode, replacement=False, untrusted_pr=False):
             '<span class="lbl">Blocked, replacement required</span>'
             f'{" ".join(detail)}</div>'
         )
+    intent = delivery.get("review_intent")
+    if mode == "review" and state in ("pending", "failed") and isinstance(intent, dict):
+        labels = {
+            "prepared": "Review prepared, awaiting submission",
+            "submitting": "Review submitting, outcome not yet verified",
+            "dismissed": "Review dismissed, needs supervised handling",
+            "retired": "Review intent retired, delivery still owed",
+        }
+        label = labels.get(str(intent.get("state", "")))
+        if label:
+            detail = ""
+            if intent.get("state") == "dismissed":
+                detail = (
+                    f'<span class="delivery-error">{md(intent.get("review_url", ""))} '
+                    "Do not retry or repost.</span>"
+                )
+            return (
+                '<div class="call delivery pending">'
+                f'<span class="lbl">{label}</span>{detail}</div>'
+            )
     if state == "pending":
         label = {
             "branch": "Implementation pending",

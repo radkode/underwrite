@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """Composed tests for the prompt-owned branch and review workflows."""
 
-import importlib.util
 import json
 import stat
 import sys
@@ -11,14 +10,6 @@ if __package__:
     from .workflow_support import ROOT, WorkflowCase, flag
 else:
     from workflow_support import ROOT, WorkflowCase, flag
-
-
-SPEC = importlib.util.spec_from_file_location(
-    "session_store", ROOT / "skills" / "underwrite" / "scripts" / "session_store.py"
-)
-assert SPEC is not None and SPEC.loader is not None
-session_store = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(session_store)
 
 
 class BranchWorkflow(WorkflowCase):
@@ -333,60 +324,12 @@ class ReviewWorkflow(WorkflowCase):
             "sessionctl.py", *args, env=self.gh_env, expected=expected
         )
 
-    def post_review(self, payload, expected=0):
-        return self.run_command(
-            [
-                "gh",
-                "api",
-                "repos/acme/widget/pulls/7/reviews",
-                "--method",
-                "POST",
-                "--input",
-                payload,
-            ],
-            env=self.gh_env,
-            expected=expected,
+    def submit_review(self, *args, expected=0):
+        return self.script(
+            "sessionctl.py", "submit-review", self.session,
+            "--intent", self.prepared_intent["intent_id"], *args,
+            env=self.gh_env, expected=expected,
         )
-
-    def review_candidates(self):
-        result = self.run_command(
-            [
-                "gh",
-                "api",
-                "--paginate",
-                "--slurp",
-                "repos/acme/widget/pulls/7/reviews",
-            ],
-            env=self.gh_env,
-        )
-        path = self.session / "review-candidates.json"
-        path.write_text(result.stdout, encoding="utf-8")
-        return path
-
-    def actor(self):
-        result = self.run_command(
-            ["gh", "api", "user", "--jq", ".login"], env=self.gh_env
-        )
-        return result.stdout.strip()
-
-    def receipt(self, source, actor):
-        return self.script_json(
-            "sessionctl.py",
-            "review-receipt",
-            self.session,
-            source,
-            "--actor",
-            actor,
-        )
-
-    def land_reconciled(self, url):
-        store = session_store.SessionStore(self.session)
-        store.land_intent(self.prepared_intent["intent_id"], url, entry={
-            "state": "landed",
-            "what": "the accepted findings",
-            "where": url,
-        })
-        store.export_json()
 
     def persist_review_outcome(self, url, status="complete"):
         patch = {
@@ -419,25 +362,29 @@ class ReviewWorkflow(WorkflowCase):
         self.script("render-report.py", self.session)
         self.script("render-report.py", self.session, "--final", expected=2)
 
-        fixed, payload = self.validated_payload([1, 2])
+        _fixed, payload = self.validated_payload([1, 2])
         self.assertEqual(payload["commit_id"], self.head)
         self.assertIn("underwrite-review:", payload["body"])
-        actor = self.actor()
-        self.check_pr()
-        response = self.post_review(fixed)
-        response_path = self.session / "review-response.json"
-        response_path.write_text(response.stdout, encoding="utf-8")
-        receipt = self.receipt(response_path, actor)
-        self.land_reconciled(receipt["url"])
+        result = json.loads(self.submit_review().stdout)
+        self.assertEqual(result["state"], "landed")
+        receipt = result["receipt"]
         self.persist_review_outcome(receipt["url"])
         self.check_pr(require_open=False)
         self.script("render-report.py", self.session, "--final", "--standalone")
 
         state = self.fake_gh_state()
         self.assertEqual(len(state["post_attempts"]), 1)
-        self.assertEqual(state["post_attempts"][0]["commit_id"], self.head)
+        self.assertEqual(state["post_attempts"][0], payload)
         self.assertEqual(len(state["reviews"]), 1)
         self.assertIn(["api", "user", "--jq", ".login"], state["calls"])
+        self.assertIn([
+            "api", "repos/acme/widget/pulls/7/reviews", "--method", "POST", "--input", "-"
+        ], state["calls"])
+        self.assertIn([
+            "api", "--paginate", "--slurp", "repos/acme/widget/pulls/7/reviews/1/comments"
+        ], state["calls"])
+        self.submit_review()
+        self.assertEqual(len(self.fake_gh_state()["post_attempts"]), 1)
         session = self.script_json("sessionctl.py", "get-session", self.session)
         self.assertEqual(len(session["lands"]), 1)
         for number in (1, 2):
@@ -451,8 +398,7 @@ class ReviewWorkflow(WorkflowCase):
         fixed, _payload = self.validated_payload([1])
         self.move_head("d" * 40)
 
-        self.assertEqual(self.actor(), "reviewer")
-        moved = self.check_pr(expected=2)
+        moved = self.submit_review(expected=4)
 
         self.assertIn("head_sha changed", moved.stderr)
         self.assertEqual(self.fake_gh_state()["post_attempts"], [])
@@ -466,20 +412,15 @@ class ReviewWorkflow(WorkflowCase):
 
     def test_a_head_move_during_post_preserves_the_review_receipt(self):
         self.accept_offline([1])
-        fixed, _payload = self.validated_payload([1])
-        actor = self.actor()
-        self.check_pr()
+        self.validated_payload([1])
         moved_head = "e" * 40
         self.update_fake_gh(
             move_after_post=True,
             moved_head_sha=moved_head,
         )
 
-        response = self.post_review(fixed)
-        response_path = self.session / "review-response.json"
-        response_path.write_text(response.stdout, encoding="utf-8")
-        receipt = self.receipt(response_path, actor)
-        self.land_reconciled(receipt["url"])
+        result = json.loads(self.submit_review().stdout)
+        receipt = result["receipt"]
         self.persist_review_outcome(receipt["url"])
         moved = self.check_pr(expected=2, require_open=False)
 
@@ -494,53 +435,54 @@ class ReviewWorkflow(WorkflowCase):
         self.assertEqual(session["review_url"], receipt["url"])
         self.assertEqual(session["status"], "complete")
 
-    def test_unknown_review_outcome_reconciles_to_the_existing_review(self):
-        actions = self.accept_offline([1])
-        fixed, _payload = self.validated_payload([1])
-        actor = self.actor()
-        self.check_pr()
+    def test_rejected_post_fails_atomically_then_new_intent_adopts_an_uncertain_post(self):
+        self.accept_offline([1])
+        self.validated_payload([1])
+        failed_intent = self.prepared_intent["intent_id"]
         self.update_fake_gh(post_mode="definite_failure")
-        failed_post = self.post_review(fixed, expected=1)
-        self.assertIn("rejected before creation", failed_post.stderr)
-        empty_candidates = self.review_candidates()
-        no_receipt = self.script(
-            "sessionctl.py",
-            "review-receipt",
-            self.session,
-            empty_candidates,
-            "--actor",
-            actor,
-            expected=1,
-        )
-        self.assertIn("found 0", no_receipt.stderr)
-        self.script_json(
-            "sessionctl.py",
-            "fail",
-            self.session,
-            actions[0]["seq"],
-            "review creation was rejected",
-            "publish the accepted finding",
-        )
+        rejected = self.submit_review(expected=1)
+        self.assertIn("HTTP 403", rejected.stderr)
+        self.assertIn("confirmed no review was created", rejected.stderr)
         recovered = self.script_json("sessionctl.py", "reconcile", self.session)
         self.assertEqual(recovered["failed_deliveries"][0]["beat_n"], 1)
 
+        self.validated_payload([1])
+        self.assertNotEqual(self.prepared_intent["intent_id"], failed_intent)
         self.update_fake_gh(post_mode="create_then_fail")
-        self.check_pr()
-        unknown = self.post_review(fixed, expected=1)
-        self.assertIn("connection lost after creation", unknown.stderr)
-        attempts_after_unknown = len(self.fake_gh_state()["post_attempts"])
-        receipt = self.receipt(self.review_candidates(), actor)
-        self.land_reconciled(receipt["url"])
+        result = json.loads(self.submit_review().stdout)
+        self.assertEqual(result["state"], "landed")
+        receipt = result["receipt"]
         self.persist_review_outcome(receipt["url"])
+        self.submit_review()
         self.check_pr(require_open=False)
         self.script("render-report.py", self.session, "--final")
 
         state = self.fake_gh_state()
-        self.assertEqual(len(state["post_attempts"]), attempts_after_unknown)
+        self.assertEqual(len(state["post_attempts"]), 2)
         self.assertEqual(len(state["reviews"]), 1)
         self.assertFalse(
             self.script_json("sessionctl.py", "reconcile", self.session)["recovery"]
         )
+
+    def test_rate_limit_stays_submitting_and_moved_target_can_be_retired(self):
+        self.accept_offline([1])
+        self.validated_payload([1])
+        self.update_fake_gh(post_mode="rate_limited")
+        uncertain = self.submit_review(expected=3)
+        self.assertIn("HTTP 429", uncertain.stderr)
+        recovery = self.script_json("sessionctl.py", "reconcile", self.session)
+        self.assertEqual(recovery["failed_deliveries"], [])
+        self.assertEqual(len(recovery["pending_deliveries"]), 1)
+        self.move_head("d" * 40)
+        self.submit_review("--retry", expected=4)
+        retired = self.script_json(
+            "sessionctl.py", "retire-review", self.session,
+            "--intent", self.prepared_intent["intent_id"], env=self.gh_env,
+        )
+        self.assertEqual(retired["state"], "retired")
+        self.assertEqual(retired["retirement_reconciliation"]["candidates_examined"], 0)
+        self.assertEqual(len(self.fake_gh_state()["post_attempts"]), 1)
+        self.assertEqual(self.fake_gh_state()["reviews"], [])
 
 
 class DistributionInvariants(unittest.TestCase):

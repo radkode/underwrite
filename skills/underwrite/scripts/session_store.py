@@ -1102,7 +1102,7 @@ class SessionStore:
                 beats_json TEXT NOT NULL,
                 report_json TEXT NOT NULL,
                 state TEXT NOT NULL
-                    CHECK (state IN ('prepared', 'submitting', 'landed', 'failed', 'replaced', 'dismissed')),
+                    CHECK (state IN ('prepared', 'submitting', 'landed', 'failed', 'replaced', 'dismissed', 'retired')),
                 review_id INTEGER UNIQUE,
                 review_url TEXT,
                 land_entry_json TEXT,
@@ -1112,7 +1112,9 @@ class SessionStore:
                 landed_at TEXT,
                 failed_at TEXT,
                 replaced_at TEXT,
-                dismissed_at TEXT
+                dismissed_at TEXT,
+                retired_at TEXT,
+                retirement_reconciliation_json TEXT
             )""")
         db.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS active_review_intent "
@@ -4338,6 +4340,17 @@ class SessionStore:
                     "answer": result.get("answer"),
                     "evidence": result.get("evidence"),
                 })
+            review_intents = {}
+            for row in db.execute(
+                "SELECT intent_id, state, review_url, beats_json FROM review_intents "
+                "WHERE state IN ('prepared', 'submitting', 'dismissed', 'retired') ORDER BY rowid"
+            ):
+                for covered in json.loads(row["beats_json"]):
+                    review_intents[covered["beat_n"]] = {
+                        "intent_id": row["intent_id"],
+                        "state": row["state"],
+                        "review_url": row["review_url"],
+                    }
             beats = []
             for row in db.execute("SELECT * FROM beats ORDER BY n"):
                 beat = json.loads(row["body_json"])
@@ -4351,6 +4364,8 @@ class SessionStore:
                     else {}
                 )
                 delivery["state"] = row["delivery_state"]
+                if row["n"] in review_intents:
+                    delivery["review_intent"] = review_intents[row["n"]]
                 beat["delivery"] = delivery
                 beat["questions"] = questions.get(row["n"], [])
                 beats.append(beat)
@@ -5210,6 +5225,11 @@ class SessionStore:
             "failed_at": row["failed_at"],
             "replaced_at": row["replaced_at"],
             "dismissed_at": row["dismissed_at"],
+            "retired_at": row["retired_at"],
+            "retirement_reconciliation": (
+                None if row["retirement_reconciliation_json"] is None
+                else json.loads(row["retirement_reconciliation_json"])
+            ),
         }
         if include_payload:
             document["payload"] = payload_bytes
@@ -5369,6 +5389,7 @@ class SessionStore:
                     timestamp,
                 ),
             )
+            self._bump_render(db)
             row = self._review_intent_row(db, intent_id)
             return self._review_intent_document(row), payload_bytes
 
@@ -5615,10 +5636,49 @@ class SessionStore:
                 "WHERE intent_id = ?",
                 (_now(), intent_id),
             )
+            self._bump_render(db)
             updated = self._review_intent_row(db, intent_id)
             return self._review_intent_document(
                 updated, include_payload=include_payload
             )
+
+    def retire_review_intent(self, intent_id, *, reconcile=None):
+        if self._review_submission_owner != (os.getpid(), threading.get_ident()):
+            raise StoreError("retire_review_intent requires the review submission lock")
+        intent = self.review_intent(intent_id, include_payload=True)
+        if intent["review_id"] is not None:
+            raise Conflict(f"review intent {intent_id} has a stored review id; cannot retire")
+        if intent["state"] not in ("prepared", "submitting"):
+            raise Conflict(f"review intent {intent_id} is {intent['state']}, cannot retire")
+        evidence = None
+        if intent["state"] == "submitting":
+            if reconcile is None:
+                raise Conflict("submitting review retirement requires reconciliation")
+            result = reconcile(intent)
+            if (
+                not isinstance(result, dict)
+                or type(result.get("candidates_examined")) is not int
+                or result["candidates_examined"] < 0
+                or "match" not in result
+            ):
+                raise Conflict("review retirement requires reconciliation evidence")
+            if result["match"] is not None:
+                raise Conflict("a matching review exists; cannot retire")
+            evidence = {
+                "candidates_examined": result["candidates_examined"],
+                "reconciled_at": _now(),
+            }
+        with self._write() as db:
+            current = self._review_intent_row(db, intent_id)
+            if current["review_id"] is not None or current["state"] != intent["state"]:
+                raise Conflict(f"review intent {intent_id} changed during retirement")
+            db.execute(
+                "UPDATE review_intents SET state = 'retired', retired_at = ?, "
+                "retirement_reconciliation_json = ? WHERE intent_id = ?",
+                (_now(), None if evidence is None else _dump(evidence), intent_id),
+            )
+            self._bump_render(db)
+            return self._review_intent_document(self._review_intent_row(db, intent_id))
 
     def fail_intent(self, intent_id, error, owed="publish the accepted finding"):
         if not isinstance(error, str) or not error.strip():
@@ -5711,6 +5771,7 @@ class SessionStore:
                     "failure = ?, submitting_at = ?, dismissed_at = ? WHERE intent_id = ?",
                     (url, failure, submitting_at, timestamp, intent_id),
                 )
+                self._bump_render(db)
             updated = self._review_intent_row(db, intent_id)
             doc = self._review_intent_document(updated)
 
