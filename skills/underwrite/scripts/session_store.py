@@ -3977,17 +3977,38 @@ class SessionStore:
             same_revisions = (prior_target["base_sha"], prior_target["head_sha"]) == (
                 target["base_sha"], target["head_sha"]
             )
-            identity_fields = (
-                "state",
-                "merged_at",
-                "head_repo_id",
-                "head_repo",
-                "head_ref",
-            )
-            if same_revisions and all(
-                prior_target.get(name) == target.get(name) for name in identity_fields
-            ):
-                raise Conflict("predecessor froze the same base and head; resume it instead")
+            if same_revisions:
+                frozen_fields = (
+                    "diff_sha256",
+                    "diff_bytes",
+                    "merge_base_sha",
+                    "object_bundle_sha256",
+                    "object_bundle_bytes",
+                    "trusted_context_sha256",
+                    "trusted_context_bytes",
+                )
+                if any(
+                    prior_target.get(name) != target.get(name)
+                    for name in frozen_fields
+                ):
+                    raise Conflict(
+                        "predecessor froze different artifacts for the same base and head; "
+                        "not lifecycle or route drift"
+                    )
+                identity_fields = (
+                    "state",
+                    "merged_at",
+                    "head_repo_id",
+                    "head_repo",
+                    "head_ref",
+                )
+                if all(
+                    prior_target.get(name) == target.get(name)
+                    for name in identity_fields
+                ):
+                    raise Conflict(
+                        "predecessor froze the same base and head; resume it instead"
+                    )
             if moved.get("head_sha") != target["head_sha"]:
                 raise StoreError("moved lines must be computed against this session's head")
             moved_lines_map = moved.get("lines")

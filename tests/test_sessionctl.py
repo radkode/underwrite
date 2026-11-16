@@ -746,13 +746,18 @@ class ReplacementRounds(unittest.TestCase):
         self.git("commit", "-q", "-m", "change")
         return self.git("rev-parse", "HEAD")
 
-    def session(self, name, head, number=7, **target_overrides):
+    def session(self, name, head, number=7, diff_text=None, **target_overrides):
         root = self.reviews / name
         store = session_store.SessionStore(root, create=True)
         scratch = self.tmp / f"{name}-input"
         scratch.mkdir()
         diff = scratch / "pr.diff"
-        diff.write_text(self.git("diff", f"{self.base}...{head}") + "\n", encoding="utf-8")
+        diff.write_text(
+            diff_text
+            if diff_text is not None
+            else self.git("diff", f"{self.base}...{head}") + "\n",
+            encoding="utf-8",
+        )
         metadata = scratch / "pr.json"
         metadata.write_text(json.dumps({"number": number}), encoding="utf-8")
         context = scratch / "trusted.json"
@@ -899,6 +904,14 @@ class ReplacementRounds(unittest.TestCase):
                 session_store.SessionStore(prior),
                 {"prior_head_sha": self.first, "head_sha": self.first, "lines": {"a.py": [2]}},
             )
+        different_diff = self.session(
+            "acme-widget-pr7-drifted-diff", self.first,
+            diff_text="diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-one\n+altered\n",
+            state="closed", merged_at="2026-08-30T12:00:00Z",
+        )
+        completed = self.run_ctl("link-predecessor", different_diff, prior)
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("not lifecycle or route drift", completed.stderr)
 
     def test_a_third_round_still_remembers_the_first_rounds_drop(self):
         prior = self.reviewed()
