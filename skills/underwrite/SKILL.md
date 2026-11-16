@@ -632,10 +632,9 @@ Lead each terminal handoff with the current recommendation and the count of deci
 owed (`state: "flag"` only). Accepted findings and pending delivery are not new decisions.
 
 **Moving past a clean or unverified beat.** Neither asks for a decision, so do not park
-on it. Store
-it, post `working` naming the beat you are moving to, then read `/state`: `seq` above
-`handled_seq` means an action is queued, so take it through `/await` and handle it as
-below before anything else. Otherwise go straight to the next beat in the same turn. When
+on it. Store it, then read `/state`: `seq` above `handled_seq` means an action is queued,
+so take it through `/await` and handle it as below before anything else. Otherwise post
+`working` naming the beat you are moving to and go straight to it in the same turn. When
 there is no next planned beat, the walk is over: post `done` with a one-line summary, as
 the last `next` does below, then go to Phase 4.
 
@@ -694,8 +693,9 @@ executing its head. Do not include `session` or `beats` in a question applicatio
 The returned receipt is the authoritative answer. Persist it, acknowledge its exact
 `seq`, then show that receipt's question, answer, and evidence in the terminal. Then carry
 on from where the walk was, not from the beat the question was about: park again if the
-walk was parked on an open `FLAG`, and otherwise continue past the clean or unverified beat
-it was moving on from. After a restart, an already-applied `result` is the stored answer, not permission
+walk was parked on an open `FLAG`, continue past the clean or unverified beat it was moving
+on from, and if the walk had already ended, post `done` again and stay in Phase 4, since
+the question set the page back to working. After a restart, an already-applied `result` is the stored answer, not permission
 to answer differently. Questions do not change the beat's state, `call`, delivery,
 cursor, or decisions owed, and do not advance the walk. The page keeps each question
 with its answer or visible pending status, including in the static report.

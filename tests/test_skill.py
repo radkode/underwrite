@@ -189,6 +189,7 @@ class CleanMeansChecked(unittest.TestCase):
         text = self.skill()
         self.assertIn("carry on from where the walk was, not from the beat the question was about", text)
         self.assertIn("park again if the walk was parked on an open `FLAG`", text)
+        self.assertIn("if the walk had already ended, post `done` again and stay in Phase 4", text)
         self.assertNotIn("park again on the beat the question was asked about", text)
         self.assertNotIn("and wait after its answer", text)
 
