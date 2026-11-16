@@ -22,6 +22,11 @@ if str(SCRIPTS) not in sys.path:
 import pr_snapshot  # noqa: E402
 import session_store  # noqa: E402
 
+if __package__:
+    from .sqlite_support import connected
+else:
+    from sqlite_support import connected
+
 
 class LookupTimeoutCase(unittest.TestCase):
     def test_load_pr_bounds_the_github_process(self):
@@ -1192,7 +1197,7 @@ class Guarding(SnapshotCase):
         )
 
     def mutate_session(self, mutate):
-        with sqlite3.connect(str(self.session / "session.sqlite3")) as db:
+        with connected(str(self.session / "session.sqlite3")) as db:
             row = db.execute(
                 "SELECT body_json FROM session WHERE singleton = 1"
             ).fetchone()

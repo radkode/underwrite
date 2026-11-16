@@ -31,6 +31,11 @@ from gateway.broker import (
 )
 from gateway.store import ReplayConflict, StoreError, StoredExecution
 
+if __package__:
+    from .sqlite_support import connected
+else:
+    from sqlite_support import connected
+
 
 SIGNER_ID = "https://runner.example/hosts/runner-7"
 SESSION_ID = "71f9b79c-9b2a-4b89-a69c-f3ed3a032abc"
@@ -346,7 +351,7 @@ class BrokerCase(unittest.TestCase):
 
     def row(self, broker, request=None):
         key = self.replay_key(broker, request)
-        with sqlite3.connect(str(broker.ledger.path)) as database:
+        with connected(str(broker.ledger.path)) as database:
             database.row_factory = sqlite3.Row
             return database.execute(
                 "SELECT * FROM attempts WHERE replay_key = ?",

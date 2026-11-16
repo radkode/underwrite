@@ -13,6 +13,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
+if __package__:
+    from .sqlite_support import connected
+else:
+    from sqlite_support import connected
+
 
 SCRIPTS = Path(__file__).resolve().parent.parent / "skills" / "underwrite" / "scripts"
 SESSIONCTL = SCRIPTS / "sessionctl.py"
@@ -676,7 +681,7 @@ class NoiseLedger(unittest.TestCase):
         root = self.walked()
         legacy = self.legacy()
         database = root / "session.sqlite3"
-        with sqlite3.connect(str(database)) as db:
+        with connected(str(database)) as db:
             db.execute("PRAGMA user_version = 6")
         before = {
             path: path.read_bytes()

@@ -19,6 +19,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
+if __package__:
+    from .sqlite_support import connected
+else:
+    from sqlite_support import connected
+
 SCRIPTS = Path(__file__).resolve().parent.parent / "skills" / "underwrite" / "scripts"
 
 
@@ -2095,7 +2100,7 @@ class RenderCli(unittest.TestCase):
             slots={"what": "x", "proof": "a.ts:1", "risk": "r", "fix": "f"},
         ))
         store.ack(store.produce("accept-1", 1, "accept", "include it")["seq"])
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             row = db.execute("SELECT body_json FROM beats WHERE n = 1").fetchone()
             finding = json.loads(row[0])
             finding["slots"] = {
@@ -2105,7 +2110,7 @@ class RenderCli(unittest.TestCase):
                 "UPDATE beats SET body_json = ? WHERE n = 1", (json.dumps(finding),)
             )
         store.export_json()
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             db.execute("PRAGMA user_version = 5")
         findings = self.root / "findings.md"
         # What a build that could not read these keys left on disk.
@@ -2129,7 +2134,7 @@ class RenderCli(unittest.TestCase):
     def test_a_pr_audience_mismatch_fails_final_validation(self):
         store = self.frozen_store(state="open")
         store.put_beat(beat(n=1, state="clean"))
-        with sqlite3.connect(str(self.root / "session.sqlite3")) as db:
+        with connected(str(self.root / "session.sqlite3")) as db:
             row = db.execute(
                 "SELECT body_json FROM session WHERE singleton = 1"
             ).fetchone()

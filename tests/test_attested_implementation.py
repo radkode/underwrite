@@ -33,6 +33,11 @@ from gateway.signing import OpenSSLSigner  # noqa: E402
 from pr_snapshot import SnapshotError, TargetMoved, capture  # noqa: E402
 from session_store import Conflict, SessionStore  # noqa: E402
 
+if __package__:
+    from .sqlite_support import connected
+else:
+    from sqlite_support import connected
+
 
 def canonical(value):
     return json.dumps(
@@ -546,7 +551,7 @@ class AttestedImplementationCase(unittest.TestCase):
         external = self.root / "external-session.sqlite3"
         database.rename(external)
         database.symlink_to(external)
-        with sqlite3.connect(str(external)) as db:
+        with connected(str(external)) as db:
             before = db.execute("SELECT COUNT(*) FROM implementation_attempts").fetchone()[0]
 
         with self.assertRaisesRegex(
@@ -559,7 +564,7 @@ class AttestedImplementationCase(unittest.TestCase):
                 api=self.api,
             )
 
-        with sqlite3.connect(str(external)) as db:
+        with connected(str(external)) as db:
             self.assertEqual(
                 db.execute("SELECT COUNT(*) FROM implementation_attempts").fetchone()[0],
                 before,
@@ -723,7 +728,7 @@ class AttestedImplementationCase(unittest.TestCase):
         quarantine.assert_not_called()
 
         self.assertFalse((self.source_root / "implementations").exists())
-        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+        with connected(str(self.source_root / "session.sqlite3")) as db:
             self.assertEqual(
                 db.execute("SELECT COUNT(*) FROM implementation_links").fetchone()[0],
                 0,
@@ -752,14 +757,14 @@ class AttestedImplementationCase(unittest.TestCase):
         quarantine.assert_not_called()
 
         self.assertFalse((self.source_root / "implementations").exists())
-        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+        with connected(str(self.source_root / "session.sqlite3")) as db:
             self.assertEqual(
                 db.execute("SELECT COUNT(*) FROM implementation_links").fetchone()[0],
                 0,
             )
 
     def test_source_without_a_frozen_bundle_is_rejected_without_a_traceback(self):
-        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+        with connected(str(self.source_root / "session.sqlite3")) as db:
             body = json.loads(
                 db.execute(
                     "SELECT body_json FROM session WHERE singleton = 1"
@@ -789,7 +794,7 @@ class AttestedImplementationCase(unittest.TestCase):
                 self.link()
 
         self.assertFalse((self.source_root / "implementations").exists())
-        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+        with connected(str(self.source_root / "session.sqlite3")) as db:
             self.assertEqual(
                 db.execute("SELECT COUNT(*) FROM implementation_links").fetchone()[0],
                 0,
@@ -808,7 +813,7 @@ class AttestedImplementationCase(unittest.TestCase):
                 self.link()
 
         self.assertFalse((self.source_root / "implementations").exists())
-        with sqlite3.connect(str(self.source_root / "session.sqlite3")) as db:
+        with connected(str(self.source_root / "session.sqlite3")) as db:
             self.assertEqual(
                 db.execute("SELECT COUNT(*) FROM implementation_links").fetchone()[0],
                 0,

@@ -25,6 +25,11 @@ from gateway.store import (
     StoredExecution,
 )
 
+if __package__:
+    from .sqlite_support import connected
+else:
+    from sqlite_support import connected
+
 
 def object_path(store, reference):
     return store.objects / reference.sha256[:2] / reference.sha256[2:]
@@ -175,7 +180,7 @@ class ReplayLedgerTests(unittest.TestCase):
         return result, output
 
     def update_attempt(self, assignment, values, replay_key="replay-1"):
-        with sqlite3.connect(str(self.ledger.path)) as database:
+        with connected(str(self.ledger.path)) as database:
             database.execute(
                 f"UPDATE attempts SET {assignment} WHERE replay_key = ?",
                 tuple(values) + (replay_key,),
@@ -201,7 +206,7 @@ class ReplayLedgerTests(unittest.TestCase):
 
         self.assertEqual(outcomes.count("reserved"), 1)
         self.assertEqual(outcomes.count("conflict"), workers - 1)
-        with sqlite3.connect(str(self.ledger.path)) as database:
+        with connected(str(self.ledger.path)) as database:
             count = database.execute("SELECT COUNT(*) FROM attempts").fetchone()[0]
         self.assertEqual(count, 1)
 
@@ -298,7 +303,7 @@ class ReplayLedgerTests(unittest.TestCase):
         )
         self.ledger.fail("signer-failed", "host signer unavailable")
 
-        with sqlite3.connect(str(self.ledger.path)) as database:
+        with connected(str(self.ledger.path)) as database:
             state, capability, reason = database.execute(
                 "SELECT state, capability, failure FROM attempts WHERE replay_key = ?",
                 ("signer-failed",),
@@ -375,7 +380,7 @@ class ReplayLedgerTests(unittest.TestCase):
         with self.assertRaises(KeyError):
             result.artifact("missing")
 
-        with sqlite3.connect(str(self.ledger.path)) as database:
+        with connected(str(self.ledger.path)) as database:
             raw = database.execute(
                 "SELECT artifacts_json FROM attempts WHERE replay_key = ?",
                 ("replay-1",),
