@@ -40,12 +40,15 @@ piping it.
 Non-negotiable. Everything else here is guidance.
 
 **1. One beat at a time.** Present exactly one unit of change, store it, then look at
-what it opened with. A `FLAG` or `UNVERIFIED` beat stops and waits for the reviewer. A
-`CLEAN` beat does not: once nothing is queued, the walk goes straight on to the next beat.
+what it opened with. A `FLAG` beat stops and waits for the reviewer. `CLEAN` and
+`UNVERIFIED` beats do not: once nothing is queued, the walk goes straight on to the next
+beat. An `UNVERIFIED` beat asks for the reviewer's reading, not a decision, and the page
+keeps it under its own heading so that reading has somewhere to go; the reviewer can open
+it, ask about it, or go back to it at any time.
 Never two units in one beat. Never "and while we're here." Your pull will be to batch
 beats to seem efficient. That single behavior collapses this back into the wall of text
-the reviewer is escaping. Moving past a clean beat is not batching: it still lands on the
-page as its own unit, with its own proof, before the next one starts.
+the reviewer is escaping. Moving past a beat that asks nothing is not batching: it still
+lands on the page as its own unit, with its own proof, before the next one starts.
 
 **2. Beats are slots, not prose.** A verdict token opens every beat: `CLEAN`, `FLAG`, or
 `UNVERIFIED`. Then fixed lines, in this order, one line each:
@@ -628,10 +631,12 @@ The renderer reports a mismatch between `cursor` and the beats the store contain
 Lead each terminal handoff with the current recommendation and the count of decisions
 owed (`state: "flag"` only). Accepted findings and pending delivery are not new decisions.
 
-**Moving past a clean beat.** A `CLEAN` beat asks nothing, so do not park on it. Store
-it, post `working` naming the beat you are moving to, then read `/state`: `seq` above
-`handled_seq` means an action is queued, so take it through `/await` and handle it as
-below before anything else. Otherwise go straight to the next beat in the same turn.
+**Moving past a clean or unverified beat.** Neither asks for a decision, so do not park
+on it. Store it, then read `/state`: `seq` above `handled_seq` means an action is queued,
+so take it through `/await` and handle it as below before anything else. Otherwise post
+`working` naming the beat you are moving to and go straight to it in the same turn. When
+there is no next planned beat, the walk is over: post `done` with a one-line summary, as
+the last `next` does below, then go to Phase 4.
 
 `next` is walk-global: the page sends it with no beat number, so apply it from the walk's
 current position whatever beat the reviewer was looking at. One found queued at that
@@ -639,7 +644,7 @@ current position whatever beat the reviewer was looking at. One found queued at 
 is then treated by its own verdict. A `next` can therefore pass a beat presented in the
 instant before the click; the ledger keeps the beat, and `back` returns to it.
 
-**Waiting on the reviewer.** After presenting a `FLAG` or `UNVERIFIED` beat, park on the
+**Waiting on the reviewer.** After presenting a `FLAG` beat, park on the
 server rather than ending the turn silently. Run this in the background too, so the
 harness wakes you when
 the reviewer acts:
@@ -686,8 +691,11 @@ inferred or insufficient. A PR source remains `no_exec`: a question never author
 executing its head. Do not include `session` or `beats` in a question application.
 
 The returned receipt is the authoritative answer. Persist it, acknowledge its exact
-`seq`, then show that receipt's question, answer, and evidence in the terminal and park
-again on the beat the question was asked about. After a restart, an already-applied `result` is the stored answer, not permission
+`seq`, then show that receipt's question, answer, and evidence in the terminal. Then carry
+on from where the walk was, not from the beat the question was about: park again if the
+walk was parked on an open `FLAG`, continue past the clean or unverified beat it was moving
+on from, and if the walk had already ended, post `done` again and stay in Phase 4, since
+the question set the page back to working. After a restart, an already-applied `result` is the stored answer, not permission
 to answer differently. Questions do not change the beat's state, `call`, delivery,
 cursor, or decisions owed, and do not advance the walk. The page keeps each question
 with its answer or visible pending status, including in the static report.
@@ -708,8 +716,8 @@ After the local effect and any required external effect are durable, acknowledge
 exact reply, and do it before you write anything the reviewer will read. Until the ack the
 page holds every control for that action, so a beat narrated first leaves the reviewer
 facing a page that died one click after they used it. For a navigation reply the order is
-apply, ack, present the beat, then park on a `FLAG` or `UNVERIFIED` beat or move on from
-a `CLEAN` one. The terminal message is the part that can wait:
+apply, ack, present the beat, then park on a `FLAG` beat or move on from any other.
+The terminal message is the part that can wait:
 
 ```bash
 $S/scripts/sessionctl.py ack "$R" <seq>
@@ -967,9 +975,10 @@ observation becomes an anchored note, a question gets answered and the beat stay
 "next" or "ok" advances, "skip follow-through" drops a tier, "back" returns to an earlier
 beat. "Not real" or "we meant that" is a drop whose words name its reason; when they do
 not, ask which of the four it is before posting. Route a question through `question`,
-not `note` or `decide`, and wait after its
-answer. Past a `FLAG` or `UNVERIFIED` beat, advance only when the reviewer asks to move
-on; past a `CLEAN` beat, advance on your own.
+not `note` or `decide`. One typed in the terminal is a conversation, so answer it and let
+the reviewer reply; one that arrives through the page is handled where the walk is. Past
+a `FLAG` beat, advance only when the reviewer asks to move on; past a
+`CLEAN` or `UNVERIFIED` beat, advance on your own.
 
 ## Phase 4: finish
 

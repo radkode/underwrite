@@ -9,7 +9,8 @@ Output is a body fragment. Phase 4 passes --standalone for a document shell,
 because the finished page is a local file unless the reviewer opts into publishing.
 
 Beats are ordered by what is owed, not by beat number: open flags first, then
-accepted, then walked-and-clean. That ordering is the whole point of the page.
+decided, then read but not run, then checked, then dropped. That ordering is the whole
+point of the page.
 
 Exit 0  every beat validated
 Exit 2  the page rendered, but some beat failed validation and carries an
@@ -57,7 +58,8 @@ STATE_STYLE = {
 SECTIONS = (
     ("Decisions owed", "out of item order, on purpose", ("flag",), True),
     ("Decided", "your call, and what came of it", ("accepted", "decided"), True),
-    ("Read and clean", "nothing owed, proof on each", ("clean", "unverified"), False),
+    ("Read, not run", "nothing owed; this is where your own reading goes", ("unverified",), False),
+    ("Checked", "a run backs each one", ("clean",), False),
     ("Dropped", "raised, then set aside", ("dropped",), False),
 )
 
@@ -1485,9 +1487,10 @@ def body_html(
     for beat in beats:
         counts[beat.get("state")] = counts.get(beat.get("state"), 0) + 1
 
-    # One tile per section, so the first four always sum to the last.
+    # One tile per section, so the first five always sum to the last.
     tiles = [
-        ("is-clean", counts.get("clean", 0) + counts.get("unverified", 0), "clean"),
+        ("is-clean", counts.get("clean", 0), "checked"),
+        ("is-unver", counts.get("unverified", 0), "read, not run"),
         ("is-flag", counts.get("flag", 0), "decisions owed"),
         ("is-acc", counts.get("accepted", 0) + counts.get("decided", 0), "decided"),
         ("is-drop", counts.get("dropped", 0), "dropped"),
@@ -1503,11 +1506,11 @@ def body_html(
         + "</div>"
     )
 
-    # A state outside the five matches no section, and a beat that matches no section
+    # A state outside the six matches no section, and a beat that matches no section
     # used to render nowhere while still counting in the tiles. The page exists to say
     # what is owed, so an unplaceable beat is shown, not dropped.
     placed = {state for _h, _t, states, _e in SECTIONS for state in states}
-    sections = (*SECTIONS, ("Unplaced", "state is not one of the five", None, True))
+    sections = (*SECTIONS, ("Unplaced", "state is not one of the six", None, True))
 
     for heading, hint, states, expanded in sections:
         if states is None:
@@ -1516,6 +1519,10 @@ def body_html(
             picked = [b for b in ledger if b.get("state") in states]
         if not picked:
             continue
+        if states == ("clean",) and any(
+            b.get("proof_kind") not in ("ran", "attested") for b in picked
+        ):
+            hint = "some were recorded before proof kinds and may rest on a read"
         if current and states and "accepted" in states:
             expanded = False
         cards = "".join(

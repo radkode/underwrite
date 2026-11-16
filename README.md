@@ -4,9 +4,10 @@ Read a pull request closely enough to stand behind it. One beat at a time, drive
 ending in a delivered result.
 
 Most review tooling hands you a wall of findings and leaves the work of deciding to you.
-This walks a change in causal order, one coherent unit at a time, and stops on each one
-that needs you: a flag, or a claim it could only read and not check. Clean beats land on
-the page and the walk moves on. When something is worth flagging, the action names what
+This walks a change in causal order, one coherent unit at a time, and stops only where it
+needs a decision from you: a flag. Clean beats, and beats it could only read and not check,
+land on the page and the walk moves on; the read-only ones gather under their own heading,
+which is where your own reading goes. When something is worth flagging, the action names what
 happens next:
 Implement applies and verifies a branch fix, Include in review queues a finding for the
 GitHub review, and Include in report records a finding in the durable report.
@@ -200,7 +201,8 @@ is listening, the beat being read leads the page on its own, under a bar that st
 view: the plan as a track with the current beat marked, the agent's own sentence about
 what it is doing, and Next item. Everything already walked sits below, ordered by what is
 owed rather than by what was walked: open flags expanded at the top, resolved beats folded
-to one line with your call on it, clean beats to one line each that still carries its
+to one line with your call on it, read-only beats under their own heading, where your own
+reading goes, and clean beats to one line each that still carries its
 proof. When the walk ends, that ledger is the page, and it is what the final render keeps.
 Above it sits what the walk covered against what it planned, with any beat it never
 reached named and the risky ones marked read carefully, because a review that stopped at
@@ -223,7 +225,7 @@ Include in report and Drop. Local branch and working-tree sessions retain Implem
 policy question whose answer completes the work carries Record decision.
 Each has a field for putting the call in your own words, and Next item advances the walk
 from anywhere. Clicking is what unblocks the terminal side, which parks on the server at
-every flag and unverified beat rather than spinning. The terminal still takes the same answers in words,
+every flag rather than spinning. The terminal still takes the same answers in words,
 so closing the tab never strands a session.
 
 The labels describe the delegated effect without changing the durable protocol. Implement,
