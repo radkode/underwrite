@@ -21,7 +21,7 @@ HERE = str(Path(__file__).resolve().parent)
 if HERE not in sys.path:
     sys.path.insert(0, HERE)
 
-from diff_lines import anchor_line, parse_diff, untouched_anchor  # noqa: E402
+from diff_lines import anchor_line, diff_paths, parse_diff, untouched_anchor  # noqa: E402
 
 
 DB_SCHEMA_VERSION = 8
@@ -623,7 +623,7 @@ def _bounded_file_identity(path, expected_size, label):
     return digest.hexdigest(), expected_size
 
 
-def _bounded_file_bytes(path, expected_size, label):
+def _bounded_file_bytes(path, expected_size, label, mismatch_on_size=False):
     if not hasattr(os, "O_NOFOLLOW"):
         raise Conflict("target reads require no-follow file opens")
     try:
@@ -641,11 +641,11 @@ def _bounded_file_bytes(path, expected_size, label):
         raise Conflict(f"{label} cannot be opened safely") from error
     try:
         before = os.fstat(descriptor)
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or before.st_nlink != 1
-            or before.st_size != expected_size
-        ):
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise Conflict(f"{label} is not one exact regular file")
+        if before.st_size != expected_size:
+            if mismatch_on_size:
+                raise Conflict(f"{label} does not match")
             raise Conflict(f"{label} is not one exact regular file")
         data = bytearray()
         while len(data) < expected_size:
@@ -673,6 +673,79 @@ def _bounded_file_bytes(path, expected_size, label):
     if identity(before) != identity(after):
         raise Conflict(f"{label} changed while read")
     return bytes(data)
+
+
+def _bounded_file_copy(source, destination, expected_size, label):
+    if not hasattr(os, "O_NOFOLLOW"):
+        raise Conflict("target reads require no-follow file opens")
+    try:
+        descriptor = os.open(
+            os.fsencode(source),
+            os.O_RDONLY
+            | os.O_NOFOLLOW
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NONBLOCK", 0)
+            | getattr(os, "O_NOCTTY", 0),
+        )
+    except FileNotFoundError:
+        raise
+    except OSError as error:
+        raise Conflict(f"{label} cannot be opened safely") from error
+    created = False
+    try:
+        before = os.fstat(descriptor)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1:
+            raise Conflict(f"{label} is not one exact regular file")
+        if before.st_size != expected_size:
+            raise Conflict(f"{label} does not match")
+        try:
+            outgoing = destination.open("xb")
+        except OSError as error:
+            raise StoreError(
+                "verified Git object bundle destination cannot be created"
+            ) from error
+        created = True
+        digest = hashlib.sha256()
+        remaining = expected_size
+        with outgoing:
+            while remaining:
+                block = os.read(descriptor, min(remaining, 1024 * 1024))
+                if not block:
+                    raise Conflict(f"{label} became shorter while read")
+                outgoing.write(block)
+                digest.update(block)
+                remaining -= len(block)
+            if os.read(descriptor, 1):
+                raise Conflict(f"{label} became longer while read")
+            outgoing.flush()
+            os.fsync(outgoing.fileno())
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_mode,
+            before.st_nlink,
+            before.st_size,
+            before.st_mtime_ns,
+            before.st_ctime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_mode,
+            after.st_nlink,
+            after.st_size,
+            after.st_mtime_ns,
+            after.st_ctime_ns,
+        ):
+            raise Conflict(f"{label} changed while read")
+        return digest.hexdigest(), expected_size
+    except Exception:
+        if created:
+            with contextlib.suppress(FileNotFoundError):
+                destination.unlink()
+        raise
+    finally:
+        os.close(descriptor)
 
 
 class SessionStore:
@@ -3695,7 +3768,12 @@ class SessionStore:
                 raise Conflict("session has no frozen trusted context")
             path = self.root / "trusted-context.json"
             try:
-                data = path.read_bytes()
+                data = _bounded_file_bytes(
+                    path,
+                    expected_size,
+                    "frozen trusted context",
+                    mismatch_on_size=True,
+                )
             except FileNotFoundError as error:
                 raise Conflict("frozen trusted context is missing") from error
             digest = hashlib.sha256(data).hexdigest()
@@ -3708,11 +3786,17 @@ class SessionStore:
         read_verified_target_diff's; this adds the bound and the transport encoding so
         the agent never has to open the projection file itself."""
         max_bytes = _positive(max_bytes, "diff max_bytes")
-        target, data = self.read_verified_target_diff()
-        if len(data) > max_bytes:
-            raise Conflict(
-                f"frozen diff is {len(data)} bytes, above max_bytes {max_bytes}"
-            )
+        with self._session_lock():
+            with self._read() as db:
+                session = json.loads(self._session_row(db)["body_json"])
+                target = session.get("target")
+                if target is None:
+                    raise Conflict("session has no frozen target")
+            if target["diff_bytes"] > max_bytes:
+                raise Conflict(
+                    f"frozen diff is {target['diff_bytes']} bytes, above max_bytes {max_bytes}"
+                )
+            data = self._verified_diff_bytes(target)
         try:
             content, encoding = data.decode("utf-8"), "utf-8"
         except UnicodeError:
@@ -3759,40 +3843,19 @@ class SessionStore:
             if expected_digest is None or expected_size is None:
                 raise Conflict("session has no frozen Git object bundle")
             source = self.root / "pr.bundle"
-            digest, size = hashlib.sha256(), 0
-            created = False
             try:
-                try:
-                    incoming = source.open("rb")
-                except FileNotFoundError as error:
-                    raise Conflict("frozen Git object bundle is missing") from error
-                try:
-                    outgoing = destination.open("xb")
-                except OSError as error:
-                    incoming.close()
-                    raise StoreError(
-                        "verified Git object bundle destination cannot be created"
-                    ) from error
-                created = True
-                with incoming, outgoing:
-                    while True:
-                        chunk = incoming.read(1024 * 1024)
-                        if not chunk:
-                            break
-                        outgoing.write(chunk)
-                        digest.update(chunk)
-                        size += len(chunk)
-                    outgoing.flush()
-                    os.fsync(outgoing.fileno())
-                if size != expected_size or digest.hexdigest() != expected_digest:
-                    raise Conflict("frozen Git object bundle does not match")
-            except Exception:
-                if created:
-                    try:
-                        destination.unlink()
-                    except FileNotFoundError:
-                        pass
-                raise
+                digest, size = _bounded_file_copy(
+                    source,
+                    destination,
+                    expected_size,
+                    "frozen Git object bundle",
+                )
+            except FileNotFoundError as error:
+                raise Conflict("frozen Git object bundle is missing") from error
+            if size != expected_size or digest != expected_digest:
+                with contextlib.suppress(FileNotFoundError):
+                    destination.unlink()
+                raise Conflict("frozen Git object bundle does not match")
             return target
 
     def review_marker(self):
@@ -3815,7 +3878,12 @@ class SessionStore:
 
     def _verified_diff_bytes(self, target):
         try:
-            data = (self.root / "pr.diff").read_bytes()
+            data = _bounded_file_bytes(
+                self.root / "pr.diff",
+                target["diff_bytes"],
+                "frozen target projection pr.diff",
+                mismatch_on_size=True,
+            )
         except FileNotFoundError as error:
             raise Conflict("frozen target projection pr.diff is missing") from error
         digest = hashlib.sha256(data).hexdigest()
@@ -3906,18 +3974,54 @@ class SessionStore:
                 raise Conflict("a session cannot replace itself")
             if (prior_target["repo"], prior_target["number"]) != (target["repo"], target["number"]):
                 raise Conflict("predecessor reviewed a different pull request")
-            if (prior_target["base_sha"], prior_target["head_sha"]) == (
+            same_revisions = (prior_target["base_sha"], prior_target["head_sha"]) == (
                 target["base_sha"], target["head_sha"]
-            ):
-                raise Conflict("predecessor froze the same base and head; resume it instead")
+            )
+            if same_revisions:
+                frozen_fields = (
+                    "diff_sha256",
+                    "diff_bytes",
+                    "merge_base_sha",
+                    "object_bundle_sha256",
+                    "object_bundle_bytes",
+                    "trusted_context_sha256",
+                    "trusted_context_bytes",
+                )
+                if any(
+                    prior_target.get(name) != target.get(name)
+                    for name in frozen_fields
+                ):
+                    raise Conflict(
+                        "predecessor froze different artifacts for the same base and head; "
+                        "not lifecycle or route drift"
+                    )
+                identity_fields = (
+                    "state",
+                    "merged_at",
+                    "head_repo_id",
+                    "head_repo",
+                    "head_ref",
+                )
+                if all(
+                    prior_target.get(name) == target.get(name)
+                    for name in identity_fields
+                ):
+                    raise Conflict(
+                        "predecessor froze the same base and head; resume it instead"
+                    )
             if moved.get("head_sha") != target["head_sha"]:
                 raise StoreError("moved lines must be computed against this session's head")
+            moved_lines_map = moved.get("lines")
+            if not isinstance(moved_lines_map, dict):
+                raise StoreError("moved lines must map paths to head line lists")
+            if same_revisions and moved_lines_map:
+                raise StoreError("moved lines must be empty when the head did not move")
             session["predecessor"] = {
                 "session": predecessor.root.name,
                 "round": prior_round + 1,
                 "base_sha": prior_target["base_sha"],
                 "head_sha": prior_target["head_sha"],
-                "moved": moved["lines"],
+                "moved": {} if same_revisions else moved_lines_map,
                 "carried": carried,
             }
             if self._save_session(db, session, allow_new_predecessor=True):
@@ -3965,20 +4069,7 @@ class SessionStore:
         this list, so agent prose can never reach an href.
         """
         _target, data = self.read_verified_target_diff()
-        paths = set()
-        for line in data.split(b"\n"):
-            if not line.startswith(b"diff --git a/"):
-                continue
-            rest = line[len(b"diff --git a/"):]
-            marker = rest.find(b" b/")
-            if marker == -1:
-                continue
-            for side in (rest[:marker], rest[marker + 3:]):
-                try:
-                    paths.add(side.decode("utf-8"))
-                except UnicodeDecodeError:
-                    continue
-        return sorted(paths)
+        return diff_paths(data)
 
     def verify_target_files(self):
         with self._session_lock():
@@ -4052,19 +4143,32 @@ class SessionStore:
             "deliveries": deliveries,
         }
 
+    def _insert_new_beat(self, db, session, beat):
+        self._validate_new_beat(beat)
+        self._attest_beat(db, session, beat)
+        self._guard_beat(session, beat)
+        changed, _revision, _state, _detail = self._save_beat(db, beat)
+        return changed
+
     def put_beat(self, document):
         beat = self._beat_document(document)
         with self._first_work_write() as db:
             session, _execution_policy = self._session_execution_policy(db)
             if session.get("linked_implementation") is not None:
                 raise Conflict("linked implementation finding is immutable")
+            max_existing = db.execute("SELECT MAX(n) FROM beats").fetchone()[0]
             row = db.execute(
                 "SELECT body_json, delivery_state, delivery_json FROM beats WHERE n = ?",
                 (beat["n"],),
             ).fetchone()
+            session_changed = False
             if row is None:
-                self._validate_new_beat(beat)
-            if row is not None:
+                changed = self._insert_new_beat(db, session, beat)
+                if max_existing is None or beat["n"] > max_existing:
+                    updated_session = json.loads(self._session_row(db)["body_json"])
+                    updated_session["current_beat"] = beat["n"]
+                    session_changed = self._save_session(db, updated_session)
+            else:
                 _refuse_slot_collision(beat)
                 current = json.loads(row["body_json"])
                 if isinstance(current.get("slots"), dict):
@@ -4119,12 +4223,11 @@ class SessionStore:
                         if not isinstance(slots, dict):
                             raise StoreError(f"beat {beat['n']} slots must be an object")
                         slots["fix"] = current_slots["fix"]
-            self._attest_beat(db, session, beat)
-            if row is not None:
+                self._attest_beat(db, session, beat)
                 self._hold_authorized_finding(db, beat, current)
-            self._guard_beat(session, beat)
-            changed, _revision, _state, _detail = self._save_beat(db, beat)
-            if changed:
+                self._guard_beat(session, beat)
+                changed, _revision, _state, _detail = self._save_beat(db, beat)
+            if changed or session_changed:
                 self._bump_render(db)
         return next(item for item in self.snapshot()[1] if item["n"] == beat["n"])
 
@@ -4503,12 +4606,17 @@ class SessionStore:
         beats,
         reference_session=_MISSING,
         authoritative=False,
+        navigation=False,
     ):
         if not isinstance(result, dict):
             raise StoreError("result must be an absolute object")
         normalized_session = None
         if session is not None:
             candidate = _copy(session)
+            if navigation:
+                for key in ("current_beat", "skipped_tiers"):
+                    if key in result:
+                        candidate[key] = _copy(result[key])
             if isinstance(reference_session, dict):
                 stored_target = reference_session.get("target")
                 if (
@@ -4545,13 +4653,33 @@ class SessionStore:
             normalized_beats,
         )
 
-    def _same_application(self, row, application):
+    def _same_application(self, row, application, db=None):
         current = json.loads(row["result_json"])
+        if row["kind"] in NAVIGATION:
+            # The store writes the position from the result into the session, so a receipt
+            # stored before it did compares as if it had.
+            for value in (current, application):
+                if isinstance(value.get("session"), dict) and isinstance(value.get("result"), dict):
+                    for key in ("current_beat", "skipped_tiers"):
+                        if key in value["result"]:
+                            value["session"][key] = _copy(value["result"][key])
+        session = current.get("session")
+        if not isinstance(session, dict) and db is not None:
+            session = json.loads(self._session_row(db)["body_json"])
         for value in (current, application):
-            value["beats"] = [
-                self._canonical_beat(beat) if isinstance(beat, dict) else beat
-                for beat in value.get("beats", [])
-            ]
+            normalized = []
+            for beat in value.get("beats", []):
+                if isinstance(beat, dict):
+                    beat = self._canonical_beat(beat)
+                    if (
+                        db is not None
+                        and isinstance(session, dict)
+                        and beat.get("proof_kind") == "attested"
+                        and "attestation" not in beat
+                    ):
+                        self._attest_beat(db, session, beat)
+                normalized.append(beat)
+            value["beats"] = normalized
         current_session = current.get("session")
         incoming_session = application.get("session")
         if (
@@ -4616,9 +4744,10 @@ class SessionStore:
                         session,
                         beats,
                         reference_session=stored.get("session"),
+                        navigation=row["kind"] in NAVIGATION,
                     )
                 )
-                if not self._same_application(row, application):
+                if not self._same_application(row, application, db=db):
                     raise Conflict(f"action {seq} already has a different application")
                 return self._action(row)
             if row["state"] == "abandoned":
@@ -4633,6 +4762,7 @@ class SessionStore:
                 beats,
                 reference_session=current_session,
                 authoritative=True,
+                navigation=True,
             )
             if normalized_session is None:
                 raise StoreError("navigation apply requires the absolute session document")
@@ -4646,20 +4776,29 @@ class SessionStore:
             changed = False
             if normalized_session is not None:
                 changed = self._save_session(db, normalized_session) or changed
+            applied_beats = []
             for beat in normalized_beats:
                 current = db.execute(
                     "SELECT body_json FROM beats WHERE n = ?", (beat["n"],)
                 ).fetchone()
                 if current is not None:
-                    if self._canonical_beat(json.loads(current["body_json"])) != beat:
+                    stored_beat = self._canonical_beat(json.loads(current["body_json"]))
+                    candidate = _copy(beat)
+                    if (
+                        candidate.get("proof_kind") == "attested"
+                        and "attestation" not in candidate
+                    ):
+                        self._attest_beat(db, normalized_session, candidate)
+                    if stored_beat != candidate:
                         raise Conflict(
                             f"navigation cannot replace existing beat {beat['n']}"
                         )
+                    applied_beats.append(stored_beat)
                 else:
-                    self._validate_new_beat(beat)
-                    self._guard_beat(normalized_session, beat)
-                    beat_changed, _revision, _state, _detail = self._save_beat(db, beat)
+                    beat_changed = self._insert_new_beat(db, normalized_session, beat)
                     changed = beat_changed or changed
+                    applied_beats.append(beat)
+            application["beats"] = [_copy(beat) for beat in applied_beats]
             if changed:
                 self._bump_render(db)
             timestamp = _now()
@@ -4969,7 +5108,7 @@ class SessionStore:
                         reference_session=stored.get("session"),
                     )
                 )
-                if not self._same_application(row, application):
+                if not self._same_application(row, application, db=db):
                     raise Conflict(f"action {seq} already has a different application")
                 return self._action(row)
             if row["state"] == "abandoned":
@@ -4989,10 +5128,22 @@ class SessionStore:
                 current = json.loads(self._session_row(db)["body_json"])
                 if current != normalized_session:
                     raise Conflict("observed session does not match the stored session")
+            observed_beats = []
             for beat in normalized_beats:
-                current = json.loads(self._beat_row(db, beat["n"])["body_json"])
-                if self._canonical_beat(current) != beat:
+                current = self._canonical_beat(
+                    json.loads(self._beat_row(db, beat["n"])["body_json"])
+                )
+                candidate = _copy(beat)
+                if (
+                    candidate.get("proof_kind") == "attested"
+                    and "attestation" not in candidate
+                ):
+                    self._attest_beat(db, normalized_session or current_session, candidate)
+                if current != candidate:
                     raise Conflict(f"observed beat {beat['n']} does not match the stored beat")
+                observed_beats.append(current)
+            if observed_beats:
+                application["beats"] = [_copy(beat) for beat in observed_beats]
             timestamp = _now()
             db.execute(
                 "UPDATE actions SET state = 'applied', result_json = ?, evidence = ?, "

@@ -27,6 +27,16 @@ if str(HERE) not in sys.path:
 from session_store import SessionStore, StoreError  # noqa: E402
 
 REVIEW_MARKER = re.compile(r"<!-- underwrite-review:[0-9a-f]{32} -->")
+MAX_REVIEW_BODY_CHARS = 65_536
+
+
+def _neutralize_marker(text):
+    return re.sub(
+        r"<!--(\s*underwrite-review:)",
+        r"&lt;!--\1",
+        text,
+        flags=re.IGNORECASE,
+    )
 
 from diff_lines import (  # noqa: E402,F401
     HUNK, SNAP_WINDOW, clean_path, hunk_holding, mark, parse_diff, snap,
@@ -89,8 +99,15 @@ def validate(payload, files):
     payload["comments"] = kept
 
     if folded:
-        lines = ["`%s:%s` %s" % (c.get("path"), c.get("line"), c.get("body", "").strip()) for c in folded]
-        payload["body"] = (payload.get("body", "").rstrip() + "\n\n" + "\n".join(lines)).strip()
+        lines = [
+            "`%s:%s` %s" % (
+                c.get("path"),
+                c.get("line"),
+                _neutralize_marker(str(c.get("body", "")).strip()),
+            )
+            for c in folded
+        ]
+        payload["body"] = ((payload.get("body") or "").rstrip() + "\n\n" + "\n".join(lines)).strip()
 
     return report
 
@@ -117,6 +134,7 @@ def main():
         # All three reads take bytes on purpose. Text mode translates a lone \r inside
         # a line's content to \n, desyncing the hunk before parse_diff ever runs.
         target = None
+        marker = ""
         if args.session:
             root = Path(args.session).expanduser()
             store = SessionStore(root)
@@ -133,6 +151,11 @@ def main():
             payload = json.load(fh)
         if not isinstance(payload, dict):
             raise StoreError("review payload must be an object")
+        body = payload.get("body", "")
+        if body is None:
+            body = ""
+        if not isinstance(body, str):
+            raise StoreError("review payload body must be text")
         if target is not None:
             if payload.get("event") not in (
                 "COMMENT",
@@ -147,20 +170,23 @@ def main():
                 payload["commit_id"] = target["head_sha"]
             elif commit_id != target["head_sha"]:
                 raise StoreError("review payload commit_id does not match the frozen head")
-            body = payload.get("body", "")
-            if body is None:
-                body = ""
-            if not isinstance(body, str):
-                raise StoreError("review payload body must be text")
             markers = REVIEW_MARKER.findall(body)
             if markers and markers != [marker]:
                 raise StoreError("review payload has a conflicting delivery marker")
-            if not markers:
-                payload["body"] = (body.rstrip() + "\n\n" + marker).strip()
+            body = REVIEW_MARKER.sub("", body).rstrip()
+        payload["body"] = body
+        report = validate(payload, parse_diff(diff))
+        if target is not None:
+            payload["body"] = (payload.get("body", "").rstrip() + "\n\n" + marker).strip()
+        final_body = payload.get("body", "")
+        if len(final_body) > MAX_REVIEW_BODY_CHARS:
+            raise StoreError(
+                f"review payload body is {len(final_body):,} characters, "
+                f"over GitHub's {MAX_REVIEW_BODY_CHARS:,}-character limit"
+            )
     except (OSError, UnicodeError, json.JSONDecodeError, StoreError) as e:
         sys.exit("validate-anchors: %s" % e)
 
-    report = validate(payload, parse_diff(diff))
     out = json.dumps(payload, indent=2)
 
     if args.out:

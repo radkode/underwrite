@@ -1145,18 +1145,93 @@ class FrozenTargets(unittest.TestCase):
         with self.assertRaisesRegex(session_store.Conflict, "is missing"):
             self.store.read_diff()
 
-    def test_reading_the_diff_fails_closed_above_max_bytes(self):
+    def test_reading_the_diff_fails_closed_above_max_bytes_without_reading_the_file(self):
         diff, metadata = self.inputs()
         target = self.store.freeze_target(self.target(), diff, metadata)
 
-        with self.assertRaisesRegex(session_store.Conflict, "above max_bytes"):
-            self.store.read_diff(max_bytes=target["diff_bytes"] - 1)
+        with mock.patch.object(
+            session_store, "_bounded_file_bytes",
+            side_effect=AssertionError("pr.diff should not be read above max_bytes"),
+        ), mock.patch.object(
+            Path, "read_bytes",
+            side_effect=AssertionError("Path.read_bytes should not be called"),
+        ):
+            with self.assertRaisesRegex(session_store.Conflict, "above max_bytes"):
+                self.store.read_diff(max_bytes=target["diff_bytes"] - 1)
         self.assertEqual(
             self.store.read_diff(max_bytes=target["diff_bytes"])["bytes"],
             target["diff_bytes"],
         )
         with self.assertRaisesRegex(session_store.StoreError, "diff max_bytes"):
             self.store.read_diff(max_bytes=0)
+
+    def test_frozen_artifact_reads_refuse_symlinks_and_fifos(self):
+        content = "review from the frozen base\n"
+        encoded = content.encode("utf-8")
+        blob_sha = hashlib.sha1(
+            b"blob " + str(len(encoded)).encode("ascii") + b"\0" + encoded
+        ).hexdigest()
+        context = {
+            "version": 1,
+            "base_sha": self.target()["base_sha"],
+            "files": [{
+                "path": "AGENTS.md",
+                "mode": "100644",
+                "blob_sha": blob_sha,
+                "content": content,
+            }],
+        }
+        diff, metadata = self.inputs()
+        bundle = self.root / "captured.bundle"
+        bundle.write_bytes(b"exact Git objects\n")
+        self.store.freeze_target(
+            self.target(), diff, metadata, self.context_input(document=context), bundle
+        )
+
+        elsewhere_diff = self.root / "elsewhere.diff"
+        elsewhere_diff.write_bytes((self.root / "pr.diff").read_bytes())
+        (self.root / "pr.diff").unlink()
+        (self.root / "pr.diff").symlink_to(elsewhere_diff)
+        with self.assertRaises(session_store.Conflict):
+            self.store.read_diff()
+        with self.assertRaises(session_store.Conflict):
+            self.store.read_verified_target_diff()
+        (self.root / "pr.diff").unlink()
+        os.mkfifo(self.root / "pr.diff")
+        with self.assertRaises(session_store.Conflict):
+            self.store.read_diff()
+        with self.assertRaises(session_store.Conflict):
+            self.store.read_verified_target_diff()
+        (self.root / "pr.diff").unlink()
+        elsewhere_diff.replace(self.root / "pr.diff")
+
+        elsewhere_ctx = self.root / "elsewhere.json"
+        elsewhere_ctx.write_bytes((self.root / "trusted-context.json").read_bytes())
+        (self.root / "trusted-context.json").unlink()
+        (self.root / "trusted-context.json").symlink_to(elsewhere_ctx)
+        with self.assertRaises(session_store.Conflict):
+            self.store.read_trusted_context()
+        (self.root / "trusted-context.json").unlink()
+        os.mkfifo(self.root / "trusted-context.json")
+        with self.assertRaises(session_store.Conflict):
+            self.store.read_trusted_context()
+        (self.root / "trusted-context.json").unlink()
+        elsewhere_ctx.replace(self.root / "trusted-context.json")
+
+        elsewhere_bundle = self.root / "elsewhere.bundle"
+        elsewhere_bundle.write_bytes((self.root / "pr.bundle").read_bytes())
+        (self.root / "pr.bundle").unlink()
+        (self.root / "pr.bundle").symlink_to(elsewhere_bundle)
+        copied = self.root / "copy-symlink.bundle"
+        with self.assertRaises(session_store.Conflict):
+            self.store.copy_verified_object_bundle(copied)
+        self.assertFalse(copied.exists())
+        (self.root / "pr.bundle").unlink()
+        os.mkfifo(self.root / "pr.bundle")
+        copied_fifo = self.root / "copy-fifo.bundle"
+        with self.assertRaises(session_store.Conflict):
+            self.store.copy_verified_object_bundle(copied_fifo)
+        self.assertFalse(copied_fifo.exists())
 
     def test_trusted_context_is_semantically_validated_and_hash_verified(self):
         content = "review from the frozen base\n"
@@ -2671,6 +2746,62 @@ class ProducingAndApplying(StoreCase):
                 action["seq"], result, session=dict(session, title="different")
             )
 
+    def test_navigation_result_owns_walk_position_and_put_beat_advances_it(self):
+        for n in (3, 4, 5):
+            self.store.put_beat(dict(CLEAN, n=n, where=f"b{n}.py:1"))
+        self.assertEqual(self.store.snapshot()[0]["current_beat"], 5)
+
+        back = self.store.produce("back-1", None, "back", "")
+        stale_session = dict(self.store.snapshot()[0], current_beat=5, skipped_tiers=["core"])
+        before = self.store.delivery_state()["render_revision"]
+        result = {"kind": "walk", "current_beat": 2, "skipped_tiers": []}
+
+        applied = self.store.apply(back["seq"], result, session=stale_session)
+        after = self.store.delivery_state()["render_revision"]
+        self.assertGreater(after, before)
+        self.assertEqual(self.store.snapshot()[0]["current_beat"], 2)
+        self.assertEqual(self.store.snapshot()[0]["skipped_tiers"], [])
+        self.assertEqual(self.store.presentation_snapshot()[0]["current_beat"], 2)
+
+        replay = self.store.apply(back["seq"], result, session=stale_session)
+        self.assertEqual(replay, applied)
+        self.assertEqual(self.store.delivery_state()["render_revision"], after)
+        self.store.ack(back["seq"])
+
+        self.store.put_beat(dict(CLEAN, n=6, where="b6.py:1"))
+        self.assertEqual(self.store.snapshot()[0]["current_beat"], 6)
+
+    def test_a_navigation_receipt_from_before_the_store_owned_position_still_replays(self):
+        """A receipt stored before the store wrote the position into the session can carry a
+        session that lacks a key its result names; an identical retry must still match."""
+        action = self.store.produce("nav-old", None, "back", "")
+        session = dict(self.store.snapshot()[0], current_beat=2)
+        session.pop("skipped_tiers", None)
+        result = {"kind": "walk", "current_beat": 2, "skipped_tiers": []}
+        self.store.apply(action["seq"], result, session=session)
+        db = sqlite3.connect(str(self.store.path))
+        try:
+            with db:
+                receipt = json.loads(db.execute(
+                    "SELECT result_json FROM actions WHERE seq = ?", (action["seq"],)
+                ).fetchone()[0])
+                receipt["session"].pop("skipped_tiers", None)
+                db.execute(
+                    "UPDATE actions SET result_json = ? WHERE seq = ?",
+                    (json.dumps(receipt), action["seq"]),
+                )
+        finally:
+            db.close()
+        before = self.store.delivery_state()["render_revision"]
+
+        self.store.apply(action["seq"], result, session=session)
+        self.store.ack(action["seq"])
+        self.store.apply(action["seq"], result, session=session)
+
+        self.assertEqual(self.store.delivery_state()["render_revision"], before)
+        with self.assertRaisesRegex(session_store.Conflict, "different application"):
+            self.store.apply(action["seq"], dict(result, current_beat=3), session=session)
+
     def test_navigation_apply_refuses_a_session_that_drops_a_stored_key(self):
         """An apply replaced the body wholesale, so a document built from memory rather
         than get-session silently erased the plan and the coverage that reads it."""
@@ -3573,6 +3704,196 @@ class FlagAnchors(unittest.TestCase):
         with self.assertRaisesRegex(session_store.StoreError, "outside the frozen diff"):
             self.store.put_beat(self.flag("src/a.py:20"))
         self.assertEqual(self.store.snapshot()[1][0]["where"], "src/a.py:11")
+
+
+class ChangedPathsAllowlist(unittest.TestCase):
+    def store_for_diff(self, raw_diff):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, root, True)
+        store = session_store.SessionStore(root, create=True)
+        diff, metadata = root / "capture.diff", root / "capture.json"
+        diff.write_bytes(raw_diff if isinstance(raw_diff, bytes) else raw_diff.encode("utf-8"))
+        metadata.write_text("{}", encoding="utf-8")
+        store.freeze_target(FrozenTargets.target(self), diff, metadata)
+        return store
+
+    def test_changed_paths_parses_spaces_quoted_non_ascii_binary_mode_only_and_b_slash(self):
+        diff = (
+            'diff --git a/has space.txt b/has space.txt\n'
+            'index 1111111..2222222 100644\n'
+            '--- a/has space.txt\t\n'
+            '+++ b/has space.txt\t\n'
+            '@@ -1 +1 @@\n-old\n+new\n'
+            'diff --git "a/caf\\303\\251.bin" "b/caf\\303\\251.bin"\n'
+            'index 3333333..4444444 100644\n'
+            'Binary files "a/caf\\303\\251.bin" and "b/caf\\303\\251.bin" differ\n'
+            'diff --git "a/mode \\"exec\\".sh" "b/mode \\"exec\\".sh"\n'
+            'old mode 100644\n'
+            'new mode 100755\n'
+            'diff --git a/tricky b/file.py b/tricky b/file.py\n'
+            'old mode 100644\n'
+            'new mode 100755\n'
+            'diff --git a/tricky b/old.bin b/tricky b/new.bin\n'
+            'similarity index 100%\n'
+            'rename from tricky b/old.bin\n'
+            'rename to tricky b/new.bin\n'
+        )
+        store = self.store_for_diff(diff)
+
+        self.assertEqual(
+            store.changed_paths(),
+            [
+                "café.bin",
+                "has space.txt",
+                'mode "exec".sh',
+                "tricky b/file.py",
+                "tricky b/new.bin",
+                "tricky b/old.bin",
+            ],
+        )
+
+    def test_changed_paths_matches_git_diff_with_quotepath_enabled(self):
+        repo = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, repo, True)
+        env = {
+            name: value for name, value in os.environ.items()
+            if not name.startswith("GIT_")
+        }
+        env.update({
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        })
+        subprocess.run(["git", "init", "--template=", str(repo)], check=True, capture_output=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@example.test"], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "config", "commit.gpgsign", "false"], check=True, env=env)
+        (repo / "with space.py").write_text("x = 1\n", encoding="utf-8")
+        (repo / "café.bin").write_bytes(b"\x00\x01\x02")
+        (repo / "mode.sh").write_text("#!/bin/sh\n", encoding="utf-8")
+        (repo / "dir b").mkdir()
+        (repo / "dir b" / "item.py").write_text("y = 1\n", encoding="utf-8")
+        (repo / r"lit\u0030.txt").write_text("z = 1\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "base"], check=True, capture_output=True, env=env)
+
+        (repo / "with space.py").write_text("x = 2\n", encoding="utf-8")
+        (repo / "café.bin").write_bytes(b"\x00\x01\x03\xff")
+        (repo / "mode.sh").chmod(0o755)
+        (repo / "dir b" / "item.py").chmod(0o755)
+        (repo / r"lit\u0030.txt").write_text("z = 2\n", encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "head"], check=True, capture_output=True, env=env)
+
+        raw = subprocess.run(
+            [
+                "git", "-c", "core.quotePath=true", "-C", str(repo),
+                "diff", "--binary", "--src-prefix=a/", "--dst-prefix=b/",
+                "HEAD~1...HEAD", "--",
+            ],
+            check=True,
+            capture_output=True,
+            env=env,
+        ).stdout
+        store = self.store_for_diff(raw)
+
+        self.assertEqual(
+            store.changed_paths(),
+            ["café.bin", "dir b/item.py", r"lit\u0030.txt", "mode.sh", "with space.py"],
+        )
+
+    def test_changed_paths_preserves_literal_a_and_b_directories_on_rename_and_copy(self):
+        repo = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, repo, True)
+        env = {
+            name: value for name, value in os.environ.items()
+            if not name.startswith("GIT_")
+        }
+        env.update({
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        })
+        subprocess.run(["git", "init", "--template=", str(repo)], check=True, capture_output=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@example.test"], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "config", "commit.gpgsign", "false"], check=True, env=env)
+        (repo / "a").mkdir()
+        (repo / "b").mkdir()
+        (repo / "a" / "pure.txt").write_text("same line\n" * 8, encoding="utf-8")
+        (repo / "b" / "blob.bin").write_bytes(b"\x00\x01\x02\x03" * 32)
+        (repo / "a" / "copied.txt").write_text("copied line\n" * 8, encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "base"], check=True, capture_output=True, env=env)
+
+        (repo / "a" / "pure.txt").rename(repo / "b" / "pure.txt")
+        (repo / "b" / "blob.bin").rename(repo / "a" / "blob.bin")
+        (repo / "b" / "copied.txt").write_text("copied line\n" * 8, encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "head"], check=True, capture_output=True, env=env)
+
+        raw = subprocess.run(
+            [
+                "git", "-c", "core.quotePath=true", "-C", str(repo),
+                "diff", "--find-copies-harder", "-M", "--src-prefix=a/", "--dst-prefix=b/",
+                "HEAD~1...HEAD", "--",
+            ],
+            check=True,
+            capture_output=True,
+            env=env,
+        ).stdout
+        self.assertIn(b"rename from a/pure.txt\nrename to b/pure.txt\n", raw)
+        self.assertIn(b"rename from b/blob.bin\nrename to a/blob.bin\n", raw)
+        self.assertIn(b"copy from a/copied.txt\ncopy to b/copied.txt\n", raw)
+        store = self.store_for_diff(raw)
+
+        self.assertEqual(
+            store.changed_paths(),
+            ["a/blob.bin", "a/copied.txt", "a/pure.txt", "b/blob.bin", "b/copied.txt", "b/pure.txt"],
+        )
+
+    def test_changed_paths_preserves_significant_filename_whitespace_in_git_diff(self):
+        repo = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, repo, True)
+        env = {
+            name: value for name, value in os.environ.items()
+            if not name.startswith("GIT_")
+        }
+        env.update({
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        })
+        subprocess.run(["git", "init", "--template=", str(repo)], check=True, capture_output=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@example.test"], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "config", "commit.gpgsign", "false"], check=True, env=env)
+        (repo / "name ").write_text("before\n", encoding="utf-8")
+        (repo / "plain.txt").write_text("move me\n" * 8, encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "base"], check=True, capture_output=True, env=env)
+
+        (repo / "name ").write_text("after\n", encoding="utf-8")
+        (repo / "plain.txt").rename(repo / " leading.txt")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "head"], check=True, capture_output=True, env=env)
+
+        raw = subprocess.run(
+            [
+                "git", "-c", "core.quotePath=true", "-C", str(repo),
+                "diff", "-M", "--src-prefix=a/", "--dst-prefix=b/",
+                "HEAD~1...HEAD", "--",
+            ],
+            check=True,
+            capture_output=True,
+            env=env,
+        ).stdout
+        store = self.store_for_diff(raw)
+
+        self.assertEqual(
+            store.changed_paths(),
+            [" leading.txt", "name ", "plain.txt"],
+        )
 
 
 class FlagAnchorsWithoutATarget(StoreCase):

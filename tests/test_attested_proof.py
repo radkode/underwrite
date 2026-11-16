@@ -531,6 +531,83 @@ class AttestedBeats(AttestedProofCase):
             render_report.validate(beat),
         )
 
+    def test_navigation_apply_attests_a_new_beat_and_refuses_bad_proofs(self):
+        self.verified(beat=2)
+        self.reserve(beat=1)
+        action = self.store.produce("nav-1", None, "next", "")
+        session = dict(self.store.snapshot()[0], cursor=1, current_beat=1)
+        result = {"kind": "walk", "current_beat": 1, "skipped_tiers": []}
+
+        with self.assertRaisesRegex(StoreError, "no proof 9"):
+            self.store.apply(
+                action["seq"], result, session=session,
+                beats=[self.attested_beat(n=1, proof=9)],
+            )
+        with self.assertRaisesRegex(Conflict, "reserved, not verified"):
+            self.store.apply(
+                action["seq"], result, session=session,
+                beats=[self.attested_beat(n=1, proof=2)],
+            )
+        with self.assertRaisesRegex(Conflict, "run for beat 2"):
+            self.store.apply(
+                action["seq"], result, session=session,
+                beats=[self.attested_beat(n=1, proof=1)],
+            )
+
+        session_two = dict(self.store.snapshot()[0], cursor=1, current_beat=2)
+        result_two = {"kind": "walk", "current_beat": 2, "skipped_tiers": []}
+        beat_two = self.attested_beat(n=2, proof=1)
+        applied = self.store.apply(
+            action["seq"], result_two, session=session_two, beats=[beat_two]
+        )
+        replayed = self.store.apply(
+            action["seq"], result_two, session=session_two, beats=[beat_two]
+        )
+
+        self.assertEqual(applied, replayed)
+        stored = self.store.snapshot()[1][0]
+        self.assertEqual(stored["n"], 2)
+        self.assertEqual(stored["attestation"]["proof"], 1)
+        self.assertEqual(stored["attestation"]["exit_code"], 1)
+        self.assertEqual(render_report.validate(stored), [])
+        replayed_from_get = self.store.apply(
+            action["seq"], result_two, session=session_two, beats=[stored]
+        )
+        self.assertEqual(applied, replayed_from_get)
+        with self.assertRaisesRegex(Conflict, "different application"):
+            self.store.apply(
+                action["seq"], result_two, session=session_two,
+                beats=[dict(stored, attestation={"proof": 1, "exit_code": 0})],
+            )
+
+    def test_beats_only_attested_reconcile_replays_raw_and_refuses_forged_attestation(self):
+        self.verified(beat=1)
+        raw_beat = self.attested_beat(n=1, proof=1)
+        stored = self.store.put_beat(raw_beat)
+        action = self.store.produce("nav-1", None, "next", "")
+        result = {"kind": "walk", "current_beat": 1, "skipped_tiers": []}
+
+        reconciled = self.store.reconcile_action(
+            action["seq"], result, beats=[raw_beat], evidence="attested beat 1 is on disk"
+        )
+        replayed = self.store.reconcile_action(
+            action["seq"], result, beats=[raw_beat], evidence="attested beat 1 is on disk"
+        )
+        self.assertEqual(reconciled, replayed)
+
+        self.store.ack(action["seq"])
+        replayed_after_ack = self.store.reconcile_action(
+            action["seq"], result, beats=[raw_beat], evidence="attested beat 1 is on disk"
+        )
+        self.assertEqual(replayed_after_ack["state"], "acked")
+        self.assertEqual(replayed_after_ack["result"], reconciled["result"])
+
+        forged = dict(raw_beat, attestation=dict(stored["attestation"], exit_code=0))
+        with self.assertRaisesRegex(Conflict, "different application"):
+            self.store.reconcile_action(
+                action["seq"], result, beats=[forged], evidence="attested beat 1 is on disk"
+            )
+
 
 class OneCallProof(AttestedProofCase):
     """`prove` reserves, hands the request to the host adapter, and consumes."""

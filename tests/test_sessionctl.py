@@ -746,13 +746,18 @@ class ReplacementRounds(unittest.TestCase):
         self.git("commit", "-q", "-m", "change")
         return self.git("rev-parse", "HEAD")
 
-    def session(self, name, head, number=7):
+    def session(self, name, head, number=7, diff_text=None, **target_overrides):
         root = self.reviews / name
         store = session_store.SessionStore(root, create=True)
         scratch = self.tmp / f"{name}-input"
         scratch.mkdir()
         diff = scratch / "pr.diff"
-        diff.write_text(self.git("diff", f"{self.base}...{head}") + "\n", encoding="utf-8")
+        diff.write_text(
+            diff_text
+            if diff_text is not None
+            else self.git("diff", f"{self.base}...{head}") + "\n",
+            encoding="utf-8",
+        )
         metadata = scratch / "pr.json"
         metadata.write_text(json.dumps({"number": number}), encoding="utf-8")
         context = scratch / "trusted.json"
@@ -765,13 +770,15 @@ class ReplacementRounds(unittest.TestCase):
         self.git("update-ref", "refs/underwrite/head", head)
         bundle = scratch / "pr.bundle"
         self.git("bundle", "create", "-q", str(bundle), "refs/underwrite/base", "refs/underwrite/head")
+        target = {
+            "version": 1, "kind": "github_pr", "repo": "acme/widget", "number": number,
+            "state": "open", "merged_at": None, "base_sha": self.base, "head_sha": head,
+            "head_repo_id": 123, "head_repo": "acme/widget", "head_ref": "feature",
+            "merge_base_sha": self.base, "changed_files": 1,
+        }
+        target.update(target_overrides)
         store.freeze_target(
-            {
-                "version": 1, "kind": "github_pr", "repo": "acme/widget", "number": number,
-                "state": "open", "merged_at": None, "base_sha": self.base, "head_sha": head,
-                "head_repo_id": 123, "head_repo": "acme/widget", "head_ref": "feature",
-                "merge_base_sha": self.base, "changed_files": 1,
-            },
+            target,
             diff, metadata, context, bundle,
         )
         return root
@@ -865,6 +872,46 @@ class ReplacementRounds(unittest.TestCase):
                 completed = self.run_ctl("link-predecessor", root, prior)
                 self.assertEqual(completed.returncode, 1)
                 self.assertIn(message, completed.stderr)
+
+    def test_a_lifecycle_or_route_change_on_the_same_shas_links_with_empty_moved_lines(self):
+        prior = self.reviewed()
+        merged = self.session(
+            "acme-widget-pr7-r2", self.first,
+            state="closed", merged_at="2026-08-30T12:00:00Z",
+        )
+        rerouted = self.session(
+            "acme-widget-pr7-route", self.first,
+            head_repo=None, head_repo_id=None, head_ref="deleted-fork",
+        )
+
+        for root in (merged, rerouted):
+            with self.subTest(root=root.name):
+                linked = self.link(root, prior)
+                self.assertEqual(linked["round"], 2)
+                self.assertEqual(linked["moved"], {})
+                self.assertEqual(
+                    [(entry["n"], entry["state"]) for entry in linked["carried"]],
+                    [(1, "dropped"), (2, "flag")],
+                )
+        with self.assertRaisesRegex(session_store.StoreError, "dropped this finding in round 1"):
+            session_store.SessionStore(merged).put_beat(self.flag(1, 2))
+        unmoved_with_lines = self.session(
+            "acme-widget-pr7-bad-moved", self.first,
+            state="closed", merged_at="2026-08-30T12:00:00Z",
+        )
+        with self.assertRaisesRegex(session_store.StoreError, "empty when the head did not move"):
+            session_store.SessionStore(unmoved_with_lines).link_predecessor(
+                session_store.SessionStore(prior),
+                {"prior_head_sha": self.first, "head_sha": self.first, "lines": {"a.py": [2]}},
+            )
+        different_diff = self.session(
+            "acme-widget-pr7-drifted-diff", self.first,
+            diff_text="diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n@@ -1 +1 @@\n-one\n+altered\n",
+            state="closed", merged_at="2026-08-30T12:00:00Z",
+        )
+        completed = self.run_ctl("link-predecessor", different_diff, prior)
+        self.assertEqual(completed.returncode, 1)
+        self.assertIn("not lifecycle or route drift", completed.stderr)
 
     def test_a_third_round_still_remembers_the_first_rounds_drop(self):
         prior = self.reviewed()
