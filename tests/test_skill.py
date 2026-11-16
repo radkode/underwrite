@@ -64,6 +64,15 @@ class BeforeThePageOpens(unittest.TestCase):
         # and still works where the harness has no such tool
         self.assertIn("where no such tool exists", text)
 
+    def test_working_tree_target_includes_staged_changes_and_never_substitutes_head_tilde(self):
+        ingest = self.skill().split("## Phase 0: scope and ingest")[1].split("## Phase 1")[0]
+        self.assertIn("`git diff HEAD`", ingest)
+        self.assertIn("staged and unstaged", ingest)
+        self.assertIn("untracked files are excluded", ingest)
+        self.assertIn("`git diff HEAD~1`", ingest)
+        self.assertIn("never substitute it automatically", ingest)
+        self.assertNotIn("falling back to `git diff HEAD~1`", ingest)
+
 
 class RecommendationContract(unittest.TestCase):
     def test_assessment_and_decisions_are_explicit_in_both_surfaces(self):
@@ -257,8 +266,10 @@ class ActionDeliveryContract(unittest.TestCase):
     def test_navigation_replay_uses_an_absolute_transactional_receipt(self):
         rule = self.waiting_rule()
         self.assertIn("absolute position and plan state", rule)
+        self.assertIn("writes\n`current_beat` and `skipped_tiers` from it into the session", rule)
         self.assertIn("stored absolute\n`result` is the receipt", rule)
         self.assertNotIn("flat-file session", rule)
+        self.assertIn("advances `current_beat` for a new beat", self.skill())
 
     def test_a_terminal_action_does_not_jump_the_queue(self):
         text = self.skill()

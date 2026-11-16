@@ -354,6 +354,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Content-Type", f"{ctype}; charset=utf-8")
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
         self.end_headers()
         self.wfile.write(payload)
 
@@ -362,6 +364,8 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream; charset=utf-8")
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Frame-Options", "DENY")
+        self.send_header("Content-Security-Policy", "frame-ancestors 'none'")
         self.send_header("Connection", "close")
         self.end_headers()
         self.close_connection = True

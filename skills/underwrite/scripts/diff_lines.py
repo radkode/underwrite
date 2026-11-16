@@ -12,17 +12,219 @@ LOCATION_LINE = re.compile(r"^(?P<path>.+?):(?P<line>\d+)(?:[-,]\d+)*$")
 SNAP_WINDOW = 20
 
 
+_GIT_ESCAPES = {
+    "a": 0x07,
+    "b": 0x08,
+    "t": 0x09,
+    "n": 0x0A,
+    "v": 0x0B,
+    "f": 0x0C,
+    "r": 0x0D,
+    '"': 0x22,
+    "\\": 0x5C,
+}
+
+
+def unquote_git_path(raw, strict_utf8=False):
+    text = raw.rstrip("\r\n")
+    if text.startswith('"') and text.endswith('"') and len(text) >= 2:
+        inner = text[1:-1]
+        raw_bytes = bytearray()
+        index = 0
+        while index < len(inner):
+            ch = inner[index]
+            if ch != "\\":
+                raw_bytes.extend(ch.encode("utf-8"))
+                index += 1
+                continue
+            index += 1
+            if index >= len(inner):
+                raw_bytes.append(0x5C)
+                break
+            esc = inner[index]
+            if "0" <= esc <= "7":
+                octal = esc
+                index += 1
+                for _ in range(2):
+                    if index < len(inner) and "0" <= inner[index] <= "7":
+                        octal += inner[index]
+                        index += 1
+                    else:
+                        break
+                raw_bytes.append(int(octal, 8) & 0xFF)
+            elif esc in _GIT_ESCAPES:
+                raw_bytes.append(_GIT_ESCAPES[esc])
+                index += 1
+            else:
+                raw_bytes.extend(esc.encode("utf-8"))
+                index += 1
+        try:
+            return raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            if strict_utf8:
+                return None
+            return inner
+    return text
+
+
 def clean_path(raw):
     p = raw.split("\t")[0].strip()
     if p.startswith('"') and p.endswith('"'):
         # Git quotes a non-ASCII path as octal escapes of its UTF-8 bytes, so the
-        # escapes have to become bytes again before decoding. Going straight from
-        # unicode_escape to str reads each byte as a codepoint: café becomes cafÃ©.
-        try:
-            p = p[1:-1].encode().decode("unicode_escape").encode("latin-1").decode("utf-8")
-        except UnicodeError:
-            p = p[1:-1]  # not UTF-8, so anchor on the raw name rather than give up
+        # escapes have to become bytes again before decoding.
+        unquoted = unquote_git_path(p)
+        p = p[1:-1] if unquoted is None else unquoted
     return p[2:] if p[:2] in ("a/", "b/") else p
+
+
+def _consume_quoted_token(text):
+    if not text.startswith('"'):
+        return None, text
+    escaped = False
+    for index in range(1, len(text)):
+        ch = text[index]
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            return text[:index + 1], text[index + 1:]
+    return None, text
+
+
+def _strip_side_prefix(path, side):
+    if path is None:
+        return None
+    prefix = f"{side}/"
+    return path[len(prefix):] if path.startswith(prefix) else None
+
+
+def _split_diff_git_header(rest):
+    if not rest:
+        return ()
+    if rest.startswith('"'):
+        first_token, tail = _consume_quoted_token(rest)
+        if first_token is None or not tail.startswith(" "):
+            return ()
+        second_part = tail[1:]
+        if second_part.startswith('"'):
+            second_token, extra = _consume_quoted_token(second_part)
+            if second_token is None or extra:
+                return ()
+            left = _strip_side_prefix(unquote_git_path(first_token, strict_utf8=True), "a")
+            right = _strip_side_prefix(unquote_git_path(second_token, strict_utf8=True), "b")
+        else:
+            left = _strip_side_prefix(unquote_git_path(first_token, strict_utf8=True), "a")
+            right = _strip_side_prefix(second_part, "b")
+        return tuple(p for p in (left, right) if p)
+    if not rest.startswith("a/"):
+        return ()
+    body = rest[2:]
+    quote_sep = body.find(' "')
+    if quote_sep != -1:
+        second_token, extra = _consume_quoted_token(body[quote_sep + 1:])
+        if second_token is not None and not extra:
+            left = body[:quote_sep]
+            right = _strip_side_prefix(unquote_git_path(second_token, strict_utf8=True), "b")
+            return tuple(p for p in (left, right) if p)
+    candidates = []
+    start = 0
+    while True:
+        marker = body.find(" b/", start)
+        if marker == -1:
+            break
+        left, right = body[:marker], body[marker + 3:]
+        if left and right:
+            candidates.append((left, right))
+        start = marker + 1
+    for left, right in candidates:
+        if left == right:
+            return (left,)
+    if len(candidates) == 1:
+        return candidates[0]
+    return candidates or ()
+
+
+def diff_paths(data):
+    """Every UTF-8 path touched in a unified Git diff, including binary and mode-only headers."""
+    paths = set()
+    pending_candidates = ()
+    saw_explicit_path = False
+
+    def flush():
+        nonlocal pending_candidates, saw_explicit_path
+        if pending_candidates and not saw_explicit_path:
+            if isinstance(pending_candidates, list):
+                for left, right in pending_candidates:
+                    paths.add(left)
+                    paths.add(right)
+            else:
+                paths.update(pending_candidates)
+        pending_candidates = ()
+        saw_explicit_path = False
+
+    def add_decoded(raw, strip_side=False):
+        value = unquote_git_path(raw, strict_utf8=True)
+        if value is not None:
+            if strip_side and value[:2] in ("a/", "b/"):
+                value = value[2:]
+            if value:
+                paths.add(value)
+
+    lines = data.split(b"\n") if isinstance(data, (bytes, bytearray)) else data.encode("utf-8").split(b"\n")
+    if lines and lines[-1] == b"":
+        lines.pop()
+    in_hunk = False
+    rem_old = rem_new = 0
+    for raw_line in lines:
+        raw_line = raw_line.rstrip(b"\r")
+        if in_hunk and (rem_old > 0 or rem_new > 0):
+            if raw_line.startswith(b"\\"):
+                continue
+            tag = raw_line[:1]
+            if tag == b" " or raw_line == b"":
+                rem_old -= 1
+                rem_new -= 1
+            elif tag == b"+":
+                rem_new -= 1
+            elif tag == b"-":
+                rem_old -= 1
+            else:
+                rem_old = rem_new = 0
+                in_hunk = False
+            if rem_old <= 0 and rem_new <= 0:
+                in_hunk = False
+            continue
+        try:
+            line = raw_line.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        m = HUNK.match(line)
+        if m:
+            rem_old = int(m.group(2) or 1)
+            rem_new = int(m.group(4) or 1)
+            in_hunk = rem_old > 0 or rem_new > 0
+            continue
+        if line.startswith("diff --git "):
+            flush()
+            pending_candidates = _split_diff_git_header(line[len("diff --git "):])
+        elif line.startswith(("rename from ", "copy from ")):
+            saw_explicit_path = True
+            prefix = "rename from " if line.startswith("rename from ") else "copy from "
+            add_decoded(line[len(prefix):])
+        elif line.startswith(("rename to ", "copy to ")):
+            saw_explicit_path = True
+            prefix = "rename to " if line.startswith("rename to ") else "copy to "
+            add_decoded(line[len(prefix):])
+        elif line.startswith(("--- ", "+++ ")):
+            target = line[4:].split("\t", 1)[0]
+            if target != "/dev/null":
+                saw_explicit_path = True
+                add_decoded(target, strip_side=True)
+    flush()
+    return sorted(paths)
 
 
 def parse_diff(text):

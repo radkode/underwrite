@@ -229,6 +229,9 @@ LIVE_JS = """<script>
       sessionStorage.setItem(draftKey, JSON.stringify({ session_id: sessionId, notes }));
     } catch (_) {}
   }
+  const reasonChip = (row, reason) => reason
+    ? [...row.querySelectorAll('.why')].find(chip => chip.dataset.reason === reason)
+    : null;
   function restoreDrafts() {
     const notes = storedDrafts();
     document.querySelectorAll('.acts').forEach(row => {
@@ -237,7 +240,7 @@ LIVE_JS = """<script>
       if (note && !note.value && saved) note.value = saved;
       const why = notes[row.dataset.acts + '/why'];
       if (why && !reasonOf(row)) {
-        const chip = row.querySelector(`.why[data-reason="${why}"]`);
+        const chip = reasonChip(row, why);
         if (chip) chip.setAttribute('aria-pressed', 'true');
       }
     });
@@ -377,7 +380,7 @@ LIVE_JS = """<script>
         note.focus();
         if (selection) note.setSelectionRange(selection[0], selection[1]);
       }
-      const chip = row.querySelector(`.why[data-reason="${reasons.get(row.dataset.acts)}"]`);
+      const chip = reasonChip(row, reasons.get(row.dataset.acts));
       if (chip) chip.setAttribute('aria-pressed', 'true');
     });
     known = beatIds();
@@ -1189,31 +1192,57 @@ def beat_html(
     )
 
 
+def skipped_tier_set(session):
+    raw = session.get("skipped_tiers")
+    if not isinstance(raw, list):
+        return set()
+    return {tier for tier in raw if isinstance(tier, str) and tier}
+
+
 def walk_entries(session, beats):
     """One entry per planned or walked beat, by n. A beat that was walked off-plan
     still gets a mark; a planned beat not yet walked has no state."""
+    skipped = skipped_tier_set(session)
     entries = {}
     for item in session.get("plan") or []:
         if isinstance(item, dict) and isinstance(item.get("n"), int):
+            tier = item.get("tier", "")
             entries[item["n"]] = {
                 "n": item["n"],
-                "tier": item.get("tier", ""),
+                "tier": tier,
                 "where": item.get("where", ""),
                 "what": item.get("what", ""),
                 "state": None,
+                "skipped": isinstance(tier, str) and tier in skipped,
             }
     for beat in beats:
         n = beat.get("n")
         if not isinstance(n, int):
             continue
         entry = entries.setdefault(
-            n, {"n": n, "tier": "", "where": "", "what": "", "state": None}
+            n, {"n": n, "tier": "", "where": "", "what": "", "state": None, "skipped": False}
         )
         entry["state"] = beat.get("state")
+        entry["skipped"] = False
         entry["landed"] = bool(beat.get("landed"))
         entry["tier"] = beat.get("tier") or entry["tier"]
         entry["where"] = beat.get("where") or entry["where"]
     return [entries[n] for n in sorted(entries)]
+
+
+def coverage_rows(entries):
+    rows = []
+    for entry in entries:
+        what = entry["what"] or entry["where"]
+        care = (
+            ' <span class="cov-care">read carefully</span>' if entry["tier"] == "risk" else ""
+        )
+        rows.append(
+            f'<li title="{attr(what)}"><span class="cov-n">{entry["n"]}</span>'
+            f'<span class="cov-what">'
+            f'{md(textwrap.shorten(what, 88, placeholder="…"))}{care}</span></li>'
+        )
+    return "".join(rows)
 
 
 def coverage_html(session, beats):
@@ -1227,20 +1256,23 @@ def coverage_html(session, beats):
     head = f"{walked} of {len(entries)} items read"
     if not left:
         return f'<p class="coverage is-done">{md(head)}.</p>'
-    rows = []
-    for entry in left:
-        what = entry["what"] or entry["where"]
-        care = (
-            ' <span class="cov-care">read carefully</span>' if entry["tier"] == "risk" else ""
+    unread = [e for e in left if not e.get("skipped")]
+    skipped = [e for e in left if e.get("skipped")]
+    if unread and not skipped:
+        return (
+            f'<div class="coverage"><p>{md(head)}. Not read yet:</p>'
+            f'<ul class="cov-left">{coverage_rows(unread)}</ul></div>'
         )
-        rows.append(
-            f'<li title="{attr(what)}"><span class="cov-n">{entry["n"]}</span>'
-            f'<span class="cov-what">'
-            f'{md(textwrap.shorten(what, 88, placeholder="…"))}{care}</span></li>'
+    if skipped and not unread:
+        return (
+            f'<div class="coverage"><p>{md(head)}. Skipped by you:</p>'
+            f'<ul class="cov-left">{coverage_rows(skipped)}</ul></div>'
         )
     return (
         f'<div class="coverage"><p>{md(head)}. Not read yet:</p>'
-        f'<ul class="cov-left">{"".join(rows)}</ul></div>'
+        f'<ul class="cov-left">{coverage_rows(unread)}</ul>'
+        f'<p>Skipped by you:</p>'
+        f'<ul class="cov-left">{coverage_rows(skipped)}</ul></div>'
     )
 
 
@@ -1253,7 +1285,8 @@ def bar_html(session, beats, current, phase):
     for entry in entries:
         state = entry["state"]
         if state is None:
-            cls, word = "is-todo", "not read yet"
+            cls = "is-todo"
+            word = "skipped by you" if entry.get("skipped") else "not read yet"
         else:
             suffix, token = state_token(state, session_mode(session), entry.get("landed", False))
             cls, word = f"s-{suffix}", token.lower()
@@ -1416,16 +1449,20 @@ def body_html(
     untrusted_pr = (
         isinstance(target, dict) and target.get("kind") == "github_pr"
     ) or isinstance(session.get("legacy_pr"), dict)
-    # While a walk is listening, the newest beat is where the reviewer is, so it leads
-    # the page on its own; the ledger below holds what has already been walked. A
+    # While a walk is listening, the stored walk position (or the newest beat for a
+    # legacy session) leads the page on its own; the ledger below holds the rest. A
     # finished walk, and every final render, is the ledger alone.
     current = None
     if live and beats and phase != "done":
-        current = max(
-            (b for b in beats if isinstance(b.get("n"), int)),
-            key=lambda b: b["n"],
-            default=None,
-        )
+        numbered = [
+            b for b in beats
+            if not isinstance(b.get("n"), bool) and isinstance(b.get("n"), int)
+        ]
+        position = session.get("current_beat")
+        if not isinstance(position, bool) and isinstance(position, int):
+            current = next((b for b in numbered if b["n"] == position), None)
+        if current is None:
+            current = max(numbered, key=lambda b: b["n"], default=None)
     parts = [assessment_html(
         session, beats, problems_by_n, validation_problems, replacement, untrusted_pr,
         walking=live and phase != "done",
