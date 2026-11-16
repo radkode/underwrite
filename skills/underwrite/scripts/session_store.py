@@ -4655,6 +4655,14 @@ class SessionStore:
 
     def _same_application(self, row, application, db=None):
         current = json.loads(row["result_json"])
+        if row["kind"] in NAVIGATION:
+            # The store writes the position from the result into the session, so a receipt
+            # stored before it did compares as if it had.
+            for value in (current, application):
+                if isinstance(value.get("session"), dict) and isinstance(value.get("result"), dict):
+                    for key in ("current_beat", "skipped_tiers"):
+                        if key in value["result"]:
+                            value["session"][key] = _copy(value["result"][key])
         session = current.get("session")
         if not isinstance(session, dict) and db is not None:
             session = json.loads(self._session_row(db)["body_json"])

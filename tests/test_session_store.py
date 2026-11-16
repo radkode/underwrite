@@ -2771,6 +2771,37 @@ class ProducingAndApplying(StoreCase):
         self.store.put_beat(dict(CLEAN, n=6, where="b6.py:1"))
         self.assertEqual(self.store.snapshot()[0]["current_beat"], 6)
 
+    def test_a_navigation_receipt_from_before_the_store_owned_position_still_replays(self):
+        """A receipt stored before the store wrote the position into the session can carry a
+        session that lacks a key its result names; an identical retry must still match."""
+        action = self.store.produce("nav-old", None, "back", "")
+        session = dict(self.store.snapshot()[0], current_beat=2)
+        session.pop("skipped_tiers", None)
+        result = {"kind": "walk", "current_beat": 2, "skipped_tiers": []}
+        self.store.apply(action["seq"], result, session=session)
+        db = sqlite3.connect(str(self.store.path))
+        try:
+            with db:
+                receipt = json.loads(db.execute(
+                    "SELECT result_json FROM actions WHERE seq = ?", (action["seq"],)
+                ).fetchone()[0])
+                receipt["session"].pop("skipped_tiers", None)
+                db.execute(
+                    "UPDATE actions SET result_json = ? WHERE seq = ?",
+                    (json.dumps(receipt), action["seq"]),
+                )
+        finally:
+            db.close()
+        before = self.store.delivery_state()["render_revision"]
+
+        self.store.apply(action["seq"], result, session=session)
+        self.store.ack(action["seq"])
+        self.store.apply(action["seq"], result, session=session)
+
+        self.assertEqual(self.store.delivery_state()["render_revision"], before)
+        with self.assertRaisesRegex(session_store.Conflict, "different application"):
+            self.store.apply(action["seq"], dict(result, current_beat=3), session=session)
+
     def test_navigation_apply_refuses_a_session_that_drops_a_stored_key(self):
         """An apply replaced the body wholesale, so a document built from memory rather
         than get-session silently erased the plan and the coverage that reads it."""
