@@ -34,6 +34,7 @@ EXECUTION_MODES = ("no_exec", "gateway_attested")
 AUDIENCE_MODES = ("branch", "review", "report")
 REVIEW_EVENTS = ("COMMENT", "APPROVE", "REQUEST_CHANGES")
 REVIEW_FIXED_FILE = "review.fixed.json"
+REVIEW_DISMISSED_FILE = "review.dismissed.json"
 _VALIDATE_ANCHORS_MODULE = None
 
 
@@ -5498,6 +5499,171 @@ class SessionStore:
             doc = self._review_intent_document(updated)
             doc["deliveries"] = receipts
             return doc
+
+    def verify_intent_payload_file(self, intent_id):
+        with self._read() as db:
+            row = self._review_intent_row(db, intent_id)
+            expected = bytes(row["payload"])
+            expected_sha256 = row["payload_sha256"]
+        payload_path = self.root / REVIEW_FIXED_FILE
+        try:
+            disk = payload_path.read_bytes()
+        except OSError as error:
+            raise Conflict(
+                f"could not read {REVIEW_FIXED_FILE} for review intent {intent_id}: {error}"
+            ) from error
+        disk_sha256 = hashlib.sha256(disk).hexdigest()
+        if disk != expected or disk_sha256 != expected_sha256:
+            raise Conflict(
+                f"{REVIEW_FIXED_FILE} sha256 {disk_sha256} does not match "
+                f"stored review intent {intent_id} ({expected_sha256})"
+            )
+        return disk
+
+    def begin_submit_intent(self, intent_id, *, retry=False, include_payload=False):
+        with self._write() as db:
+            intent = self._review_intent_row(db, intent_id)
+            session, execution_policy = self._session_execution_policy(db)
+            if self._expected_delivery_kind(session) != "review":
+                raise Conflict(
+                    f"review submission does not match {session.get('audience')!r}"
+                )
+            replacement_reason = self._replacement_reason(session, execution_policy)
+            if replacement_reason:
+                raise Conflict(
+                    replacement_reason + "; start a supervised replacement session"
+                )
+            if intent["state"] == "submitting":
+                if not retry:
+                    raise Conflict(
+                        f"review intent {intent_id} is already submitting; "
+                        "repeat submit-review to reconcile before any retry"
+                    )
+                return self._review_intent_document(
+                    intent, include_payload=include_payload
+                )
+            if intent["state"] != "prepared":
+                raise Conflict(
+                    f"review intent {intent_id} is {intent['state']}, cannot submit"
+                )
+            db.execute(
+                "UPDATE review_intents SET state = 'submitting', submitting_at = ? "
+                "WHERE intent_id = ?",
+                (_now(), intent_id),
+            )
+            updated = self._review_intent_row(db, intent_id)
+            return self._review_intent_document(
+                updated, include_payload=include_payload
+            )
+
+    def fail_intent(self, intent_id, error, owed="publish the accepted finding"):
+        if not isinstance(error, str) or not error.strip():
+            raise StoreError("error must be non-empty text")
+        if not isinstance(owed, str) or not owed.strip():
+            raise StoreError("owed must be non-empty text")
+        error, owed = error.strip(), owed.strip()
+
+        with self._write() as db:
+            intent = self._review_intent_row(db, intent_id)
+            covered = json.loads(intent["beats_json"])
+            if intent["state"] == "failed":
+                if intent["failure"] != error:
+                    raise Conflict(
+                        f"review intent {intent_id} already failed with a different error"
+                    )
+                doc = self._review_intent_document(intent)
+                doc["deliveries"] = []
+                for item in covered:
+                    beat_row = self._beat_row(db, item["beat_n"])
+                    current = (
+                        json.loads(beat_row["delivery_json"])
+                        if beat_row["delivery_json"]
+                        else {}
+                    )
+                    doc["deliveries"].append(
+                        self._delivery_receipt(
+                            item["action_seq"],
+                            item["beat_n"],
+                            beat_row["delivery_state"],
+                            current,
+                        )
+                    )
+                return doc
+            if intent["state"] != "submitting":
+                raise Conflict(
+                    f"review intent {intent_id} is {intent['state']}, cannot fail"
+                )
+
+        deliveries = [
+            self.fail(item["action_seq"], error, owed) for item in covered
+        ]
+
+        with self._write() as db:
+            intent = self._review_intent_row(db, intent_id)
+            if intent["state"] == "failed":
+                if intent["failure"] != error:
+                    raise Conflict(
+                        f"review intent {intent_id} already failed with a different error"
+                    )
+            elif intent["state"] != "submitting":
+                raise Conflict(
+                    f"review intent {intent_id} is {intent['state']}, cannot fail"
+                )
+            else:
+                db.execute(
+                    "UPDATE review_intents SET state = 'failed', failure = ?, "
+                    "failed_at = ? WHERE intent_id = ?",
+                    (error, _now(), intent_id),
+                )
+            updated = self._review_intent_row(db, intent_id)
+            doc = self._review_intent_document(updated)
+            doc["deliveries"] = deliveries
+            return doc
+
+    def record_dismissed_intent(self, intent_id, receipt):
+        if not isinstance(receipt, dict):
+            raise StoreError("dismissed review receipt must be an object")
+        url = receipt.get("url")
+        if not isinstance(url, str) or not url.strip():
+            raise StoreError("dismissed review receipt requires url")
+        url = url.strip()
+        failure = f"review was DISMISSED ({url})"
+
+        with self._write() as db:
+            intent = self._review_intent_row(db, intent_id)
+            if intent["state"] == "failed":
+                if intent["review_url"] != url or intent["failure"] != failure:
+                    raise Conflict(
+                        f"review intent {intent_id} already failed differently"
+                    )
+            elif intent["state"] not in ("prepared", "submitting"):
+                raise Conflict(
+                    f"review intent {intent_id} is {intent['state']}, cannot record dismissed receipt"
+                )
+            else:
+                timestamp = _now()
+                submitting_at = intent["submitting_at"] or timestamp
+                db.execute(
+                    "UPDATE review_intents SET state = 'failed', review_url = ?, "
+                    "failure = ?, submitting_at = ?, failed_at = ? WHERE intent_id = ?",
+                    (url, failure, submitting_at, timestamp, intent_id),
+                )
+            updated = self._review_intent_row(db, intent_id)
+            doc = self._review_intent_document(updated)
+
+        payload = (
+            json.dumps(
+                {"intent_id": intent_id, "receipt": _copy(receipt)},
+                indent=2,
+                sort_keys=True,
+            )
+            + "\n"
+        ).encode("utf-8")
+        receipt_path = self.root / REVIEW_DISMISSED_FILE
+        _atomic_write(receipt_path, payload)
+        doc["dismissed_receipt"] = _copy(receipt)
+        doc["receipt_file"] = str(receipt_path)
+        return doc
 
     def delivery_state(self):
         with self._read() as db:

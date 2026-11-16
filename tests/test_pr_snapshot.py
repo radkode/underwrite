@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """Exact pull request snapshot and precondition contracts."""
 
+import contextlib
 import hashlib
+import io
 import json
 import os
 import shlex
@@ -11,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from collections.abc import Callable
 from pathlib import Path
 from unittest import mock
 
@@ -21,6 +24,7 @@ if str(SCRIPTS) not in sys.path:
 
 import pr_snapshot  # noqa: E402
 import session_store  # noqa: E402
+import sessionctl  # noqa: E402
 
 if __package__:
     from .sqlite_support import connected
@@ -1391,6 +1395,442 @@ class Guarding(SnapshotCase):
         )
         dismissed = pr_snapshot.review_receipt(self.store, source, "reviewer")
         self.assertEqual(dismissed["state"], "DISMISSED")
+
+
+class ReviewRunner:
+    def __init__(self, store, intent_id):
+        self.store = store
+        self.intent_id = intent_id
+        self.calls = []
+        self.metadata = {
+            "number": 7,
+            "state": "open",
+            "merged_at": None,
+            "base": {"sha": "a" * 40, "repo": {"full_name": "acme/widget"}},
+            "head": {
+                "sha": "b" * 40,
+                "ref": "feature",
+                "repo": {"id": 123, "full_name": "acme/widget"},
+            },
+        }
+        self.response = {
+            "id": 17,
+            "commit_id": "b" * 40,
+            "body": "Review\n\n" + store.review_marker(),
+            "user": {"login": "reviewer"},
+            "state": "COMMENTED",
+            "html_url": "https://example.test/reviews/17",
+        }
+        self.post_error = None
+        self.read_error = None
+        self.reviews = [[], []]
+        self.comments = {17: [[{"id": 101}], [{"id": 102}]]}
+        self.on_post: Callable[[], object] | None = None
+        self.on_actor: Callable[[], object] | None = None
+
+    @property
+    def posts(self):
+        return [call for call in self.calls if "POST" in call[0]]
+
+    def __call__(self, command, stdin=None):
+        self.calls.append((command, stdin))
+        endpoint = "repos/acme/widget/pulls/7"
+        if command == ["gh", "api", "user", "--jq", ".login"]:
+            if self.on_actor:
+                self.on_actor()
+            return b"REVIEWER\n"
+        if command == [
+            "gh", "api", "-H", "Accept: application/vnd.github+json", endpoint
+        ]:
+            return json.dumps(self.metadata).encode()
+        if command == ["gh", "api", endpoint + "/reviews", "--method", "POST", "--input", "-"]:
+            durable = session_store.SessionStore(self.store.root).review_intent(self.intent_id)
+            if durable["state"] != "submitting" or not durable["submitting_at"]:
+                raise AssertionError("POST must follow the durable submitting transition")
+            if self.on_post:
+                self.on_post()
+            if self.post_error:
+                raise self.post_error
+            return json.dumps(self.response).encode()
+        if command == ["gh", "api", "--paginate", "--slurp", endpoint + "/reviews"]:
+            if self.read_error:
+                raise self.read_error
+            return json.dumps(self.reviews).encode()
+        prefix = ["gh", "api", "--paginate", "--slurp"]
+        for review_id, comments in self.comments.items():
+            if command == prefix + [endpoint + f"/reviews/{review_id}/comments"]:
+                if isinstance(comments, Exception):
+                    raise comments
+                return json.dumps(comments).encode()
+        raise AssertionError(f"unexpected GitHub call: {command!r}")
+
+
+class SubmitReview(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.store = session_store.SessionStore(self.root, create=True)
+        target = {
+            "version": 1,
+            "kind": "github_pr",
+            "repo": "acme/widget",
+            "number": 7,
+            "state": "open",
+            "merged_at": None,
+            "base_sha": "a" * 40,
+            "head_sha": "b" * 40,
+            "head_repo_id": 123,
+            "head_repo": "acme/widget",
+            "head_ref": "feature",
+            "merge_base_sha": "e" * 40,
+            "changed_files": 1,
+        }
+        diff = self.root / "source.diff"
+        metadata = self.root / "source.json"
+        context = self.root / "source-context.json"
+        diff.write_text(
+            "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n"
+            "@@ -10,2 +10,3 @@\n ctx\n+line eleven\n+line twelve\n",
+            encoding="utf-8",
+        )
+        metadata.write_text('{"number": 7}', encoding="utf-8")
+        context.write_text(
+            json.dumps(
+                {"version": 1, "base_sha": "a" * 40, "files": []},
+                separators=(",", ":"),
+                sort_keys=True,
+            ) + "\n",
+            encoding="utf-8",
+        )
+        self.store.freeze_target(target, diff, metadata, context)
+        self.store.freeze_execution("no_exec")
+        for n in (1, 2, 3):
+            self.store.put_beat({
+                "n": n,
+                "tier": "core",
+                "state": "flag",
+                "proof_kind": "read",
+                "claim": f"finding {n}",
+                "where": "a.py:11",
+                "slots": {"what": "x", "proof": "a.py:11", "risk": "r", "fix": "pin it"},
+            })
+        self.accept(1)
+        self.accept(2)
+        self.comments = {
+            "1": {"path": "a.py", "line": 11, "side": "RIGHT", "body": "Fix one."},
+            "2": {"path": "a.py", "line": 12, "side": "RIGHT", "body": "Fix two."},
+        }
+        self.intent = self.store.prepare_review("COMMENT", "Summary", self.comments)
+        self.intent_id = self.intent["intent_id"]
+        self.runner = ReviewRunner(self.store, self.intent_id)
+
+    def accept(self, n):
+        action = self.store.produce(f"accept-{n}", n, "accept", f"yes {n}")
+        self.store.ack(action["seq"])
+        return action
+
+    def invoke(self, *args):
+        output, error = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
+            code = sessionctl.main(
+                ["submit-review", str(self.root), "--intent", self.intent_id, *args],
+                runner=self.runner,
+            )
+        return code, output.getvalue(), error.getvalue()
+
+    def state(self):
+        return self.store.review_intent(self.intent_id)["state"]
+
+    def pending_beats(self):
+        return [item["beat_n"] for item in self.store.reconcile()["pending_deliveries"]]
+
+    def test_success_posts_stored_bytes_and_lands_only_intent_beats(self):
+        payload = self.store.review_intent(self.intent_id, include_payload=True)["payload"]
+        self.runner.on_post = lambda: self.accept(3)
+
+        code, output, error = self.invoke()
+
+        self.assertEqual((code, error), (0, ""))
+        result = json.loads(output)
+        self.assertEqual(result["state"], "landed")
+        self.assertEqual([item["beat_n"] for item in result["deliveries"]], [1, 2])
+        self.assertEqual({item["artifact"] for item in result["deliveries"]},
+                         {"https://example.test/reviews/17"})
+        self.assertEqual(self.pending_beats(), [3])
+        self.assertEqual(self.runner.posts[0][1], payload)
+        self.assertEqual(len(self.runner.posts), 1)
+        self.assertEqual(len(self.store.snapshot()[0]["lands"]), 1)
+        calls = len(self.runner.calls)
+        self.assertEqual(self.invoke()[0], 0)
+        self.assertEqual(len(self.runner.calls), calls)
+
+    def test_changed_preview_bytes_are_refused_before_any_github_call(self):
+        preview = self.root / "review.fixed.json"
+        preview.write_bytes(preview.read_bytes().replace(b"Summary", b"Changed"))
+
+        code, _output, error = self.invoke()
+
+        self.assertEqual(code, 1)
+        self.assertIn("does not match stored review intent", error)
+        self.assertEqual(self.runner.calls, [])
+        self.assertEqual(self.state(), "prepared")
+
+    def test_event_state_mismatch_refuses_landing(self):
+        self.runner.response["state"] = "APPROVED"
+
+        code, _output, error = self.invoke()
+
+        self.assertEqual(code, 1)
+        self.assertIn("does not match intent event", error)
+        self.assertEqual(self.state(), "submitting")
+        self.assertEqual(self.pending_beats(), [1, 2])
+
+    def test_response_with_wrong_commit_marker_or_actor_refuses_landing(self):
+        target = self.store.frozen_target()
+        for change in (
+            {"commit_id": "c" * 40},
+            {"body": "Review without a marker"},
+            {"user": {"login": "someone-else"}},
+        ):
+            with self.subTest(change=change), self.assertRaisesRegex(
+                session_store.Conflict, "did not match"
+            ):
+                pr_snapshot._verified_review_receipt(
+                    self.runner, target, self.store.review_marker(), "reviewer",
+                    self.intent, dict(self.runner.response, **change),
+                )
+        self.assertEqual(self.state(), "prepared")
+        self.assertEqual(self.runner.calls, [])
+
+    def test_approve_requires_approved_receipt(self):
+        intent = self.store.prepare_review("APPROVE", "Summary", self.comments, replace=True)
+        result = self._submit_event(intent, "APPROVED")
+        self.assertEqual(result["receipt"]["state"], "APPROVED")
+
+    def test_request_changes_requires_changes_requested_receipt(self):
+        intent = self.store.prepare_review("REQUEST_CHANGES", "Summary", self.comments, replace=True)
+        result = self._submit_event(intent, "CHANGES_REQUESTED")
+        self.assertEqual(result["receipt"]["state"], "CHANGES_REQUESTED")
+
+    def _submit_event(self, intent, state):
+        self.runner.intent_id = intent["intent_id"]
+        self.runner.response["state"] = state
+        return pr_snapshot.submit_review(self.store, intent["intent_id"], runner=self.runner)
+
+    def test_comment_count_mismatch_refuses_landing(self):
+        self.runner.comments[17] = [[{"id": 101}]]
+
+        code, _output, error = self.invoke()
+
+        self.assertEqual(code, 1)
+        self.assertIn("has 1 comment(s)", error)
+        self.assertIn("expected 2", error)
+        self.assertEqual(self.state(), "submitting")
+        self.assertEqual(self.pending_beats(), [1, 2])
+
+    def test_comment_read_failure_after_post_keeps_the_outcome_uncertain(self):
+        self.runner.comments[17] = pr_snapshot.ReviewApiError("HTTP 503", status=503)
+
+        code, _output, error = self.invoke()
+
+        self.assertEqual(code, 3)
+        self.assertIn("comment verification failed", error)
+        self.assertEqual(self.state(), "submitting")
+        self.assertEqual(self.pending_beats(), [1, 2])
+        self.assertEqual(self.store.reconcile()["failed_deliveries"], [])
+
+    def test_comment_count_is_the_count_after_anchor_folding(self):
+        self.comments["2"]["path"] = "outside.py"
+        intent = self.store.prepare_review("COMMENT", "Summary", self.comments, replace=True)
+        self.runner.comments[17] = [[{"id": 101}]]
+
+        result = self._submit_event(intent, "COMMENTED")
+
+        self.assertEqual(result["receipt"]["comment_count"], 1)
+        self.assertEqual([item["beat_n"] for item in result["deliveries"]], [1, 2])
+
+    def test_5xx_reconciles_every_page_and_lands_one_verified_match(self):
+        self.runner.post_error = pr_snapshot.ReviewApiError("HTTP 503", status=503)
+        match = self.runner.response
+        self.runner.reviews = [[
+            dict(match, id=1, body="other review"),
+            dict(match, id=2, user={"login": "someone-else"}),
+            dict(match, id=3, commit_id="c" * 40),
+            dict(match, id=4, state="PENDING"),
+        ], [match]]
+
+        code, output, error = self.invoke()
+
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output)["receipt"]["review_id"], 17)
+        self.assertEqual(self.state(), "landed")
+        self.assertEqual(self.pending_beats(), [])
+        self.assertEqual(len(self.runner.posts), 1)
+
+    def test_reconciliation_counts_only_event_and_comment_count_matches(self):
+        self.runner.post_error = pr_snapshot.ReviewApiError("HTTP 503", status=503)
+        match = self.runner.response
+        self.runner.reviews = [[dict(match, id=18, state="APPROVED")], [
+            dict(match, id=19), match,
+        ]]
+        self.runner.comments[19] = [[]]
+
+        self.assertEqual(self.invoke()[0], 0)
+        self.assertEqual(self.state(), "landed")
+
+    def test_5xx_without_match_exits_3_and_rerun_does_not_post_again(self):
+        self.runner.post_error = pr_snapshot.ReviewApiError("HTTP 503", status=503)
+
+        code, _output, error = self.invoke()
+        self.assertEqual(code, 3)
+        self.assertIn("repeat submit-review to reconcile", error)
+        self.assertEqual(self.state(), "submitting")
+        code, _output, error = self.invoke()
+        self.assertEqual(code, 3)
+        self.assertIn("repeat the read", error)
+        self.assertEqual(len(self.runner.posts), 1)
+        self.assertEqual(self.pending_beats(), [1, 2])
+
+    def test_transport_error_without_match_keeps_the_outcome_uncertain(self):
+        self.runner.post_error = pr_snapshot.ReviewApiError("connection lost")
+        self.assertEqual(self.invoke()[0], 3)
+        self.assertEqual(self.state(), "submitting")
+        self.assertEqual(self.pending_beats(), [1, 2])
+
+    def test_422_without_match_does_not_record_publication_failure(self):
+        self.runner.post_error = pr_snapshot.ReviewApiError("HTTP 422", status=422)
+        self.assertEqual(self.invoke()[0], 3)
+        self.assertEqual(self.state(), "submitting")
+        self.assertEqual(self.pending_beats(), [1, 2])
+        self.assertEqual(self.store.reconcile()["failed_deliveries"], [])
+
+    def test_explicit_retry_reconciles_then_rechecks_before_posting(self):
+        self.store.begin_submit_intent(self.intent_id)
+
+        code, _output, error = self.invoke("--retry")
+
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(self.state(), "landed")
+        self.assertEqual(len(self.runner.posts), 1)
+        commands = [call[0] for call in self.runner.calls]
+        review_read = commands.index(["gh", "api", "--paginate", "--slurp", "repos/acme/widget/pulls/7/reviews"])
+        preflight = next(i for i, command in enumerate(commands) if "-H" in command)
+        post = next(i for i, command in enumerate(commands) if "POST" in command)
+        self.assertLess(review_read, preflight)
+        self.assertLess(preflight, post)
+
+    def test_submitting_reconciles_existing_receipt_even_if_pr_has_moved(self):
+        self.store.begin_submit_intent(self.intent_id)
+        self.runner.reviews = [[], [self.runner.response]]
+        self.runner.metadata["head"]["sha"] = "c" * 40
+
+        code, _output, error = self.invoke("--retry")
+
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(self.state(), "landed")
+        self.assertEqual(self.runner.posts, [])
+        self.assertFalse(any("-H" in command for command, _stdin in self.runner.calls))
+
+    def test_two_verified_matches_are_a_conflict(self):
+        self.runner.post_error = pr_snapshot.ReviewApiError("HTTP 503", status=503)
+        self.runner.reviews = [[self.runner.response], [dict(self.runner.response, id=18)]]
+        self.runner.comments[18] = [[{"id": 201}, {"id": 202}]]
+
+        code, _output, error = self.invoke()
+
+        self.assertEqual(code, 1)
+        self.assertIn("found 2", error)
+        self.assertEqual(self.state(), "submitting")
+        self.assertEqual(self.pending_beats(), [1, 2])
+
+    def test_dismissed_response_records_receipt_without_landing(self):
+        self.runner.response["state"] = "DISMISSED"
+        self._assert_dismissed()
+
+    def test_dismissed_reconciliation_records_receipt_without_landing(self):
+        self.runner.post_error = pr_snapshot.ReviewApiError("HTTP 503", status=503)
+        self.runner.reviews = [[dict(self.runner.response, state="DISMISSED")]]
+        self._assert_dismissed()
+
+    def _assert_dismissed(self):
+        code, _output, error = self.invoke()
+        self.assertEqual(code, 1)
+        self.assertIn("DISMISSED", error)
+        self.assertEqual(self.state(), "failed")
+        self.assertEqual(self.pending_beats(), [1, 2])
+        self.assertEqual(self.store.snapshot()[0].get("lands", []), [])
+        receipt = json.loads((self.root / "review.dismissed.json").read_text(encoding="utf-8"))
+        self.assertEqual(receipt["intent_id"], self.intent_id)
+        self.assertEqual(receipt["receipt"]["state"], "DISMISSED")
+        self.assertEqual(receipt["receipt"]["review_id"], 17)
+        calls = len(self.runner.calls)
+        self.assertEqual(self.invoke("--retry")[0], 1)
+        self.assertEqual(len(self.runner.calls), calls)
+
+    def test_definite_4xx_fails_each_non_head_accept_through_fail(self):
+        later = self.store.produce("later-note", 3, "note", "still considering this")
+        self.runner.post_error = pr_snapshot.ReviewApiError("HTTP 403", status=403)
+        with (
+            mock.patch.object(self.store, "fail", wraps=self.store.fail) as fail,
+            self.assertRaisesRegex(session_store.Conflict, "confirmed no review was created"),
+        ):
+            pr_snapshot.submit_review(self.store, self.intent_id, runner=self.runner)
+        self.assertEqual([call.args[0] for call in fail.call_args_list], [1, 2])
+        self.assertEqual(self.state(), "failed")
+        failed = self.store.reconcile()["failed_deliveries"]
+        self.assertEqual([item["beat_n"] for item in failed], [1, 2])
+        self.assertTrue(all("HTTP 403" in item["error"] for item in failed))
+        self.assertEqual(self.pending_beats(), [])
+        self.assertEqual(self.store.head()["seq"], later["seq"])
+        self.assertEqual(self.store.snapshot()[0].get("lands", []), [])
+
+    def test_4xx_with_verified_match_lands_instead_of_failing(self):
+        self.runner.post_error = pr_snapshot.ReviewApiError("HTTP 403", status=403)
+        self.runner.reviews = [[self.runner.response]]
+        self.assertEqual(self.invoke()[0], 0)
+        self.assertEqual(self.state(), "landed")
+
+    def test_failed_intent_receipts_are_idempotent_for_non_head_accepts(self):
+        self.store.begin_submit_intent(self.intent_id)
+        self.store.produce("later-note", 3, "note", "still considering this")
+
+        first = self.store.fail_intent(self.intent_id, "HTTP 403")
+        replay = self.store.fail_intent(self.intent_id, "HTTP 403")
+
+        self.assertEqual(replay, first)
+        self.assertEqual(first["state"], "failed")
+        self.assertEqual([item["beat_n"] for item in first["deliveries"]], [1, 2])
+
+    def test_check_pr_drift_refuses_before_post(self):
+        self.runner.metadata["head"]["sha"] = "c" * 40
+
+        code, _output, error = self.invoke()
+
+        self.assertEqual(code, 2)
+        self.assertIn("head_sha changed", error)
+        self.assertEqual(self.runner.posts, [])
+        self.assertEqual(self.state(), "prepared")
+
+    def test_concurrent_submit_transition_refuses_a_second_post(self):
+        self.runner.on_actor = lambda: self.store.begin_submit_intent(self.intent_id)
+
+        code, _output, error = self.invoke()
+
+        self.assertEqual(code, 1)
+        self.assertIn("already submitting", error)
+        self.assertEqual(self.runner.posts, [])
+        self.assertEqual(self.state(), "submitting")
+
+    def test_reconciliation_transport_failure_exits_3_without_posting(self):
+        self.store.begin_submit_intent(self.intent_id)
+        self.runner.read_error = pr_snapshot.ReviewApiError("connection lost")
+
+        code, _output, error = self.invoke("--retry")
+
+        self.assertEqual(code, 3)
+        self.assertIn("reconciliation failed", error)
+        self.assertEqual(self.runner.posts, [])
+        self.assertEqual(self.state(), "submitting")
 
 
 if __name__ == "__main__":

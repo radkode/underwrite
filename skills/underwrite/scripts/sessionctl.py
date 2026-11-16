@@ -18,6 +18,7 @@ if str(HERE) not in sys.path:
 from session_store import DROP_REASONS, FLAG_STATES, SessionStore, StoreError  # noqa: E402
 from diff_lines import LOCATION_LINE, resolve_path  # noqa: E402
 from pr_snapshot import (  # noqa: E402
+    ReviewSubmissionUncertain,
     TargetMoved,
     capture,
     check,
@@ -25,10 +26,12 @@ from pr_snapshot import (  # noqa: E402
     check_controller,
     check_worktree,
     context_log,
+    gh_runner,
     moved_lines,
     read_blob,
     review_identity,
     review_receipt,
+    submit_review,
 )
 
 
@@ -301,6 +304,11 @@ def parser():
     prepare.add_argument("--comments-file", required=True)
     prepare.add_argument("--replace", action="store_true")
 
+    submit = commands.add_parser("submit-review")
+    submit.add_argument("session")
+    submit.add_argument("--intent", required=True)
+    submit.add_argument("--retry", action="store_true")
+
     receipt = commands.add_parser("review-receipt")
     receipt.add_argument("session")
     receipt.add_argument("source")
@@ -387,7 +395,7 @@ def confine(args):
             raise StoreError(f"{name} {value} is outside UNDERWRITE_CONFINE {boundary}")
 
 
-def run(args):
+def run(args, *, runner=gh_runner):
     confine(args)
     if args.command == "init":
         store = SessionStore(
@@ -442,6 +450,15 @@ def run(args):
         result = store.prepare_review(
             args.event, body, comments, replace=args.replace
         )
+    elif args.command == "submit-review":
+        store = SessionStore(args.session)
+        try:
+            result = submit_review(
+                store, args.intent, retry=args.retry, runner=runner
+            )
+        except BaseException:
+            store.export_json()
+            raise
     elif args.command == "review-receipt":
         store = SessionStore(args.session)
         return review_receipt(store, args.source, args.actor)
@@ -531,12 +548,15 @@ def run(args):
     return result
 
 
-def main(argv=None):
+def main(argv=None, *, runner=gh_runner):
     try:
         args = parser().parse_args(argv)
-        result = run(args)
+        result = run(args, runner=runner)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
+    except ReviewSubmissionUncertain as error:
+        print(f"sessionctl: {error}", file=sys.stderr)
+        return 3
     except TargetMoved as error:
         print(f"sessionctl: {error}", file=sys.stderr)
         return 2

@@ -62,6 +62,16 @@ class TargetMoved(Conflict):
     pass
 
 
+class ReviewSubmissionUncertain(Conflict):
+    pass
+
+
+class ReviewApiError(SnapshotError):
+    def __init__(self, message, status=None):
+        super().__init__(message)
+        self.status = status
+
+
 class _UncleanController(SnapshotError):
     pass
 
@@ -1438,3 +1448,296 @@ def review_receipt(store, source, actor):
     if isinstance(match.get("id"), int):
         result["review_id"] = match["id"]
     return result
+
+
+_EVENT_STATE = {
+    "COMMENT": "COMMENTED",
+    "APPROVE": "APPROVED",
+    "REQUEST_CHANGES": "CHANGES_REQUESTED",
+}
+_HTTP_STATUS = re.compile(r"\bHTTP ([1-5][0-9]{2})\b")
+
+
+def gh_runner(command, stdin=None, timeout=None):
+    try:
+        completed = subprocess.run(
+            command,
+            input=stdin,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as error:
+        raise ReviewApiError(f"{command[0]} timed out") from error
+    except OSError as error:
+        raise ReviewApiError(f"could not run {command[0]}: {error}") from error
+    if completed.returncode:
+        stderr_text = completed.stderr.decode("utf-8", "replace").strip()
+        stdout_text = completed.stdout.decode("utf-8", "replace").strip()
+        status = None
+        for text in (stderr_text, stdout_text):
+            found = _HTTP_STATUS.search(text)
+            if found:
+                status = int(found.group(1))
+                break
+        if status is None and stdout_text:
+            try:
+                parsed = json.loads(stdout_text)
+                if isinstance(parsed, dict) and str(parsed.get("status", "")).isdigit():
+                    status = int(parsed["status"])
+            except json.JSONDecodeError:
+                pass
+        detail = stderr_text or stdout_text or f"exit {completed.returncode}"
+        raise ReviewApiError(f"{command[0]} failed: {detail}", status=status)
+    return completed.stdout
+
+
+def _runner_json(runner, command, *, stdin=None, description="GitHub response"):
+    raw = runner(command, stdin=stdin)
+    try:
+        text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        return json.loads(text)
+    except (UnicodeError, json.JSONDecodeError) as error:
+        raise ReviewApiError(f"GitHub returned malformed {description}") from error
+
+
+def _flatten_pages(value, description):
+    if not isinstance(value, list):
+        raise SnapshotError(f"{description} must be a JSON array")
+    if value and all(isinstance(page, list) for page in value):
+        items = [item for page in value for item in page]
+    else:
+        items = value
+    if not all(isinstance(item, dict) for item in items):
+        raise SnapshotError(f"{description} must contain JSON objects")
+    return items
+
+
+def _runner_pr_loader(runner):
+    def load(repo, number):
+        repo, number = _repo(repo), _positive(number, "PR number")
+        value = _runner_json(
+            runner,
+            [
+                "gh",
+                "api",
+                "-H",
+                "Accept: application/vnd.github+json",
+                f"repos/{repo}/pulls/{number}",
+            ],
+            description="PR metadata",
+        )
+        if not isinstance(value, dict):
+            raise SnapshotError("GitHub returned non-object PR metadata")
+        return value
+
+    return load
+
+
+def _runner_actor(runner):
+    raw = runner(["gh", "api", "user", "--jq", ".login"])
+    try:
+        actor = (
+            raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        ).strip()
+    except UnicodeError as error:
+        raise SnapshotError("GitHub returned malformed actor login") from error
+    if not actor:
+        raise SnapshotError("GitHub returned an empty actor login")
+    return actor
+
+
+def _review_comment_count(runner, repo, number, review_id):
+    raw = _runner_json(
+        runner,
+        [
+            "gh",
+            "api",
+            "--paginate",
+            "--slurp",
+            f"repos/{repo}/pulls/{number}/reviews/{review_id}/comments",
+        ],
+        description="review comments",
+    )
+    return len(_flatten_pages(raw, "review comments"))
+
+
+def _verified_review_receipt(runner, target, marker, actor, intent, response):
+    if not isinstance(response, dict):
+        raise SnapshotError("review response must be a JSON object")
+    if not _matching_review(response, target, marker, actor):
+        raise Conflict(
+            "review response did not match the frozen commit, delivery marker, and actor"
+        )
+    url = _review_url(response)
+    state = response["state"]
+    receipt = {
+        "commit_id": target["head_sha"],
+        "marker": marker,
+        "state": state,
+        "url": url,
+    }
+    review_id = response.get("id")
+    if isinstance(review_id, bool) or not isinstance(review_id, int):
+        review_id = None
+    if review_id is not None:
+        receipt["review_id"] = review_id
+    if state == "DISMISSED":
+        return receipt
+    expected_state = _EVENT_STATE[intent["event"]]
+    if state != expected_state:
+        raise Conflict(
+            f"review response state {state!r} does not match intent event "
+            f"{intent['event']!r} (expected {expected_state!r})"
+        )
+    if review_id is None:
+        raise SnapshotError("review response has no integer id to verify comments")
+    observed_comments = _review_comment_count(
+        runner, target["repo"], target["number"], review_id
+    )
+    if observed_comments != intent["comment_count"]:
+        raise Conflict(
+            f"review {review_id} has {observed_comments} comment(s); "
+            f"intent {intent['intent_id']} expected {intent['comment_count']}"
+        )
+    receipt["comment_count"] = observed_comments
+    return receipt
+
+
+def _reconcile_reviews(runner, target, marker, actor, intent):
+    raw = _runner_json(
+        runner,
+        [
+            "gh",
+            "api",
+            "--paginate",
+            "--slurp",
+            f"repos/{target['repo']}/pulls/{target['number']}/reviews",
+        ],
+        description="pull request reviews",
+    )
+    candidates = _flatten_pages(raw, "pull request reviews")
+    matches = []
+    for item in candidates:
+        if not _matching_review(item, target, marker, actor):
+            continue
+        if item["state"] not in (_EVENT_STATE[intent["event"]], "DISMISSED"):
+            continue
+        try:
+            receipt = _verified_review_receipt(
+                runner, target, marker, actor, intent, item
+            )
+        except Conflict:
+            continue
+        matches.append(receipt)
+    if len(matches) > 1:
+        raise Conflict(
+            "expected at most one review matching the frozen commit, marker, actor, "
+            f"event, and comment count; found {len(matches)}"
+        )
+    return matches[0] if matches else None
+
+
+def _land_or_dismiss(store, intent, receipt):
+    if receipt["state"] == "DISMISSED":
+        store.record_dismissed_intent(intent["intent_id"], receipt)
+        raise Conflict(
+            f"review for intent {intent['intent_id']} is DISMISSED ({receipt['url']}); "
+            "receipt recorded, stop for supervised handling without landing"
+        )
+    entry = {
+        "state": "landed",
+        "what": "the accepted findings" if intent["beats"] else "GitHub review",
+        "where": receipt["url"],
+    }
+    result = store.land_intent(intent["intent_id"], receipt["url"], entry=entry)
+    result["receipt"] = receipt
+    return result
+
+
+def submit_review(store, intent_id, *, retry=False, runner=gh_runner, api=None):
+    intent = store.review_intent(intent_id, include_payload=True)
+    state = intent["state"]
+    if state == "landed":
+        return store.land_intent(intent_id, intent["review_url"])
+    if state not in ("prepared", "submitting"):
+        raise Conflict(f"review intent {intent_id} is {state}, cannot submit")
+
+    payload_bytes = store.verify_intent_payload_file(intent_id)
+    pr_api = _runner_pr_loader(runner) if api is None else api
+
+    if state == "submitting":
+        target = store.frozen_target()
+        if target["kind"] != "github_pr":
+            raise SnapshotError("frozen target is not a GitHub pull request")
+        replacement_reason = store.replacement_reason()
+        if replacement_reason:
+            raise Conflict(
+                replacement_reason + "; start a supervised replacement session"
+            )
+        actor = _runner_actor(runner)
+        marker = store.review_marker()
+        try:
+            reconciled = _reconcile_reviews(runner, target, marker, actor, intent)
+        except ReviewApiError as error:
+            raise ReviewSubmissionUncertain(
+                f"review intent {intent_id} reconciliation failed ({error}); "
+                "repeat submit-review to reconcile before any retry"
+            ) from error
+        if reconciled is not None:
+            return _land_or_dismiss(store, intent, reconciled)
+        if not retry:
+            raise ReviewSubmissionUncertain(
+                f"review intent {intent_id} is already submitting and no matching review "
+                "is visible yet; repeat the read before passing --retry"
+            )
+
+    target = check(store, require_open=True, api=pr_api)
+    actor = _runner_actor(runner)
+    marker = store.review_marker()
+    intent = store.begin_submit_intent(
+        intent_id, retry=state == "submitting" and retry, include_payload=True
+    )
+
+    endpoint = f"repos/{target['repo']}/pulls/{target['number']}/reviews"
+    try:
+        response = _runner_json(
+            runner,
+            ["gh", "api", endpoint, "--method", "POST", "--input", "-"],
+            stdin=payload_bytes,
+            description="review POST response",
+        )
+    except ReviewApiError as post_error:
+        try:
+            reconciled = _reconcile_reviews(runner, target, marker, actor, intent)
+        except ReviewApiError as reconcile_error:
+            raise ReviewSubmissionUncertain(
+                f"review POST outcome is unknown ({post_error}) and reconciliation "
+                f"failed ({reconcile_error}); repeat submit-review to reconcile before "
+                "any retry"
+            ) from reconcile_error
+        if reconciled is not None:
+            return _land_or_dismiss(store, intent, reconciled)
+        status = post_error.status
+        if status is not None and 400 <= status < 500 and status != 422:
+            store.fail_intent(
+                intent_id,
+                str(post_error),
+                "publish the accepted finding",
+            )
+            raise Conflict(
+                f"review creation was rejected (HTTP {status}) and reconciliation "
+                f"confirmed no review was created: {post_error}"
+            ) from post_error
+        raise ReviewSubmissionUncertain(
+            f"review POST outcome is unknown ({post_error}) and no matching review is "
+            "visible yet; repeat submit-review to reconcile before passing --retry"
+        ) from post_error
+
+    try:
+        receipt = _verified_review_receipt(runner, target, marker, actor, intent, response)
+    except ReviewApiError as error:
+        raise ReviewSubmissionUncertain(
+            f"review POST returned a receipt but comment verification failed ({error}); "
+            "repeat submit-review to reconcile before any retry"
+        ) from error
+    return _land_or_dismiss(store, intent, receipt)
