@@ -4135,12 +4135,18 @@ class SessionStore:
             session, _execution_policy = self._session_execution_policy(db)
             if session.get("linked_implementation") is not None:
                 raise Conflict("linked implementation finding is immutable")
+            max_existing = db.execute("SELECT MAX(n) FROM beats").fetchone()[0]
             row = db.execute(
                 "SELECT body_json, delivery_state, delivery_json FROM beats WHERE n = ?",
                 (beat["n"],),
             ).fetchone()
+            session_changed = False
             if row is None:
                 changed = self._insert_new_beat(db, session, beat)
+                if max_existing is None or beat["n"] > max_existing:
+                    updated_session = json.loads(self._session_row(db)["body_json"])
+                    updated_session["current_beat"] = beat["n"]
+                    session_changed = self._save_session(db, updated_session)
             else:
                 _refuse_slot_collision(beat)
                 current = json.loads(row["body_json"])
@@ -4200,7 +4206,7 @@ class SessionStore:
                 self._hold_authorized_finding(db, beat, current)
                 self._guard_beat(session, beat)
                 changed, _revision, _state, _detail = self._save_beat(db, beat)
-            if changed:
+            if changed or session_changed:
                 self._bump_render(db)
         return next(item for item in self.snapshot()[1] if item["n"] == beat["n"])
 
@@ -4238,28 +4244,18 @@ class SessionStore:
             session = json.loads(session_row["body_json"])
             session["schema_version"] = session_row["format_version"]
             questions = {}
-            latest_walk = None
             for row in db.execute(
-                "SELECT * FROM actions WHERE kind IN ('question', 'next', 'back', 'skip') "
-                "ORDER BY seq"
+                "SELECT * FROM actions WHERE kind = 'question' ORDER BY seq"
             ):
                 action = self._action(row)
                 result = action["result"] or {}
-                if row["kind"] == "question":
-                    questions.setdefault(row["beat_n"], []).append({
-                        "seq": row["seq"],
-                        "question": row["note"],
-                        "state": row["state"],
-                        "answer": result.get("answer"),
-                        "evidence": result.get("evidence"),
-                    })
-                elif row["state"] in ("applied", "acked") and isinstance(result, dict):
-                    latest_walk = result
-            if isinstance(latest_walk, dict):
-                if "current_beat" not in session and "current_beat" in latest_walk:
-                    session["current_beat"] = latest_walk["current_beat"]
-                if "skipped_tiers" not in session and "skipped_tiers" in latest_walk:
-                    session["skipped_tiers"] = _copy(latest_walk["skipped_tiers"])
+                questions.setdefault(row["beat_n"], []).append({
+                    "seq": row["seq"],
+                    "question": row["note"],
+                    "state": row["state"],
+                    "answer": result.get("answer"),
+                    "evidence": result.get("evidence"),
+                })
             beats = []
             for row in db.execute("SELECT * FROM beats ORDER BY n"):
                 beat = json.loads(row["body_json"])
@@ -4589,12 +4585,17 @@ class SessionStore:
         beats,
         reference_session=_MISSING,
         authoritative=False,
+        navigation=False,
     ):
         if not isinstance(result, dict):
             raise StoreError("result must be an absolute object")
         normalized_session = None
         if session is not None:
             candidate = _copy(session)
+            if navigation:
+                for key in ("current_beat", "skipped_tiers"):
+                    if key in result:
+                        candidate[key] = _copy(result[key])
             if isinstance(reference_session, dict):
                 stored_target = reference_session.get("target")
                 if (
@@ -4712,6 +4713,7 @@ class SessionStore:
                         session,
                         beats,
                         reference_session=stored.get("session"),
+                        navigation=row["kind"] in NAVIGATION,
                     )
                 )
                 if not self._same_application(row, application, db=db):
@@ -4729,6 +4731,7 @@ class SessionStore:
                 beats,
                 reference_session=current_session,
                 authoritative=True,
+                navigation=True,
             )
             if normalized_session is None:
                 raise StoreError("navigation apply requires the absolute session document")

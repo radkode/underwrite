@@ -2746,6 +2746,31 @@ class ProducingAndApplying(StoreCase):
                 action["seq"], result, session=dict(session, title="different")
             )
 
+    def test_navigation_result_owns_walk_position_and_put_beat_advances_it(self):
+        for n in (3, 4, 5):
+            self.store.put_beat(dict(CLEAN, n=n, where=f"b{n}.py:1"))
+        self.assertEqual(self.store.snapshot()[0]["current_beat"], 5)
+
+        back = self.store.produce("back-1", None, "back", "")
+        stale_session = dict(self.store.snapshot()[0], current_beat=5, skipped_tiers=["core"])
+        before = self.store.delivery_state()["render_revision"]
+        result = {"kind": "walk", "current_beat": 2, "skipped_tiers": []}
+
+        applied = self.store.apply(back["seq"], result, session=stale_session)
+        after = self.store.delivery_state()["render_revision"]
+        self.assertGreater(after, before)
+        self.assertEqual(self.store.snapshot()[0]["current_beat"], 2)
+        self.assertEqual(self.store.snapshot()[0]["skipped_tiers"], [])
+        self.assertEqual(self.store.presentation_snapshot()[0]["current_beat"], 2)
+
+        replay = self.store.apply(back["seq"], result, session=stale_session)
+        self.assertEqual(replay, applied)
+        self.assertEqual(self.store.delivery_state()["render_revision"], after)
+        self.store.ack(back["seq"])
+
+        self.store.put_beat(dict(CLEAN, n=6, where="b6.py:1"))
+        self.assertEqual(self.store.snapshot()[0]["current_beat"], 6)
+
     def test_navigation_apply_refuses_a_session_that_drops_a_stored_key(self):
         """An apply replaced the body wholesale, so a document built from memory rather
         than get-session silently erased the plan and the coverage that reads it."""

@@ -266,8 +266,10 @@ class ActionDeliveryContract(unittest.TestCase):
     def test_navigation_replay_uses_an_absolute_transactional_receipt(self):
         rule = self.waiting_rule()
         self.assertIn("absolute position and plan state", rule)
+        self.assertIn("writes\n`current_beat` and `skipped_tiers` from it into the session", rule)
         self.assertIn("stored absolute\n`result` is the receipt", rule)
         self.assertNotIn("flat-file session", rule)
+        self.assertIn("advances `current_beat` for a new beat", self.skill())
 
     def test_a_terminal_action_does_not_jump_the_queue(self):
         text = self.skill()

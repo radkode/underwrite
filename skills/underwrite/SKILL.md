@@ -621,9 +621,9 @@ the flag with `second_read: {verdict: "unread", evidence}` naming why, so the pa
 it was not read twice.
 
 **Persist the beat in the same turn you present it.** Not at the end. Send the complete
-beat object, `proof_kind` included, to `$S/scripts/sessionctl.py put-beat "$R" -`, then
-patch `cursor` through `patch-session`. Read an existing document only through
-`get-session` or `get-beat`.
+beat object, `proof_kind` included, to `$S/scripts/sessionctl.py put-beat "$R" -`, which
+advances `current_beat` for a new beat, then patch `cursor` through `patch-session`. Read
+an existing document only through `get-session` or `get-beat`.
 Real reviews get interrupted, and a walk that stops should lose nothing it already found.
 The renderer reports a mismatch between `cursor` and the beats the store contains.
 Lead each terminal handoff with the current recommendation and the count of decisions
@@ -666,7 +666,8 @@ $S/scripts/sessionctl.py apply "$R" <seq> application.json
 ```
 
 `application.json` is `{result, session, beats}`. `result` names the absolute outcome,
-for example `{"kind":"walk","current_beat":6,"skipped_tiers":[]}`. `session` is the
+for example `{"kind":"walk","current_beat":6,"skipped_tiers":[]}`, and the store writes
+`current_beat` and `skipped_tiers` from it into the session. `session` is the
 complete resulting session object read through `get-session`, and `beats` contains only
 new beat objects first presented by that move. Navigation cannot replace an existing
 beat; reviewer-owned state would otherwise be vulnerable to a stale snapshot.

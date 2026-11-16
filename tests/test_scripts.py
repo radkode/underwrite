@@ -598,28 +598,64 @@ class TheWalk(unittest.TestCase):
         legacy_stage = legacy.split('id="stage"')[1].split("</section>")[0]
         self.assertIn('data-n="7"', legacy_stage)
 
-    def test_navigation_position_in_walk_receipt_stages_the_moved_beat(self):
+    def test_navigation_position_is_store_owned_bumps_render_and_advances_on_new_beat(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)
             store = va.SessionStore(root, create=True)
             store.put_session({
                 "repo": "acme/widget",
                 "audience": {"mode": "branch", "why": "local"},
-                "plan": [{"n": n, "tier": "core", "where": f"f{n}.ts:{n}"} for n in range(1, 8)],
+                "plan": [
+                    {"n": n, "tier": "follow-through" if n == 5 else "core", "where": f"f{n}.ts:{n}"}
+                    for n in range(1, 7)
+                ],
             })
-            for n in range(1, 8):
+            for n in range(1, 5):
                 store.put_beat(beat(n=n, state="clean", proof_kind="ran", where=f"f{n}.ts:{n}"))
-            action = store.produce("back-1", None, "back", "")
-            session = store.snapshot()[0]
-            store.apply(
-                action["seq"],
-                {"kind": "walk", "current_beat": 3, "skipped_tiers": []},
-                session=session,
-            )
+            self.assertEqual(store.snapshot()[0]["current_beat"], 4)
+
+            before_back = store.delivery_state()["render_revision"]
+            back = store.produce("back-1", None, "back", "")
+            stale_session = dict(store.snapshot()[0], current_beat=4, skipped_tiers=["core"])
+            back_result = {"kind": "walk", "current_beat": 2, "skipped_tiers": []}
+            applied = store.apply(back["seq"], back_result, session=stale_session)
+            after_back = store.delivery_state()["render_revision"]
+            self.assertGreater(after_back, before_back)
+            self.assertEqual(store.snapshot()[0]["current_beat"], 2)
+            self.assertEqual(store.snapshot()[0]["skipped_tiers"], [])
+
+            replay = store.apply(back["seq"], back_result, session=stale_session)
+            self.assertEqual(replay, applied)
+            self.assertEqual(store.delivery_state()["render_revision"], after_back)
+            store.ack(back["seq"])
+
             loaded_session, loaded_beats, css, problems, _ = rr.load(root, rr.default_css())
             html = rr.render(loaded_session, loaded_beats, css, problems, live=True, phase="parked")
             stage = html.split('id="stage"')[1].split("</section>")[0]
-            self.assertIn('data-n="3"', stage)
+            self.assertIn('data-n="2"', stage)
+
+            store.put_beat(beat(n=1, state="clean", proof_kind="ran", where="f1.ts:1", claim="refined"))
+            self.assertEqual(store.snapshot()[0]["current_beat"], 2)
+
+            skip = store.produce("skip-1", None, "skip", "")
+            before_skip = store.delivery_state()["render_revision"]
+            store.apply(
+                skip["seq"],
+                {"kind": "walk", "current_beat": 2, "skipped_tiers": ["follow-through"]},
+                session=store.snapshot()[0],
+            )
+            self.assertGreater(store.delivery_state()["render_revision"], before_skip)
+            self.assertEqual(store.snapshot()[0]["skipped_tiers"], ["follow-through"])
+            store.ack(skip["seq"])
+
+            before_forward = store.delivery_state()["render_revision"]
+            store.put_beat(beat(n=6, state="clean", proof_kind="ran", where="f6.ts:6"))
+            self.assertGreater(store.delivery_state()["render_revision"], before_forward)
+            self.assertEqual(store.snapshot()[0]["current_beat"], 6)
+            loaded_session, loaded_beats, css, problems, _ = rr.load(root, rr.default_css())
+            advanced = rr.render(loaded_session, loaded_beats, css, problems, live=True, phase="parked")
+            advanced_stage = advanced.split('id="stage"')[1].split("</section>")[0]
+            self.assertIn('data-n="6"', advanced_stage)
 
 
 class WalkCoverage(unittest.TestCase):
