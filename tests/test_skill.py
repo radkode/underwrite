@@ -179,6 +179,19 @@ class CleanMeansChecked(unittest.TestCase):
         self.assertNotIn("Past a `FLAG` or `UNVERIFIED` beat", text)
         self.assertNotIn("every flag and unverified beat", self.readme())
 
+    def test_a_walk_that_runs_out_of_beats_on_its_own_still_ends(self):
+        """Moving past the last read-only beat had no `done`, so the live page kept staging
+        it as if the walk were still waiting."""
+        text = self.skill()
+        self.assertIn("When there is no next planned beat, the walk is over: post `done`", text)
+
+    def test_a_question_from_the_page_resumes_the_walk_where_it_was(self):
+        text = self.skill()
+        self.assertIn("carry on from where the walk was, not from the beat the question was about", text)
+        self.assertIn("park again if the walk was parked on an open `FLAG`", text)
+        self.assertNotIn("park again on the beat the question was asked about", text)
+        self.assertNotIn("and wait after its answer", text)
+
     def test_next_is_walk_global_because_the_page_sends_no_beat_number(self):
         text = self.skill()
         self.assertIn("`next` is walk-global", text)

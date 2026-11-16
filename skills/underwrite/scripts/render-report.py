@@ -9,7 +9,8 @@ Output is a body fragment. Phase 4 passes --standalone for a document shell,
 because the finished page is a local file unless the reviewer opts into publishing.
 
 Beats are ordered by what is owed, not by beat number: open flags first, then
-accepted, then walked-and-clean. That ordering is the whole point of the page.
+decided, then read but not run, then checked, then dropped. That ordering is the whole
+point of the page.
 
 Exit 0  every beat validated
 Exit 2  the page rendered, but some beat failed validation and carries an
@@ -1505,11 +1506,11 @@ def body_html(
         + "</div>"
     )
 
-    # A state outside the five matches no section, and a beat that matches no section
+    # A state outside the six matches no section, and a beat that matches no section
     # used to render nowhere while still counting in the tiles. The page exists to say
     # what is owed, so an unplaceable beat is shown, not dropped.
     placed = {state for _h, _t, states, _e in SECTIONS for state in states}
-    sections = (*SECTIONS, ("Unplaced", "state is not one of the five", None, True))
+    sections = (*SECTIONS, ("Unplaced", "state is not one of the six", None, True))
 
     for heading, hint, states, expanded in sections:
         if states is None:
@@ -1518,6 +1519,10 @@ def body_html(
             picked = [b for b in ledger if b.get("state") in states]
         if not picked:
             continue
+        if states == ("clean",) and any(
+            b.get("proof_kind") not in ("ran", "attested") for b in picked
+        ):
+            hint = "some were recorded before proof kinds and may rest on a read"
         if current and states and "accepted" in states:
             expanded = False
         cards = "".join(

@@ -635,7 +635,9 @@ owed (`state: "flag"` only). Accepted findings and pending delivery are not new 
 on it. Store
 it, post `working` naming the beat you are moving to, then read `/state`: `seq` above
 `handled_seq` means an action is queued, so take it through `/await` and handle it as
-below before anything else. Otherwise go straight to the next beat in the same turn.
+below before anything else. Otherwise go straight to the next beat in the same turn. When
+there is no next planned beat, the walk is over: post `done` with a one-line summary, as
+the last `next` does below, then go to Phase 4.
 
 `next` is walk-global: the page sends it with no beat number, so apply it from the walk's
 current position whatever beat the reviewer was looking at. One found queued at that
@@ -690,8 +692,10 @@ inferred or insufficient. A PR source remains `no_exec`: a question never author
 executing its head. Do not include `session` or `beats` in a question application.
 
 The returned receipt is the authoritative answer. Persist it, acknowledge its exact
-`seq`, then show that receipt's question, answer, and evidence in the terminal and park
-again on the beat the question was asked about. After a restart, an already-applied `result` is the stored answer, not permission
+`seq`, then show that receipt's question, answer, and evidence in the terminal. Then carry
+on from where the walk was, not from the beat the question was about: park again if the
+walk was parked on an open `FLAG`, and otherwise continue past the clean or unverified beat
+it was moving on from. After a restart, an already-applied `result` is the stored answer, not permission
 to answer differently. Questions do not change the beat's state, `call`, delivery,
 cursor, or decisions owed, and do not advance the walk. The page keeps each question
 with its answer or visible pending status, including in the static report.
@@ -971,8 +975,9 @@ observation becomes an anchored note, a question gets answered and the beat stay
 "next" or "ok" advances, "skip follow-through" drops a tier, "back" returns to an earlier
 beat. "Not real" or "we meant that" is a drop whose words name its reason; when they do
 not, ask which of the four it is before posting. Route a question through `question`,
-not `note` or `decide`, and wait after its
-answer. Past a `FLAG` beat, advance only when the reviewer asks to move on; past a
+not `note` or `decide`. One typed in the terminal is a conversation, so answer it and let
+the reviewer reply; one that arrives through the page is handled where the walk is. Past
+a `FLAG` beat, advance only when the reviewer asks to move on; past a
 `CLEAN` or `UNVERIFIED` beat, advance on your own.
 
 ## Phase 4: finish

@@ -399,6 +399,17 @@ class ReportOrdering(unittest.TestCase):
         self.assertRegex(html, r'<div class="count is-unver"[^>]*>\s*<span class="n">1</span>\s*<span class="k">read, not run</span>')
         self.assertNotIn('<span class="k">clean</span>', html)
 
+    def test_checked_claims_a_run_only_when_every_clean_beat_records_one(self):
+        """A clean beat stored before proof kinds may rest on a read, so the heading must
+        not promise a run for it."""
+        ran = self.render([beat(n=1, state="clean")])
+        self.assertIn("a run backs each one", ran)
+        legacy = dict(beat(n=2, state="clean"))
+        legacy.pop("proof_kind")
+        mixed = self.render([beat(n=1, state="clean"), legacy])
+        self.assertNotIn("a run backs each one", mixed)
+        self.assertIn("recorded before proof kinds and may rest on a read", mixed)
+
     def test_the_tiles_partition_every_walked_beat(self):
         """decided and dropped counted nowhere, so a walk with one recorded decision
         read 3 + 0 + 0 of 4."""
