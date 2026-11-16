@@ -3771,6 +3771,56 @@ class ChangedPathsAllowlist(unittest.TestCase):
             ["café.bin", "dir b/item.py", r"lit\u0030.txt", "mode.sh", "with space.py"],
         )
 
+    def test_changed_paths_preserves_literal_a_and_b_directories_on_rename_and_copy(self):
+        repo = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, repo, True)
+        env = {
+            name: value for name, value in os.environ.items()
+            if not name.startswith("GIT_")
+        }
+        env.update({
+            "GIT_CONFIG_GLOBAL": os.devnull,
+            "GIT_CONFIG_NOSYSTEM": "1",
+            "GIT_TERMINAL_PROMPT": "0",
+        })
+        subprocess.run(["git", "init", "--template=", str(repo)], check=True, capture_output=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "config", "user.name", "Test"], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "config", "user.email", "t@example.test"], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "config", "commit.gpgsign", "false"], check=True, env=env)
+        (repo / "a").mkdir()
+        (repo / "b").mkdir()
+        (repo / "a" / "pure.txt").write_text("same line\n" * 8, encoding="utf-8")
+        (repo / "b" / "blob.bin").write_bytes(b"\x00\x01\x02\x03" * 32)
+        (repo / "a" / "copied.txt").write_text("copied line\n" * 8, encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "."], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "base"], check=True, capture_output=True, env=env)
+
+        (repo / "a" / "pure.txt").rename(repo / "b" / "pure.txt")
+        (repo / "b" / "blob.bin").rename(repo / "a" / "blob.bin")
+        (repo / "b" / "copied.txt").write_text("copied line\n" * 8, encoding="utf-8")
+        subprocess.run(["git", "-C", str(repo), "add", "-A"], check=True, env=env)
+        subprocess.run(["git", "-C", str(repo), "commit", "-m", "head"], check=True, capture_output=True, env=env)
+
+        raw = subprocess.run(
+            [
+                "git", "-c", "core.quotePath=true", "-C", str(repo),
+                "diff", "--find-copies-harder", "-M", "--src-prefix=a/", "--dst-prefix=b/",
+                "HEAD~1...HEAD", "--",
+            ],
+            check=True,
+            capture_output=True,
+            env=env,
+        ).stdout
+        self.assertIn(b"rename from a/pure.txt\nrename to b/pure.txt\n", raw)
+        self.assertIn(b"rename from b/blob.bin\nrename to a/blob.bin\n", raw)
+        self.assertIn(b"copy from a/copied.txt\ncopy to b/copied.txt\n", raw)
+        store = self.store_for_diff(raw)
+
+        self.assertEqual(
+            store.changed_paths(),
+            ["a/blob.bin", "a/copied.txt", "a/pure.txt", "b/blob.bin", "b/copied.txt", "b/pure.txt"],
+        )
+
 
 class FlagAnchorsWithoutATarget(StoreCase):
     def test_a_branch_walk_has_no_frozen_diff_to_check(self):

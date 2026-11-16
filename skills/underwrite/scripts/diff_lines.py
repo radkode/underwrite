@@ -165,10 +165,10 @@ def diff_paths(data):
         pending_candidates = ()
         saw_explicit_path = False
 
-    def add_decoded(raw):
+    def add_decoded(raw, strip_side=False):
         value = unquote_git_path(raw, strict_utf8=True)
         if value is not None:
-            if value[:2] in ("a/", "b/"):
+            if strip_side and value[:2] in ("a/", "b/"):
                 value = value[2:]
             if value:
                 paths.add(value)
@@ -222,7 +222,7 @@ def diff_paths(data):
             target = line[4:].split("\t")[0].strip()
             if target != "/dev/null":
                 saw_explicit_path = True
-                add_decoded(target)
+                add_decoded(target, strip_side=True)
     flush()
     return sorted(paths)
 
