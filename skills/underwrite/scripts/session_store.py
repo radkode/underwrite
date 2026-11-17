@@ -5305,9 +5305,13 @@ class SessionStore:
                 "SELECT intent_id, state, beats_json FROM review_intents "
                 "WHERE state IN ('dismissed', 'orphaned')"
             ):
-                if any(item["beat_n"] in owed for item in json.loads(blocked["beats_json"])):
+                blocked_beats = json.loads(blocked["beats_json"])
+                if (not owed and not blocked_beats) or any(
+                    item["beat_n"] in owed for item in blocked_beats
+                ):
                     raise Conflict(
-                        f"{blocked['state']} review intent {blocked['intent_id']} covers pending beats; "
+                        f"{blocked['state']} review intent {blocked['intent_id']} covers pending beats "
+                        "or the same zero-beat target; "
                         "stop for supervised handling without reposting"
                     )
             missing = sorted(set(owed) - set(parsed_comments))

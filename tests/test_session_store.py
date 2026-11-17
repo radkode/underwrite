@@ -5515,6 +5515,31 @@ class ReviewIntents(unittest.TestCase):
             [1, 2],
         )
 
+    def assert_zero_beat_review_blocks_reprepare(self, intent_id):
+        for replace in (False, True):
+            with self.subTest(replace=replace), self.assertRaisesRegex(
+                session_store.Conflict, "stop for supervised handling without reposting"
+            ):
+                self.store.prepare_review("APPROVE", "Looks clean.", {}, replace=replace)
+        self.assertEqual([item["intent_id"] for item in self.store.review_intents()], [intent_id])
+
+    def test_dismissed_zero_beat_intent_blocks_identical_reprepare(self):
+        intent_id = self.store.prepare_review("APPROVE", "Looks clean.", {})["intent_id"]
+        self.store.bind_review_id(intent_id, 17)
+        self.store.record_dismissed_intent(intent_id, {
+            "state": "DISMISSED", "review_id": 17, "url": "https://example.test/reviews/17",
+        })
+        self.assert_zero_beat_review_blocks_reprepare(intent_id)
+
+    def test_orphaned_zero_beat_intent_blocks_identical_reprepare(self):
+        intent_id = self.store.prepare_review("APPROVE", "Looks clean.", {})["intent_id"]
+        self.store.bind_review_id(intent_id, 17)
+        with self.store.review_submission_lock():
+            self.store.orphan_review_intent(
+                intent_id, "cannot verify body", "https://example.test/reviews/17", "review_object"
+            )
+        self.assert_zero_beat_review_blocks_reprepare(intent_id)
+
     def test_prepare_review_allows_zero_pending_beats_when_comments_empty(self):
         prepared = self.store.prepare_review("APPROVE", "Looks clean.", {})
 
