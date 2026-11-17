@@ -4348,7 +4348,7 @@ class SessionStore:
             review_intents = {}
             for row in db.execute(
                 "SELECT intent_id, state, review_url, orphan_reason, beats_json FROM review_intents "
-                "WHERE state IN ('prepared', 'submitting', 'dismissed', 'retired', 'orphaned') ORDER BY rowid"
+                "ORDER BY rowid"
             ):
                 for covered in json.loads(row["beats_json"]):
                     review_intents[covered["beat_n"]] = {
@@ -5356,6 +5356,11 @@ class SessionStore:
                     and active_beats == covered
                 ):
                     return self._review_intent_document(active), payload_bytes
+                if active["review_id"] is not None:
+                    raise Conflict(
+                        f"review intent {active['intent_id']} has a stored review id; "
+                        "use submit-review to verify it or orphan-review for supervised handling"
+                    )
                 if not replace:
                     raise Conflict(
                         f"non-terminal review intent {active['intent_id']} is already "

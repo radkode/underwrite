@@ -1593,6 +1593,11 @@ def _verified_review_receipt(runner, target, marker, actor, intent, response):
     stored_id = intent.get("review_id")
     if stored_id is not None and review_id != stored_id:
         raise Conflict(f"review response id {review_id} does not match stored review id {stored_id}")
+    payload = json.loads(intent["payload"])
+    observed_body = response["body"].replace("\r\n", "\n").rstrip()
+    expected_body = payload["body"].replace("\r\n", "\n").rstrip()
+    if observed_body != expected_body:
+        raise Conflict(f"review {review_id} body does not match intent {intent['intent_id']}")
     if state == "DISMISSED" and stored_id == review_id:
         return receipt
     expected_state = _EVENT_STATE[intent["event"]]
@@ -1604,7 +1609,7 @@ def _verified_review_receipt(runner, target, marker, actor, intent, response):
     observed_comments = _review_comments(
         runner, target["repo"], target["number"], review_id
     )
-    expected_comments = json.loads(intent["payload"])["comments"]
+    expected_comments = payload["comments"]
     if len(observed_comments) != len(expected_comments):
         raise Conflict(
             f"review {review_id} has {len(observed_comments)} comment(s); "
@@ -1690,7 +1695,7 @@ def _review_reconciliation(store, runner, target, marker, actor, intent, *, boun
     if len(matches) > 1:
         raise Conflict(
             "expected at most one review matching the frozen commit, marker, actor, "
-            f"event, and inline comments; found {len(matches)}"
+            f"event, body, and inline comments; found {len(matches)}"
         )
     return {"candidates_examined": len(candidates), "match": matches[0] if matches else None}
 
@@ -1851,7 +1856,12 @@ def _submit_review(store, intent_id, *, retry, runner, api):
         if reconciled is not None:
             return _land_or_dismiss(store, intent, reconciled)
         status = post_error.status
-        if status is not None and 400 <= status < 500 and status not in (408, 422, 429):
+        if (
+            state == "prepared"
+            and status is not None
+            and 400 <= status < 500
+            and status not in (408, 422, 429)
+        ):
             store.fail_intent(
                 intent_id,
                 str(post_error),

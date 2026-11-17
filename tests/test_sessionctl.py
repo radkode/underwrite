@@ -222,6 +222,25 @@ class ApplyingAndRecovering(SessionCtlCase):
         session = json.loads((self.root / "session.json").read_text(encoding="utf-8"))
         self.assertEqual(session["lands"][0]["where"], "abc1234")
 
+    def test_confined_branch_land_entry_accepts_stdin_with_cwd_outside_boundary(self):
+        self.init()
+        action = self.store().produce("accept-1", 1, "accept", "yes")
+        env = dict(os.environ, UNDERWRITE_CONFINE=str(self.root))
+        entry = {"state": "landed", "what": "pin it", "where": "abc1234"}
+        with tempfile.TemporaryDirectory() as outside:
+            completed = subprocess.run(
+                [sys.executable, str(SESSIONCTL), "land", str(self.root),
+                 str(action["seq"]), "1", "abc1234", "--kind", "commit",
+                 "--branch", "jacek/pin", "--entry", "-"],
+                input=json.dumps(entry), text=True, capture_output=True, env=env, cwd=outside,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(json.loads(completed.stdout)["state"], "landed")
+        session, beats = self.store().snapshot()
+        self.assertEqual(session["lands"], [entry])
+        self.assertEqual(beats[0]["landed"], "abc1234")
+        self.assertEqual(beats[0]["branch"], "jacek/pin")
+
     def test_reconcile_action_requires_evidence_and_abandon_requires_the_head(self):
         self.init()
         store = self.store()

@@ -1417,7 +1417,7 @@ class ReviewRunner:
         self.response = {
             "id": 17,
             "commit_id": "b" * 40,
-            "body": "Review\n\n" + store.review_marker(),
+            "body": "Summary\n\n" + store.review_marker(),
             "user": {"login": "reviewer"},
             "state": "COMMENTED",
             "html_url": "https://example.test/reviews/17",
@@ -1782,11 +1782,71 @@ class SubmitReview(unittest.TestCase):
         self.comments["2"]["path"] = "outside.py"
         intent = self.store.prepare_review("COMMENT", "Summary", self.comments, replace=True)
         self.runner.comments[17] = [[dict(self.comments["1"], id=101)]]
+        self.runner.response["body"] = (
+            "Summary\n\n`outside.py:12` Fix two.\n\n" + self.store.review_marker()
+        )
 
         result = self._submit_event(intent, "COMMENTED")
 
         self.assertEqual(result["receipt"]["comment_count"], 1)
         self.assertEqual([item["beat_n"] for item in result["deliveries"]], [1, 2])
+
+    def test_reconciliation_rejects_different_folded_body_with_identical_inline_comments(self):
+        self.comments["2"]["path"] = "outside.py"
+        self.intent = self.store.prepare_review("COMMENT", "Summary", self.comments, replace=True)
+        self.intent_id = self.intent["intent_id"]
+        self.runner.intent_id = self.intent_id
+        self.runner.response["body"] = (
+            "Summary\n\n`outside.py:12` An earlier finding.\n\n" + self.store.review_marker()
+        )
+        self.runner.comments[17] = [[dict(self.comments["1"], id=101)]]
+        self.runner.reviews = [[self.runner.response]]
+        self.start_submitting()
+
+        code, _output, error = self.invoke()
+
+        self.assertEqual(code, 3)
+        self.assertIn("no matching review", error)
+        self.assertEqual(self.state(), "submitting")
+        self.assertIsNone(self.store.review_intent(self.intent_id)["review_id"])
+        self.assertEqual(self.pending_beats(), [1, 2])
+        self.assertEqual(self.runner.posts, [])
+
+    def test_reconciliation_rejects_zero_inline_review_with_different_body(self):
+        folded = {key: dict(item, path="outside.py") for key, item in self.comments.items()}
+        self.intent = self.store.prepare_review("COMMENT", "Summary", folded, replace=True)
+        self.intent_id = self.intent["intent_id"]
+        self.runner.intent_id = self.intent_id
+        self.runner.comments[17] = [[]]
+        self.runner.reviews = [[self.runner.response]]
+        self.start_submitting()
+
+        self.assertEqual(self.invoke()[0], 3)
+        self.assertEqual(self.state(), "submitting")
+        self.assertIsNone(self.store.review_intent(self.intent_id)["review_id"])
+        self.assertEqual(self.pending_beats(), [1, 2])
+        self.assertEqual(self.runner.posts, [])
+
+    def test_body_verification_normalizes_only_crlf_and_trailing_whitespace(self):
+        self.runner.response["body"] = "Summary\r\n\r\n" + self.store.review_marker() + " \t\r\n"
+        self.assertEqual(self.invoke()[0], 0)
+        self.assertEqual(self.state(), "landed")
+
+    def test_reconciliation_rejects_leading_internal_and_bare_cr_body_changes(self):
+        self.start_submitting()
+        for body in (
+            " Summary\n\n",
+            "Summary \n\n",
+            "Summary\n",
+            "Summary\r\n\r",
+        ):
+            with self.subTest(body=body):
+                self.runner.response["body"] = body + self.store.review_marker()
+                self.runner.reviews = [[self.runner.response]]
+                self.assertEqual(self.invoke()[0], 3)
+                self.assertEqual(self.state(), "submitting")
+                self.assertIsNone(self.store.review_intent(self.intent_id)["review_id"])
+        self.assertEqual(self.runner.posts, [])
 
     def test_5xx_reconciles_every_page_and_lands_one_verified_match(self):
         self.runner.post_error = pr_snapshot.ReviewApiError("HTTP 503", status=503)
@@ -1807,7 +1867,7 @@ class SubmitReview(unittest.TestCase):
         self.assertEqual(self.pending_beats(), [])
         self.assertEqual(len(self.runner.posts), 1)
 
-    def test_reconciliation_matches_only_event_and_inline_comment_content(self):
+    def test_reconciliation_matches_only_event_body_and_inline_comment_content(self):
         self.runner.post_error = pr_snapshot.ReviewApiError("HTTP 503", status=503)
         match = self.runner.response
         self.runner.reviews = [[dict(match, id=18, state="APPROVED")], [
@@ -1853,6 +1913,10 @@ class SubmitReview(unittest.TestCase):
         self.intent_id = self.intent["intent_id"]
         self.runner.intent_id = self.intent_id
         self.runner.comments[17] = [[]]
+        self.runner.response["body"] = (
+            "Summary\n\n`outside.py:11` Fix one.\n`outside.py:12` Fix two.\n\n"
+            + self.store.review_marker()
+        )
         self.assertEqual(self.invoke()[0], 0)
         first_id = self.intent_id
         self.accept(3)
@@ -1947,6 +2011,27 @@ class SubmitReview(unittest.TestCase):
         self.assertEqual(self.state(), "submitting")
         self.assertEqual(self.pending_beats(), [1, 2])
         self.assertEqual(self.store.reconcile()["failed_deliveries"], [])
+
+    def test_retry_4xx_preserves_earlier_uncertainty_until_review_becomes_visible(self):
+        self.runner.post_error = pr_snapshot.ReviewApiError("connection lost")
+        self.assertEqual(self.invoke()[0], 3)
+        self.assertEqual(len(self.runner.posts), 1)
+        self.runner.post_error = pr_snapshot.ReviewApiError("HTTP 403", status=403)
+
+        code, _output, error = self.invoke("--retry")
+
+        self.assertEqual(code, 3)
+        self.assertIn("no matching review", error)
+        self.assertEqual(self.state(), "submitting")
+        self.assertIsNone(self.store.review_intent(self.intent_id)["failed_at"])
+        self.assertEqual(self.store.reconcile()["failed_deliveries"], [])
+        self.assertEqual(self.pending_beats(), [1, 2])
+        self.assertEqual(len(self.runner.posts), 2)
+        self.runner.reviews = [[self.runner.response]]
+        self.assertEqual(self.invoke()[0], 0)
+        self.assertEqual(self.state(), "landed")
+        self.assertEqual(self.pending_beats(), [])
+        self.assertEqual(len(self.runner.posts), 2)
 
     def test_explicit_retry_reconciles_then_rechecks_before_posting(self):
         self.start_submitting()
@@ -2073,6 +2158,38 @@ class SubmitReview(unittest.TestCase):
         self.assertIn("this invocation did not post, intent unchanged", error)
         self.assertEqual(self.runner.posts, [])
         self.assertEqual(self.store.review_intent(self.intent_id), before)
+
+    def test_prepared_adoption_with_changed_content_refuses_replace_and_can_be_orphaned(self):
+        second = next(beat for beat in self.store.snapshot()[1] if beat["n"] == 2)
+        self.store.put_beat(dict(second, claim="changed before reconciliation"))
+        self.runner.reviews = [[self.runner.response]]
+
+        code, _output, error = self.invoke()
+
+        self.assertEqual(code, 1)
+        self.assertIn("content changed", error)
+        before = self.store.review_intent(self.intent_id)
+        self.assertEqual(before["state"], "prepared")
+        self.assertEqual(before["review_id"], 17)
+        preview = (self.root / "review.fixed.json").read_bytes()
+        for replace in (False, True):
+            with self.subTest(replace=replace), self.assertRaisesRegex(
+                session_store.Conflict, "stored review id; use submit-review.*orphan-review"
+            ):
+                self.store.prepare_review("COMMENT", "Changed summary", self.comments, replace=replace)
+            self.assertEqual(self.store.review_intent(self.intent_id), before)
+            self.assertEqual((self.root / "review.fixed.json").read_bytes(), preview)
+            self.assertEqual(len(self.store.review_intents()), 1)
+        self.assertEqual(self.invoke("--retry")[0], 1)
+        self.assertEqual(self.runner.posts, [])
+        code, output, error = self.invoke_command("orphan-review", "--reason", "content changed")
+        self.assertEqual((code, error), (0, ""))
+        orphaned = json.loads(output)
+        self.assertEqual(orphaned["state"], "orphaned")
+        self.assertEqual(orphaned["review_id"], 17)
+        self.assertEqual(self.pending_beats(), [1, 2])
+        self.assertEqual(self.store.reconcile()["failed_deliveries"], [])
+        self.assertEqual(self.runner.posts, [])
 
     def test_orphan_stored_review_after_content_changed_blocks_reprepare(self):
         def change_content():

@@ -2067,6 +2067,31 @@ class RenderCli(unittest.TestCase):
         self.assertEqual(self.page().count("Included, review pending"), 1)
         self.assertEqual(self.page().count("Review dismissed, needs supervised handling"), 1)
 
+    def test_failed_replacement_review_renders_failure_instead_of_older_retirement(self):
+        store = self.frozen_store(state="open")
+        store.put_beat(beat(n=1, state="flag", where="a.ts:1"))
+        action = store.produce("include", 1, "accept", "Include it")
+        store.ack(action["seq"])
+        comments = {"1": {"path": "a.ts", "line": 1, "side": "RIGHT", "body": "Fix it."}}
+        first = store.prepare_review("COMMENT", "Summary", comments)
+        with store.review_submission_lock():
+            store.retire_review_intent(first["intent_id"])
+        replacement = store.prepare_review("COMMENT", "Replacement summary", comments)
+        with store.review_submission_lock():
+            store.begin_submit_intent(replacement["intent_id"])
+        store.fail_intent(replacement["intent_id"], "HTTP 403: publication refused <reason>")
+
+        delivery = store.presentation_snapshot()[1][0]["delivery"]
+        self.assertEqual(delivery["review_intent"]["intent_id"], replacement["intent_id"])
+        self.assertEqual(delivery["review_intent"]["state"], "failed")
+        rendered = self.run_cli("--standalone")
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertIn("Review publication failed", self.page())
+        self.assertIn("HTTP 403: publication refused &lt;reason&gt;", self.page())
+        self.assertNotIn("Review intent retired", self.page())
+        self.assertNotIn("awaiting submission", self.page())
+        self.assertEqual(self.run_cli("--final").returncode, 2)
+
     def test_orphaned_review_renders_url_and_supervised_no_repost_warning(self):
         store = self.frozen_store(state="open")
         store.put_beat(beat(n=1, state="flag", where="a.ts:1"))

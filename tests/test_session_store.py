@@ -4921,6 +4921,23 @@ class ReviewIntents(unittest.TestCase):
             self.store.begin_submit_intent(intent_id, retry=True)
         self.assertEqual(self.store.review_intent(intent_id), before)
 
+    def test_prepare_review_with_stored_id_allows_only_identical_replay(self):
+        intent_id = self.prepare_two_and_start()
+        self.store.bind_review_id(intent_id, 17)
+        before = self.store.review_intent(intent_id)
+        comments = {"1": self.comment(), "2": self.comment(line=12)}
+        for replace in (False, True):
+            with self.subTest(replace=replace):
+                replay = self.store.prepare_review("COMMENT", "Summary", comments, replace=replace)
+                self.assertEqual(replay["intent_id"], intent_id)
+                self.assertEqual(replay["review_id"], 17)
+                with self.assertRaisesRegex(
+                    session_store.Conflict, "stored review id; use submit-review.*orphan-review"
+                ):
+                    self.store.prepare_review("COMMENT", "Changed", comments, replace=replace)
+                self.assertEqual(self.store.review_intent(intent_id), before)
+                self.assertEqual(len(self.store.review_intents()), 1)
+
     def test_orphan_review_intent_requires_lock_stored_id_and_reason(self):
         intent_id = self.prepare_two_and_start()
         args = (intent_id, "cannot land", "https://example.test/reviews/17", "review_object")

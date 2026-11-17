@@ -401,7 +401,10 @@ def confine(args):
     boundary = Path(root).resolve()
     for name in ("session", "predecessor", "reviews", "body_file", "comments_file", "source", "entry"):
         value = getattr(args, name, None)
-        if value is None or (name == "source" and value == "-" and args.command != "review-receipt"):
+        if value is None or (
+            value == "-"
+            and (name == "entry" or (name == "source" and args.command != "review-receipt"))
+        ):
             continue
         target = Path(value).expanduser().resolve()
         if target != boundary and boundary not in target.parents:

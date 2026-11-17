@@ -1074,7 +1074,8 @@ marker. It writes `$R/review.fixed.json` and returns the intent id, event, cover
 anchor changes, and digest. Report snapped or folded anchors in one line. Show the preview:
 event, covered beats, and the complete `$R/review.fixed.json` payload. Get one explicit yes
 for that intent before submitting. If the reviewer changes it, prepare and preview again;
-`--replace` can replace only a never-posted prepared intent.
+`--replace` can replace only a never-posted prepared intent with no stored review id.
+With a stored id, use `submit-review` to verify or supervised `orphan-review`, not `--replace`.
 
 ```bash
 $S/scripts/sessionctl.py submit-review "$R" --intent <intent-id>
@@ -1082,8 +1083,9 @@ $S/scripts/sessionctl.py submit-review "$R" --intent <intent-id>
 
 `submit-review` refuses changed preview bytes, runs `check-pr --require-open`, and durably
 marks the intent submitting before the POST. It verifies the frozen commit, marker,
-authenticated actor, event/state, and inline comment content after folding. A verified receipt
-lands exactly the intent's beats and adds one shared `lands[]` entry, atomically. Beats
+authenticated actor, event/state, the validated body including folded findings, and inline
+comment content. Only CRLF line endings and trailing body whitespace are normalized.
+A verified receipt lands exactly the intent's beats and adds one shared `lands[]` entry, atomically. Beats
 accepted later stay pending and need a separate approved intent. Never POST or land review
 beats by hand.
 
@@ -1095,8 +1097,10 @@ explicit approval for `--retry`; retry only after reconciliation finds no review
 rechecks the open target. A stored review id is verified without reposting, even with
 `--retry`. Never blindly post twice or infer a new audience from a 422.
 `DISMISSED` records a receipt without landing: stop for supervised handling and do not
-retry. A definite other 4xx with no match records publication failure for every covered
-beat, preserving the accepted findings. An unknown outcome must never be marked failed.
+retry. Only an initial POST from a prepared intent can treat a definite other 4xx with no
+match as publication failure for every covered beat, preserving the accepted findings.
+A retry after an uncertain attempt stays submitting even on 4xx.
+An unknown outcome must never be marked failed.
 
 Exit 4 means the target moved before POST: this invocation did not post, intent unchanged.
 For a submitting intent, an earlier POST may still surface. Stop and use
