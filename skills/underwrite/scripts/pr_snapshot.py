@@ -1621,17 +1621,15 @@ def _verified_review_receipt(runner, target, marker, actor, intent, response):
             f"intent {intent['intent_id']} expected {len(expected_comments)}"
         )
 
-    def comment_key(comment):
-        line = comment.get("line")
-        side = comment.get("side")
-        if line is None:
-            line = comment.get("original_line")
-            side = side or comment.get("original_side")
-        start_line = comment.get("start_line")
-        start_side = comment.get("start_side")
-        if start_line is None:
-            start_line = comment.get("original_start_line")
-            start_side = start_side or comment.get("original_start_side")
+    def comment_key(comment, *, use_original=False):
+        def anchor(field):
+            value = comment.get("original_" + field) if use_original else None
+            return comment.get(field) if value is None else value
+
+        line = anchor("line")
+        side = anchor("side")
+        start_line = anchor("start_line")
+        start_side = anchor("start_side")
         values = (comment.get("path"), side, line, comment.get("body"), start_line, start_side)
         if (
             not all(isinstance(value, str) for value in (values[0], values[1], values[3]))
@@ -1643,7 +1641,8 @@ def _verified_review_receipt(runner, target, marker, actor, intent, response):
             raise Conflict(f"review {review_id} has malformed inline comment content")
         return values
 
-    if Counter(map(comment_key, observed_comments)) != Counter(map(comment_key, expected_comments)):
+    observed_keys = Counter(comment_key(comment, use_original=True) for comment in observed_comments)
+    if observed_keys != Counter(map(comment_key, expected_comments)):
         raise Conflict(f"review {review_id} inline comments do not match intent {intent['intent_id']}")
     receipt["comment_count"] = len(observed_comments)
     return receipt

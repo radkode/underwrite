@@ -1626,6 +1626,35 @@ class SubmitReview(unittest.TestCase):
         self.assertEqual(json.loads(output)["state"], "landed")
         self.assertEqual(len(self.runner.posts), 1)
 
+    def test_reconciliation_lands_shifted_single_line_using_original_coordinates(self):
+        self.start_submitting()
+        self.runner.reviews = [[self.runner.response]]
+        self.runner.metadata["head"]["sha"] = "c" * 40
+        self.runner.comments[17][0][0].update(
+            line=12, side="LEFT", original_line=11, original_side="RIGHT"
+        )
+
+        code, output, error = self.invoke("--retry")
+
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output)["state"], "landed")
+        self.assertEqual(self.runner.posts, [])
+
+    def test_reconciliation_refuses_single_line_with_different_original_coordinates(self):
+        self.start_submitting()
+        self.runner.reviews = [[self.runner.response]]
+        self.runner.metadata["head"]["sha"] = "c" * 40
+        self.runner.comments[17][0][0].update(original_line=12, original_side="LEFT")
+
+        code, _output, error = self.invoke("--retry")
+
+        self.assertEqual(code, 3)
+        self.assertIn("inline comments do not match intent", error)
+        self.assertEqual(self.state(), "submitting")
+        self.assertEqual(self.pending_beats(), [1, 2])
+        self.assertEqual(self.store.review_intent(self.intent_id)["review_id"], 17)
+        self.assertEqual(self.runner.posts, [])
+
     def prepare_multiline_review(self):
         self.comments["2"].update(start_line=11, start_side="RIGHT")
         self.intent = self.store.prepare_review("COMMENT", "Summary", self.comments, replace=True)
@@ -1649,6 +1678,38 @@ class SubmitReview(unittest.TestCase):
             comment[field] = None
         self.assertEqual(self.invoke()[0], 0)
         self.assertEqual(self.state(), "landed")
+        self.assertEqual(self.runner.posts, [])
+
+    def test_reconciliation_lands_shifted_multiline_using_original_coordinates(self):
+        self.prepare_multiline_review()
+        self.runner.metadata["head"]["sha"] = "c" * 40
+        self.runner.comments[17][1][0].update(
+            line=13, side="LEFT", start_line=12, start_side="LEFT",
+            original_line=12, original_side="RIGHT",
+            original_start_line=11, original_start_side="RIGHT",
+        )
+
+        code, output, error = self.invoke("--retry")
+
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output)["state"], "landed")
+        self.assertEqual(self.runner.posts, [])
+
+    def test_reconciliation_refuses_multiline_with_different_original_coordinates(self):
+        self.prepare_multiline_review()
+        self.runner.metadata["head"]["sha"] = "c" * 40
+        self.runner.comments[17][1][0].update(
+            original_line=12, original_side="RIGHT",
+            original_start_line=10, original_start_side="LEFT",
+        )
+
+        code, _output, error = self.invoke("--retry")
+
+        self.assertEqual(code, 3)
+        self.assertIn("inline comments do not match intent", error)
+        self.assertEqual(self.state(), "submitting")
+        self.assertEqual(self.pending_beats(), [1, 2])
+        self.assertEqual(self.store.review_intent(self.intent_id)["review_id"], 17)
         self.assertEqual(self.runner.posts, [])
 
     def test_reconciliation_refuses_missing_multiline_range(self):
