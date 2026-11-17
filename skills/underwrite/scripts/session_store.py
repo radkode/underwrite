@@ -4346,6 +4346,7 @@ class SessionStore:
                     "answer": result.get("answer"),
                     "evidence": result.get("evidence"),
                 })
+            session["review_intents"] = self._unresolved_review_intents(db)
             review_intents = {}
             for row in db.execute(
                 "SELECT intent_id, state, review_id, review_url, orphan_reason, beats_json FROM review_intents "
@@ -5261,6 +5262,44 @@ class SessionStore:
                 )
             ]
 
+    def _unresolved_review_intents(self, db):
+        outstanding_beats = {
+            row["n"] for row in db.execute(
+                "SELECT n FROM beats WHERE delivery_state IN ('pending', 'failed')"
+            )
+        }
+        unresolved = []
+        later_landed_zero_beat = False
+        for row in db.execute("SELECT * FROM review_intents ORDER BY rowid DESC"):
+            covered = json.loads(row["beats_json"])
+            state = row["state"]
+            if state == "landed" and not covered:
+                later_landed_zero_beat = True
+            if (
+                state in ("submitting", "dismissed", "orphaned")
+                or (state == "prepared" and row["review_id"] is not None)
+                or (
+                    state == "failed" and any(
+                        item["beat_n"] in outstanding_beats for item in covered
+                    )
+                )
+                or (
+                    state in ("failed", "retired") and not covered
+                    and not later_landed_zero_beat
+                )
+            ):
+                unresolved.append({
+                    "intent_id": row["intent_id"],
+                    "event": row["event"],
+                    "state": state,
+                    "beats": covered,
+                    "review_id": row["review_id"],
+                    "review_url": row["review_url"],
+                    "orphan_reason": row["orphan_reason"],
+                    "failure": row["failure"],
+                })
+        return list(reversed(unresolved))
+
     def prepare_review(self, event, body, comments, *, replace=False):
         with self._session_lock():
             intent_doc, payload_bytes = self._prepare_review(
@@ -5842,6 +5881,7 @@ class SessionStore:
                 "failed_at = ? WHERE intent_id = ?",
                 (error, _now(), intent_id),
             )
+            self._bump_render(db)
             updated = self._review_intent_row(db, intent_id)
             doc = self._review_intent_document(updated)
             doc["deliveries"] = deliveries
@@ -5901,7 +5941,7 @@ class SessionStore:
             recovery = db.execute(
                 "SELECT EXISTS(SELECT 1 FROM actions WHERE state NOT IN ('acked','abandoned')) "
                 "OR EXISTS(SELECT 1 FROM beats WHERE delivery_state IN ('pending','failed'))"
-            ).fetchone()[0]
+            ).fetchone()[0] or bool(self._unresolved_review_intents(db))
             session_row = self._session_row(db)
             revision = session_row["render_revision"]
             session_id = session_row["session_id"]
@@ -5931,6 +5971,7 @@ class SessionStore:
                     or isinstance(session.get("legacy_pr"), dict)
                 )
             )
+            review_intents = self._unresolved_review_intents(db)
             pending, failed = [], []
             for row in db.execute(
                 "SELECT n, delivery_state, delivery_json FROM beats "
@@ -5958,8 +5999,9 @@ class SessionStore:
             "head": head,
             "pending_deliveries": pending,
             "failed_deliveries": failed,
+            "review_intents": review_intents,
             "render_revision": revision,
-            "recovery": bool(head or pending or failed),
+            "recovery": bool(head or pending or failed or review_intents),
         }
 
     def reconcile_action(self, seq, result, session=None, beats=(), evidence=""):

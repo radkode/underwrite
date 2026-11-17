@@ -3518,7 +3518,8 @@ class RecoveringAndDelivering(StoreCase):
         raw_session, raw_beats = self.store.snapshot()
         presented_session, presented_beats = self.store.presentation_snapshot()
 
-        self.assertEqual(presented_session, raw_session)
+        self.assertEqual(presented_session, {**raw_session, "review_intents": []})
+        self.assertNotIn("review_intents", raw_session)
         self.assertNotIn("delivery", raw_beats[0])
         self.assertEqual(presented_beats[0]["delivery"], {"state": "none"})
 
@@ -5516,6 +5517,7 @@ class ReviewIntents(unittest.TestCase):
         )
 
     def assert_zero_beat_review_blocks_reprepare(self, intent_id):
+        self.assert_unresolved_zero_beat_review(intent_id, self.store.review_intent(intent_id)["state"])
         for replace in (False, True):
             with self.subTest(replace=replace), self.assertRaisesRegex(
                 session_store.Conflict, "stop for supervised handling without reposting"
@@ -5539,6 +5541,57 @@ class ReviewIntents(unittest.TestCase):
                 intent_id, "cannot verify body", "https://example.test/reviews/17", "review_object"
             )
         self.assert_zero_beat_review_blocks_reprepare(intent_id)
+
+    def assert_unresolved_zero_beat_review(self, intent_id, state):
+        projected = self.store.presentation_snapshot()[0]["review_intents"]
+        self.assertEqual([(item["intent_id"], item["state"]) for item in projected], [(intent_id, state)])
+        self.assertEqual(projected[0]["beats"], [])
+        recovery = self.store.reconcile()
+        self.assertEqual(recovery["review_intents"], projected)
+        self.assertEqual(recovery["pending_deliveries"], [])
+        self.assertEqual(recovery["failed_deliveries"], [])
+        self.assertTrue(recovery["recovery"])
+        self.assertTrue(self.store.delivery_state()["recovery"])
+
+    def test_zero_beat_prepared_intent_needs_stored_id_before_recovery(self):
+        intent_id = self.store.prepare_review("APPROVE", "Looks clean.", {})["intent_id"]
+        self.assertEqual(self.store.presentation_snapshot()[0]["review_intents"], [])
+        self.assertFalse(self.store.reconcile()["recovery"])
+        self.assertFalse(self.store.delivery_state()["recovery"])
+        self.store.bind_review_id(intent_id, 17)
+        self.assert_unresolved_zero_beat_review(intent_id, "prepared")
+
+    def test_zero_beat_submitting_and_retired_intents_remain_in_recovery_until_later_landing(self):
+        intent_id = self.store.prepare_review("APPROVE", "Looks clean.", {})["intent_id"]
+        with self.store.review_submission_lock():
+            self.store.begin_submit_intent(intent_id, posting_actor="reviewer")
+            self.assert_unresolved_zero_beat_review(intent_id, "submitting")
+            self.store.retire_review_intent(
+                intent_id, reconcile=lambda _: {"candidates_examined": 0, "match": None},
+                reconcile_delay=0,
+            )
+        self.assert_unresolved_zero_beat_review(intent_id, "retired")
+        replacement = self.store.prepare_review("APPROVE", "Looks clean.", {})
+        self.store.land_intent(replacement["intent_id"], "https://example.test/reviews/18")
+        self.assertEqual(self.store.presentation_snapshot()[0]["review_intents"], [])
+        self.assertFalse(self.store.reconcile()["recovery"])
+        self.assertFalse(self.store.delivery_state()["recovery"])
+
+    def test_zero_beat_failed_intent_stays_in_recovery_until_later_zero_beat_landing(self):
+        earlier = self.store.prepare_review("APPROVE", "Earlier approval.", {})
+        self.store.land_intent(earlier["intent_id"], "https://example.test/reviews/16")
+        intent_id = self.store.prepare_review("APPROVE", "Looks clean.", {})["intent_id"]
+        with self.store.review_submission_lock():
+            self.store.begin_submit_intent(intent_id, posting_actor="reviewer")
+        revision = self.store.delivery_state()["render_revision"]
+        self.store.fail_intent(intent_id, "HTTP 403")
+        self.assertGreater(self.store.delivery_state()["render_revision"], revision)
+        self.assert_unresolved_zero_beat_review(intent_id, "failed")
+        replacement = self.store.prepare_review("APPROVE", "Looks clean.", {})
+        self.store.land_intent(replacement["intent_id"], "https://example.test/reviews/18")
+        self.assertEqual(self.store.presentation_snapshot()[0]["review_intents"], [])
+        self.assertFalse(self.store.reconcile()["recovery"])
+        self.assertFalse(self.store.delivery_state()["recovery"])
 
     def test_prepare_review_allows_zero_pending_beats_when_comments_empty(self):
         prepared = self.store.prepare_review("APPROVE", "Looks clean.", {})

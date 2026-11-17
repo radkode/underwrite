@@ -1473,6 +1473,43 @@ def assessment_html(
     )
 
 
+def review_intents_html(session):
+    intents = session.get("review_intents") or []
+    if not intents:
+        return ""
+    rows = []
+    for intent in intents:
+        state = intent["state"]
+        if state in ("dismissed", "orphaned"):
+            guidance = "Stop for supervised handling. Do not retry or repost."
+        elif state in ("failed", "retired"):
+            guidance = "Review delivery is still owed. Prepare and preview a replacement for approval."
+        else:
+            guidance = (
+                "Use submit-review to verify before any retry; do not repost while a matching "
+                "review exists. With a stored review id, use supervised orphan-review if it cannot land."
+            )
+        covered = ", ".join(str(item["beat_n"]) for item in intent["beats"]) or "none"
+        detail = (
+            f'<span class="delivery-owed">Covered beats: {md(covered)}. {guidance}</span>'
+        )
+        if intent.get("review_url"):
+            detail += f'<span class="delivery-error">{md(intent["review_url"])}</span>'
+        if intent.get("orphan_reason") or intent.get("failure"):
+            reason = intent.get("orphan_reason") or intent["failure"]
+            detail += f'<span class="delivery-error">Reason: {md(reason)}</span>'
+        rows.append(
+            '<div class="call delivery pending">'
+            f'<span class="lbl">{md(intent["event"])} review: {md(state)}</span>'
+            f'<span>Intent: <code>{md(intent["intent_id"])}</code></span>{detail}</div>'
+        )
+    return (
+        '<section class="sec"><div class="sec-head"><h2>Outstanding GitHub reviews</h2>'
+        '<span class="hint">Delivery is unresolved, including reviews with no findings.</span>'
+        f'</div>{"".join(rows)}</section>'
+    )
+
+
 def body_html(
     session, beats, problems_by_n, live=False, phase=None, paths=(),
     validation_problems=(),
@@ -1515,6 +1552,7 @@ def body_html(
     ledger = [b for b in beats if b is not current]
 
     parts.append(coverage_html(session, beats))
+    parts.append(review_intents_html(session))
 
     counts = {}
     for beat in beats:
@@ -1819,6 +1857,12 @@ def load(root, css_path, final=False):
                 and beat.get("landed")
             ):
                 beat.setdefault("delivery_kind", expected_delivery)
+    if final:
+        for intent in session.get("review_intents") or []:
+            problems.append(
+                f"review intent {intent['intent_id']} is {intent['state']}; "
+                "review delivery is unresolved"
+            )
     for beat in beats:
         found = validate(beat, mode, final)
         if found:
@@ -1861,7 +1905,7 @@ def main():
     ap.add_argument(
         "--final",
         action="store_true",
-        help="require every accepted beat to have its audience outcome",
+        help="require every accepted beat and outstanding review intent to have its audience outcome",
     )
     args = ap.parse_args()
 

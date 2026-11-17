@@ -2067,6 +2067,120 @@ class RenderCli(unittest.TestCase):
         self.assertEqual(self.page().count("Included, review pending"), 1)
         self.assertEqual(self.page().count("Review dismissed, needs supervised handling"), 1)
 
+    def assert_zero_beat_review_blocks_final(self, store, intent_id, state):
+        rendered = self.run_cli("--standalone")
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertIn("Outstanding GitHub reviews", self.page())
+        self.assertIn(f"APPROVE review: {state}", self.page())
+        self.assertIn("Covered beats: none.", self.page())
+        self.assertIn(intent_id, self.page())
+        self.assertEqual(store.reconcile()["pending_deliveries"], [])
+        self.assertTrue(store.reconcile()["recovery"])
+        final = self.run_cli("--final")
+        self.assertEqual(final.returncode, 2, final.stderr)
+        self.assertIn(f"review intent {intent_id} is {state}; review delivery is unresolved", final.stderr)
+
+    def test_zero_beat_uncertain_submission_is_visible_in_recovery_and_blocks_final(self):
+        pr_snapshot = load("pr_snapshot")
+        store = self.frozen_store(state="open")
+        intent_id = store.prepare_review("APPROVE", "Looks clean.", {})["intent_id"]
+        posts = []
+
+        def runner(command, stdin=None):
+            if command == ["gh", "api", "user", "--jq", ".login"]:
+                return b"reviewer\n"
+            if command == ["gh", "api", "--paginate", "--slurp", "repos/acme/widget/pulls/42/reviews"]:
+                return b"[[]]"
+            if "POST" in command:
+                posts.append(command)
+                raise pr_snapshot.ReviewApiError("connection lost after POST")
+            self.fail(f"unexpected GitHub call: {command!r}")
+
+        metadata = {
+            "number": 42, "state": "open", "merged_at": None,
+            "base": {"sha": "a" * 40, "repo": {"full_name": "acme/widget"}},
+            "head": {"sha": "b" * 40, "ref": "feature",
+                     "repo": {"id": 123, "full_name": "acme/widget"}},
+        }
+        with self.assertRaises(pr_snapshot.ReviewSubmissionUncertain):
+            pr_snapshot.submit_review(
+                store, intent_id, runner=runner, api=lambda _repo, _number: metadata
+            )
+        self.assertEqual(len(posts), 1)
+        self.assert_zero_beat_review_blocks_final(store, intent_id, "submitting")
+        self.assertIn("Use submit-review to verify before any retry", self.page())
+        self.assertIn("do not repost while a matching review exists", self.page())
+
+    def test_zero_beat_bound_prepared_and_orphaned_intents_block_final(self):
+        store = self.frozen_store(state="open")
+        intent_id = store.prepare_review("APPROVE", "Looks clean.", {})["intent_id"]
+        store.bind_review_id(intent_id, 17, review_url="https://example.test/reviews/17")
+        self.assert_zero_beat_review_blocks_final(store, intent_id, "prepared")
+        with store.review_submission_lock():
+            store.orphan_review_intent(
+                intent_id, "body edited <reason>", "https://example.test/reviews/17", "review_object"
+            )
+        self.assert_zero_beat_review_blocks_final(store, intent_id, "orphaned")
+        self.assertIn("Do not retry or repost.", self.page())
+        self.assertIn("body edited &lt;reason&gt;", self.page())
+        self.assertIn("https://example.test/reviews/17", self.page())
+
+    def test_zero_beat_dismissed_intent_blocks_final(self):
+        store = self.frozen_store(state="open")
+        intent_id = store.prepare_review("APPROVE", "Looks clean.", {})["intent_id"]
+        store.bind_review_id(intent_id, 17)
+        store.record_dismissed_intent(intent_id, {
+            "state": "DISMISSED", "review_id": 17, "url": "https://example.test/reviews/17",
+        })
+        self.assert_zero_beat_review_blocks_final(store, intent_id, "dismissed")
+        self.assertIn("Do not retry or repost.", self.page())
+
+    def test_zero_beat_failed_intent_blocks_final_until_later_zero_beat_review_lands(self):
+        store = self.frozen_store(state="open")
+        intent_id = store.prepare_review("APPROVE", "Looks clean.", {})["intent_id"]
+        with store.review_submission_lock():
+            store.begin_submit_intent(intent_id, posting_actor="reviewer")
+        store.fail_intent(intent_id, "HTTP 403 <reason>")
+        self.assert_zero_beat_review_blocks_final(store, intent_id, "failed")
+        self.assertIn("HTTP 403 &lt;reason&gt;", self.page())
+        replacement = store.prepare_review("APPROVE", "Looks clean.", {})
+        store.land_intent(replacement["intent_id"], "https://example.test/reviews/18")
+        final = self.run_cli("--final")
+        self.assertEqual(final.returncode, 0, final.stderr)
+        self.assertNotIn("Outstanding GitHub reviews", self.page())
+        self.assertFalse(store.reconcile()["recovery"])
+
+    def test_zero_beat_retired_intent_blocks_final_until_later_zero_beat_review_lands(self):
+        store = self.frozen_store(state="open")
+        intent_id = store.prepare_review("APPROVE", "Looks clean.", {})["intent_id"]
+        with store.review_submission_lock():
+            store.retire_review_intent(intent_id)
+        self.assert_zero_beat_review_blocks_final(store, intent_id, "retired")
+        replacement = store.prepare_review("APPROVE", "Looks clean.", {})
+        store.land_intent(replacement["intent_id"], "https://example.test/reviews/18")
+        final = self.run_cli("--final")
+        self.assertEqual(final.returncode, 0, final.stderr)
+        self.assertNotIn("Outstanding GitHub reviews", self.page())
+
+    def test_superseded_failed_review_intent_does_not_block_final(self):
+        store = self.frozen_store(state="open")
+        store.put_beat(beat(n=1, state="flag", where="a.ts:1"))
+        action = store.produce("include", 1, "accept", "Include it")
+        store.ack(action["seq"])
+        comments = {"1": {"path": "a.ts", "line": 1, "side": "RIGHT", "body": "Fix it."}}
+        intent_id = store.prepare_review("COMMENT", "Summary", comments)["intent_id"]
+        with store.review_submission_lock():
+            store.begin_submit_intent(intent_id, posting_actor="reviewer")
+        store.fail_intent(intent_id, "HTTP 403")
+        self.assertEqual(self.run_cli("--final").returncode, 2)
+        replacement = store.prepare_review("COMMENT", "Summary", comments)
+        store.land_intent(replacement["intent_id"], "https://example.test/reviews/18")
+        final = self.run_cli("--final")
+        self.assertEqual(final.returncode, 0, final.stderr)
+        self.assertFalse(store.reconcile()["recovery"])
+        self.assertEqual(store.presentation_snapshot()[0]["review_intents"], [])
+        self.assertNotIn("Outstanding GitHub reviews", self.page())
+
     def test_prepared_adoption_with_changed_content_renders_receipt_and_verify_or_orphan(self):
         pr_snapshot = load("pr_snapshot")
         store = self.frozen_store(state="open")
