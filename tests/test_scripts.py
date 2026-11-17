@@ -2074,11 +2074,43 @@ class RenderCli(unittest.TestCase):
         self.assertIn(f"APPROVE review: {state}", self.page())
         self.assertIn("Covered beats: none.", self.page())
         self.assertIn(intent_id, self.page())
+        self.assertNotIn("Final recommendation", self.page())
+        self.assertNotIn("The review is complete. Nothing is waiting on you.", self.page())
+        self.assertIn("A review delivery is still outstanding.", self.page())
+        self.assertIn("A review delivery is still outstanding.", rendered.stderr)
         self.assertEqual(store.reconcile()["pending_deliveries"], [])
         self.assertTrue(store.reconcile()["recovery"])
         final = self.run_cli("--final")
         self.assertEqual(final.returncode, 2, final.stderr)
         self.assertIn(f"review intent {intent_id} is {state}; review delivery is unresolved", final.stderr)
+
+    def test_finished_walk_with_zero_beat_approval_stays_unfinished_until_landing(self):
+        store = self.frozen_store(state="open")
+        store.patch_session({
+            "plan": [{"n": 1}], "status": "done",
+            "recommendation": "The reviewed change looks good.",
+        })
+        store.put_beat(beat())
+        intent_id = store.prepare_review("APPROVE", "Looks clean.", {})["intent_id"]
+        with store.review_submission_lock():
+            store.begin_submit_intent(intent_id, posting_actor="reviewer")
+        self.assert_zero_beat_review_blocks_final(store, intent_id, "submitting")
+        session, beats = store.presentation_snapshot()
+        fragment = rr.body_html(session, beats, {}, live=True, phase="done")
+        self.assertNotIn("Final recommendation", fragment)
+        self.assertNotIn("Nothing is waiting on you", fragment)
+        self.assertIn("A review delivery is still outstanding.", fragment)
+
+        review_url = "https://example.test/reviews/17"
+        store.bind_review_id(intent_id, 17)
+        store.land_intent(intent_id, review_url)
+        rendered = self.run_cli("--final", "--standalone")
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertIn("<h2>Final recommendation</h2>", self.page())
+        self.assertIn("The review is complete. Nothing is waiting on you.", self.page())
+        self.assertIn(review_url, self.page())
+        self.assertNotIn("Outstanding GitHub reviews", self.page())
+        self.assertNotIn("A review delivery is still outstanding.", self.page())
 
     def test_zero_beat_uncertain_submission_is_visible_in_recovery_and_blocks_final(self):
         pr_snapshot = load("pr_snapshot")
@@ -2110,12 +2142,22 @@ class RenderCli(unittest.TestCase):
         self.assert_zero_beat_review_blocks_final(store, intent_id, "submitting")
         self.assertIn("Use submit-review to verify before any retry", self.page())
         self.assertIn("do not repost while a matching review exists", self.page())
+        self.assertIn("Use retire-review before a supervised replacement", self.page())
+        self.assertNotIn("Stored review id:", self.page())
+        store.bind_review_id(intent_id, 17)
+        self.assertEqual(self.run_cli("--standalone").returncode, 0)
+        self.assertIn("Stored review id: 17", self.page())
+        self.assertIn("Use supervised orphan-review if it cannot land.", self.page())
+        self.assertNotIn("retire-review", self.page())
 
     def test_zero_beat_bound_prepared_and_orphaned_intents_block_final(self):
         store = self.frozen_store(state="open")
         intent_id = store.prepare_review("APPROVE", "Looks clean.", {})["intent_id"]
         store.bind_review_id(intent_id, 17, review_url="https://example.test/reviews/17")
         self.assert_zero_beat_review_blocks_final(store, intent_id, "prepared")
+        self.assertIn("Stored review id: 17", self.page())
+        self.assertIn("Use supervised orphan-review if it cannot land.", self.page())
+        self.assertNotIn("retire-review", self.page())
         with store.review_submission_lock():
             store.orphan_review_intent(
                 intent_id, "body edited <reason>", "https://example.test/reviews/17", "review_object"

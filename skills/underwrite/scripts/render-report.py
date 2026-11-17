@@ -1402,6 +1402,8 @@ def assessment(session, beats, problems_by_n, validation_problems=(), walking=Fa
         limits.append(f"{unverified} item{'s' if unverified != 1 else ''} unverified.")
     if problems_by_n or validation_problems:
         limits.append("The report has validation problems; resolve them before relying on it.")
+    if session.get("review_intents"):
+        limits.append("A review delivery is still outstanding. Resolve the outstanding GitHub reviews.")
     owed = sum(beat.get("state") == "flag" for beat in beats)
     if limits:
         label = "Provisional recommendation"
@@ -1487,12 +1489,18 @@ def review_intents_html(session):
         else:
             guidance = (
                 "Use submit-review to verify before any retry; do not repost while a matching "
-                "review exists. With a stored review id, use supervised orphan-review if it cannot land."
+                "review exists. "
             )
+            if intent.get("review_id") is not None:
+                guidance += "Use supervised orphan-review if it cannot land."
+            else:
+                guidance += "Use retire-review before a supervised replacement; it requires reconciliation if submitting."
         covered = ", ".join(str(item["beat_n"]) for item in intent["beats"]) or "none"
         detail = (
             f'<span class="delivery-owed">Covered beats: {md(covered)}. {guidance}</span>'
         )
+        if intent.get("review_id") is not None:
+            detail += f'<span>Stored review id: {md(intent["review_id"])}</span>'
         if intent.get("review_url"):
             detail += f'<span class="delivery-error">{md(intent["review_url"])}</span>'
         if intent.get("orphan_reason") or intent.get("failure"):

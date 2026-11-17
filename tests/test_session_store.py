@@ -5528,18 +5528,26 @@ class ReviewIntents(unittest.TestCase):
     def test_dismissed_zero_beat_intent_blocks_identical_reprepare(self):
         intent_id = self.store.prepare_review("APPROVE", "Looks clean.", {})["intent_id"]
         self.store.bind_review_id(intent_id, 17)
-        self.store.record_dismissed_intent(intent_id, {
+        revision = self.store.delivery_state()["render_revision"]
+        receipt = {
             "state": "DISMISSED", "review_id": 17, "url": "https://example.test/reviews/17",
-        })
+        }
+        self.store.record_dismissed_intent(intent_id, receipt)
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision + 1)
+        self.store.record_dismissed_intent(intent_id, receipt)
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision + 1)
         self.assert_zero_beat_review_blocks_reprepare(intent_id)
 
     def test_orphaned_zero_beat_intent_blocks_identical_reprepare(self):
         intent_id = self.store.prepare_review("APPROVE", "Looks clean.", {})["intent_id"]
         self.store.bind_review_id(intent_id, 17)
+        revision = self.store.delivery_state()["render_revision"]
         with self.store.review_submission_lock():
-            self.store.orphan_review_intent(
-                intent_id, "cannot verify body", "https://example.test/reviews/17", "review_object"
-            )
+            for _ in range(2):
+                self.store.orphan_review_intent(
+                    intent_id, "cannot verify body", "https://example.test/reviews/17", "review_object"
+                )
+                self.assertEqual(self.store.delivery_state()["render_revision"], revision + 1)
         self.assert_zero_beat_review_blocks_reprepare(intent_id)
 
     def assert_unresolved_zero_beat_review(self, intent_id, state):
@@ -5566,10 +5574,12 @@ class ReviewIntents(unittest.TestCase):
         with self.store.review_submission_lock():
             self.store.begin_submit_intent(intent_id, posting_actor="reviewer")
             self.assert_unresolved_zero_beat_review(intent_id, "submitting")
+            revision = self.store.delivery_state()["render_revision"]
             self.store.retire_review_intent(
                 intent_id, reconcile=lambda _: {"candidates_examined": 0, "match": None},
                 reconcile_delay=0,
             )
+            self.assertEqual(self.store.delivery_state()["render_revision"], revision + 1)
         self.assert_unresolved_zero_beat_review(intent_id, "retired")
         replacement = self.store.prepare_review("APPROVE", "Looks clean.", {})
         self.store.land_intent(replacement["intent_id"], "https://example.test/reviews/18")
@@ -5593,16 +5603,48 @@ class ReviewIntents(unittest.TestCase):
         self.assertFalse(self.store.reconcile()["recovery"])
         self.assertFalse(self.store.delivery_state()["recovery"])
 
-    def test_prepare_review_allows_zero_pending_beats_when_comments_empty(self):
+    def test_zero_beat_review_prepare_submit_bind_and_land_advance_revision_once(self):
+        revision = self.store.delivery_state()["render_revision"]
         prepared = self.store.prepare_review("APPROVE", "Looks clean.", {})
-
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision + 1)
         self.assertEqual(prepared["beats"], [])
         self.assertEqual(prepared["comment_count"], 0)
-        landed = self.store.land_intent(
-            prepared["intent_id"], "https://example.test/reviews/clean"
-        )
+        intent_id = prepared["intent_id"]
+        self.store.prepare_review("APPROVE", "Looks clean.", {})
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision + 1)
+        with self.store.review_submission_lock():
+            self.store.begin_submit_intent(intent_id, posting_actor="reviewer")
+            self.assertEqual(self.store.delivery_state()["render_revision"], revision + 2)
+            self.store.begin_submit_intent(intent_id, posting_actor="reviewer", retry=True)
+            self.assertEqual(self.store.delivery_state()["render_revision"], revision + 2)
+        self.store.bind_review_id(intent_id, 17)
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision + 3)
+        self.store.bind_review_id(intent_id, 17)
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision + 3)
+
+        review_url = "https://example.test/reviews/clean"
+        landed = self.store.land_intent(intent_id, review_url)
         self.assertEqual(landed["state"], "landed")
         self.assertEqual(landed["deliveries"], [])
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision + 4)
+        self.assertEqual(self.store.snapshot()[0]["lands"], [{
+            "state": "landed", "what": "GitHub review", "where": review_url,
+        }])
+        self.assertEqual(self.store.land_intent(intent_id, review_url), landed)
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision + 4)
+        self.assertEqual(len(self.store.snapshot()[0]["lands"]), 1)
+
+    def test_zero_beat_landing_advances_revision_even_when_shared_entry_already_exists(self):
+        review_url = "https://example.test/reviews/clean"
+        earlier = self.store.prepare_review("APPROVE", "Looks clean.", {})
+        self.store.land_intent(earlier["intent_id"], review_url)
+        later = self.store.prepare_review("APPROVE", "Still clean.", {})
+        revision = self.store.delivery_state()["render_revision"]
+
+        self.store.land_intent(later["intent_id"], review_url)
+
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision + 1)
+        self.assertEqual(len(self.store.snapshot()[0]["lands"]), 1)
 
     def test_land_intent_refuses_if_covered_beat_changed_after_prepare(self):
         self.accept(1)

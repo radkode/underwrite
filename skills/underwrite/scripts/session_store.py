@@ -5524,7 +5524,6 @@ class SessionStore:
                     f"review intent {intent_id} is {intent['state']}, cannot land"
                 )
 
-            any_beat_changed = False
             receipts = []
             timestamp = _now()
             for item in covered:
@@ -5585,10 +5584,7 @@ class SessionStore:
                 beat["landed"] = review_url
                 beat["delivery_kind"] = "review"
                 beat.pop("branch", None)
-                beat_changed, _revision, _state, _detail = self._save_beat(
-                    db, beat, "landed", desired
-                )
-                any_beat_changed = any_beat_changed or beat_changed
+                self._save_beat(db, beat, "landed", desired)
                 receipts.append(
                     self._delivery_receipt(seq, beat_n, "landed", desired)
                 )
@@ -5598,20 +5594,16 @@ class SessionStore:
             lands = session.setdefault("lands", [])
             if not isinstance(lands, list):
                 raise StoreError("session lands must be a list")
-            session_changed = False
-            if covered and land_entry not in lands:
+            if land_entry not in lands:
                 lands.append(land_entry)
-                session_changed = self._save_session(
-                    db, session, allow_new_lands=True
-                )
+                self._save_session(db, session, allow_new_lands=True)
 
             db.execute(
                 "UPDATE review_intents SET state = 'landed', review_url = ?, "
                 "land_entry_json = ?, landed_at = ? WHERE intent_id = ?",
                 (review_url, _dump(land_entry), timestamp, intent_id),
             )
-            if any_beat_changed or session_changed:
-                self._bump_render(db)
+            self._bump_render(db)
             updated = self._review_intent_row(db, intent_id)
             doc = self._review_intent_document(updated)
             doc["deliveries"] = receipts
