@@ -1,13 +1,53 @@
 #!/usr/bin/env python3
 """Contract tests for the prompt-owned parts of the underwrite workflow."""
 import json
+import re
 import unittest
 from pathlib import Path
 
+if __package__:
+    from .skill_support import SKILL, skill_text
+else:
+    from skill_support import SKILL, skill_text
 
-SKILL = Path(__file__).resolve().parent.parent / "skills" / "underwrite" / "SKILL.md"
 README = Path(__file__).resolve().parent.parent / "README.md"
 MANIFEST = Path(__file__).resolve().parent.parent / ".claude-plugin"
+
+
+class SkillCorpus(unittest.TestCase):
+    def test_every_reference_is_linked_from_the_core(self):
+        core = skill_text("SKILL.md")
+        references = sorted((SKILL.parent / "references").glob("*.md"))
+        self.assertTrue(references)
+        for path in references:
+            with self.subTest(reference=path.name):
+                self.assertIn(f"$S/references/{path.name}", core)
+
+    def test_every_core_reference_link_resolves(self):
+        links = re.findall(r"\$S/(references/[^`\s]+\.md)", skill_text("SKILL.md"))
+        self.assertTrue(links)
+        for link in links:
+            with self.subTest(link=link):
+                self.assertTrue((SKILL.parent / link).is_file())
+
+    def test_the_core_stays_within_its_line_budget(self):
+        self.assertLessEqual(len(skill_text("SKILL.md").splitlines()), 850)
+
+    def test_the_frontmatter_is_unchanged(self):
+        expected = (
+            "---\n"
+            "name: underwrite\n"
+            "description: Interactive PR review, one beat at a time. Reconstructs what a change "
+            "is for and how it fits the project, walks it in causal order while the reviewer "
+            "steers, resolves each flag at the moment it is raised, and finishes the chosen "
+            "resolutions as commits, recorded decisions, durable report inclusions, or a "
+            "GitHub review, whichever has a reader. Use for reviewing a PR or an unfamiliar "
+            "diff, especially AI-authored changes where no author is around to answer questions.\n"
+            "disable-model-invocation: true\n"
+            "argument-hint: [pr-number | branch] [--eval]\n"
+            "---\n"
+        )
+        self.assertEqual(skill_text("SKILL.md").split("\n\n", 1)[0] + "\n", expected)
 
 
 class PublishedVersion(unittest.TestCase):
@@ -32,7 +72,7 @@ class BeforeThePageOpens(unittest.TestCase):
     def skill(self):
         """Whitespace-collapsed: these are prose assertions, and a reflow that rewraps a
         sentence is not a behaviour change."""
-        return " ".join(SKILL.read_text(encoding="utf-8").split())
+        return " ".join(skill_text().split())
 
     def test_ingest_reports_progress_instead_of_going_quiet(self):
         text = self.skill()
@@ -65,7 +105,8 @@ class BeforeThePageOpens(unittest.TestCase):
         self.assertIn("where no such tool exists", text)
 
     def test_working_tree_target_includes_staged_changes_and_never_substitutes_head_tilde(self):
-        ingest = self.skill().split("## Phase 0: scope and ingest")[1].split("## Phase 1")[0]
+        text = " ".join(skill_text("SKILL.md").split())
+        ingest = text.split("## Phase 0: scope and ingest")[1].split("## Phase 1")[0]
         self.assertIn("`git diff HEAD`", ingest)
         self.assertIn("staged and unstaged", ingest)
         self.assertIn("untracked files are excluded", ingest)
@@ -76,7 +117,7 @@ class BeforeThePageOpens(unittest.TestCase):
 
 class RecommendationContract(unittest.TestCase):
     def test_assessment_and_decisions_are_explicit_in_both_surfaces(self):
-        text = " ".join(SKILL.read_text(encoding="utf-8").split())
+        text = " ".join(skill_text().split())
         for phrase in (
             "Lead the terminal with your assessment",
             "decision: {question, recommendation}",
@@ -97,7 +138,7 @@ class TheHeadIsNotYourFinding(unittest.TestCase):
     slots on dailydeck#1499 were the author's own docstrings, reworded."""
 
     def skill(self):
-        return " ".join(SKILL.read_text(encoding="utf-8").split())
+        return " ".join(skill_text().split())
 
     def test_rule_five_covers_laundering_and_not_only_obedience(self):
         text = self.skill()
@@ -127,7 +168,7 @@ class CleanMeansChecked(unittest.TestCase):
     spelling, and the walk only parks where the verdict asks something."""
 
     def skill(self):
-        return " ".join(SKILL.read_text(encoding="utf-8").split())
+        return " ".join(skill_text().split())
 
     def readme(self):
         return " ".join(README.read_text(encoding="utf-8").split())
@@ -206,10 +247,10 @@ class CleanMeansChecked(unittest.TestCase):
 
 class ReviewModeContract(unittest.TestCase):
     def skill(self):
-        return SKILL.read_text(encoding="utf-8")
+        return skill_text()
 
     def test_review_findings_stay_accepted_until_the_review_is_posted(self):
-        text = self.skill()
+        text = skill_text("SKILL.md")
         for anchor in (
             "In `review` mode",
             "If the working tree is dirty",
@@ -227,7 +268,7 @@ class ReviewModeContract(unittest.TestCase):
         self.assertIn("post `decide`", decision_rule)
 
     def test_review_delivery_has_a_final_validation_and_publish_step(self):
-        text = " ".join(self.skill().split())
+        text = " ".join(skill_text("references/finish-review.md").split())
         self.assertIn("render-report.py $R --final", text)
         self.assertIn("one shared `lands[]` entry, atomically", text)
         self.assertIn("Pending or failed deliveries and unresolved review intents, including ones with no findings, are not final", text)
@@ -235,13 +276,16 @@ class ReviewModeContract(unittest.TestCase):
         self.assertIn("re-publish the updated artifact", text)
 
     def test_final_render_exit_2_includes_zero_finding_review_intents_and_their_recovery(self):
-        rule = self.skill().split("Without `--final`", 1)[1].split("**Publishing is opt-in.**", 1)[0]
+        core = skill_text("SKILL.md")
+        rule = core.split("Without `--final`", 1)[1].split("**Publishing is opt-in.**", 1)[0]
         prose = " ".join(rule.split())
+        recovery = " ".join(skill_text("references/finish-review.md").split("**Review mode.**", 1)[0].split())
 
         self.assertIn("unresolved review intents, including ones with no findings", prose)
         self.assertIn("Exit 2 means the page rendered but a beat failed validation and carries an `UNPROVEN` chip, or `--final` found an unresolved review intent, even with no findings and no chip", prose)
-        self.assertIn("For an outstanding review intent, follow the Review mode guidance below", prose)
-        active, terminal = prose.split("For a `failed` or `retired` intent,", 1)
+        self.assertIn("For an outstanding review intent, read `$S/references/finish-review.md` before recovery", prose)
+        self.assertIn("For an outstanding review intent, follow the Review mode guidance in this file", recovery)
+        active, terminal = recovery.split("For a `failed` or `retired` intent,", 1)
         self.assertIn("For a `prepared` or `submitting` intent, use `submit-review` to verify", active)
         self.assertIn("supervised `orphan-review` for a stored review that cannot land", active)
         self.assertIn("`retire-review` before a supervised replacement when no review id is stored", active)
@@ -266,10 +310,10 @@ class ReviewModeContract(unittest.TestCase):
 
 class ActionDeliveryContract(unittest.TestCase):
     def skill(self):
-        return SKILL.read_text(encoding="utf-8")
+        return skill_text()
 
     def waiting_rule(self):
-        text = self.skill()
+        text = skill_text("SKILL.md")
         start_anchor = "**Waiting on the reviewer.**"
         end_anchor = "**Resolving a flag.**"
         self.assertIn(start_anchor, text)
@@ -317,7 +361,7 @@ class ActionDeliveryContract(unittest.TestCase):
 
 class QuestionContract(unittest.TestCase):
     def question_rule(self):
-        text = " ".join(SKILL.read_text(encoding="utf-8").split())
+        text = " ".join(skill_text("SKILL.md").split())
         return text.split("**Answering a question.**", 1)[1].split(
             "A `next` on the last planned beat", 1
         )[0]
@@ -343,12 +387,12 @@ class QuestionContract(unittest.TestCase):
         self.assertIn("do not advance the walk", rule)
         self.assertIn("visible pending status", rule)
         self.assertIn("Save note and Record decision are not question shortcuts", rule)
-        self.assertNotIn("After answering a question, go straight to the next beat", SKILL.read_text())
+        self.assertNotIn("After answering a question, go straight to the next beat", skill_text())
 
 
 class DelegatedActionContract(unittest.TestCase):
     def skill(self):
-        return SKILL.read_text(encoding="utf-8")
+        return skill_text()
 
     def test_visible_actions_map_to_the_existing_protocol(self):
         text = self.skill()
@@ -406,7 +450,7 @@ class DelegatedActionContract(unittest.TestCase):
 
 class ReportModeContract(unittest.TestCase):
     def skill(self):
-        return SKILL.read_text(encoding="utf-8")
+        return skill_text()
 
     def test_report_accept_is_the_terminal_durable_outcome(self):
         text = self.skill()
@@ -441,12 +485,13 @@ class PublishingIsOptIn(unittest.TestCase):
     the normal end of a session with no question asked (DD-2361)."""
 
     def finish(self):
-        text = " ".join(SKILL.read_text(encoding="utf-8").split())
-        return text[text.index("## Phase 4: finish"):text.index("## Session state")]
+        text = " ".join(skill_text("SKILL.md").split())
+        core_finish = text[text.index("## Phase 4: finish"):text.index("## Session state")]
+        return core_finish + " " + " ".join(skill_text("references/finish-review.md").split())
 
     def test_every_phase_four_render_writes_the_local_file(self):
         renders = [
-            line for line in SKILL.read_text(encoding="utf-8").splitlines()
+            line for line in skill_text().splitlines()
             if "render-report.py $R" in line
         ]
         self.assertTrue(renders)
@@ -492,10 +537,10 @@ class PublishingIsOptIn(unittest.TestCase):
 
 class FrozenSnapshotContract(unittest.TestCase):
     def skill(self):
-        return SKILL.read_text(encoding="utf-8")
+        return skill_text()
 
     def test_ingest_freezes_a_local_exact_diff_before_contextual_reads(self):
-        text = self.skill()
+        text = skill_text("SKILL.md")
         snapshot = text.index('sessionctl.py snapshot-pr "$R"')
         context = text.index("After the snapshot is frozen")
 
@@ -516,7 +561,7 @@ class FrozenSnapshotContract(unittest.TestCase):
         self.assertNotIn('check-worktree "$R" "$PWD"', text)
 
     def review_rule(self):
-        return self.skill().split("**Review mode.**", 1)[1].split("## Session state", 1)[0]
+        return skill_text("references/finish-review.md").split("**Review mode.**", 1)[1]
 
     def test_review_prepares_previews_and_approves_the_intent_before_submission(self):
         rule = self.review_rule()
@@ -611,7 +656,7 @@ class FrozenSnapshotContract(unittest.TestCase):
         self.assertIn("preserve the durable receipt", prose)
         self.assertIn("Do not retry the review", prose)
         self.assertIn("replay its durable landing, not to create another review", prose)
-        self.assertIn("Publishing that page remains the separate opt-in above", prose)
+        self.assertIn("Publishing that page remains the separate opt-in under **Publishing is opt-in.** in `$S/SKILL.md`", prose)
 
 
 class DropReasons(unittest.TestCase):
@@ -622,7 +667,7 @@ class DropReasons(unittest.TestCase):
     FOUR = ("`wrong`", "`intentional`", "`not-worth-it`", "`pre-existing`")
 
     def test_resolving_a_flag_names_the_four_reasons_and_their_meanings(self):
-        text = " ".join(SKILL.read_text(encoding="utf-8").split())
+        text = " ".join(skill_text("SKILL.md").split())
         rule = text.split("Drop asks for two things")[1].split("An answer in words")[0]
         for reason in self.FOUR:
             self.assertIn(reason, rule)
@@ -631,12 +676,12 @@ class DropReasons(unittest.TestCase):
         self.assertIn("ask which one when their words do not say", rule)
 
     def test_the_terminal_path_carries_the_reason_beside_the_note(self):
-        text = " ".join(SKILL.read_text(encoding="utf-8").split())
+        text = " ".join(skill_text().split())
         self.assertIn('a drop carries `"reason"` beside its note', text)
         self.assertIn("is a drop whose words name its reason", text)
 
     def test_the_store_appendix_records_reason_as_a_new_field_only(self):
-        text = " ".join(SKILL.read_text(encoding="utf-8").split())
+        text = " ".join(skill_text("references/session-state.md").split())
         appendix = text.split("`state` is one of `clean`")[1]
         for reason in self.FOUR:
             self.assertIn(reason, appendix)
@@ -653,14 +698,14 @@ class FlagAnchors(unittest.TestCase):
     the FIX names the class when one fix applies in several places."""
 
     def test_rule_four_names_the_store_check_and_the_nearest_line(self):
-        text = " ".join(SKILL.read_text(encoding="utf-8").split())
+        text = " ".join(skill_text("SKILL.md").split())
         rule = text.split("**4. One flag per beat")[1].split("**5.")[0]
         self.assertIn("inside the frozen diff's hunks, numbered as the head reads", rule)
         self.assertIn("context lines included", rule)
         self.assertIn("refused with the nearest touched line named", rule)
 
     def test_a_fix_that_applies_in_several_places_names_the_count(self):
-        text = " ".join(SKILL.read_text(encoding="utf-8").split())
+        text = " ".join(skill_text().split())
         self.assertIn("`FIX` states the count and one example", text)
 
     def test_the_readme_says_a_flag_lands_on_a_touched_line(self):
@@ -675,19 +720,19 @@ class ReviewGuide(unittest.TestCase):
     REVIEW = Path(__file__).resolve().parent.parent / "REVIEW.md"
 
     def skill(self):
-        return " ".join(SKILL.read_text(encoding="utf-8").split())
+        return " ".join(skill_text().split())
 
     def test_ingest_freezes_every_review_guide_from_the_base(self):
         self.assertIn("every `REVIEW.md` at any depth", self.skill())
 
     def test_the_claim_check_reads_what_failure_looks_like(self):
-        text = self.skill()
+        text = " ".join(skill_text("SKILL.md").split())
         claim = text.split("**The claim check.**")[1].split("State the frozen audience")[0]
         self.assertIn("report a body that is silent on a failure the owners named", claim)
         self.assertIn("distinct from a mismatch", claim)
 
     def test_the_plan_batches_paths_the_guide_skips_and_says_so(self):
-        text = self.skill()
+        text = " ".join(skill_text("SKILL.md").split())
         plan = text.split("## Phase 2: plan the walk")[1].split("## Phase 3")[0]
         self.assertIn("A file whose every hunk is what the frozen `REVIEW.md` covering it calls not worth walking goes to follow-through", plan)
         self.assertIn("the reviewer can pull it back", plan)
@@ -717,10 +762,11 @@ class ClaimSections(unittest.TestCase):
     TEMPLATE = Path(__file__).resolve().parent.parent / ".github" / "pull_request_template.md"
 
     def skill(self):
-        return " ".join(SKILL.read_text(encoding="utf-8").split())
+        return " ".join(skill_text().split())
 
     def claim(self):
-        return self.skill().split("**The claim check.**")[1].split("State the frozen audience")[0]
+        text = " ".join(skill_text("SKILL.md").split())
+        return text.split("**The claim check.**")[1].split("State the frozen audience")[0]
 
     def test_the_claim_check_names_the_sections_the_body_lacks(self):
         claim = self.claim()
@@ -728,7 +774,8 @@ class ClaimSections(unittest.TestCase):
         self.assertIn("rather than folding them into a mismatch", claim)
 
     def test_a_missing_testing_answer_reaches_the_recommendation(self):
-        finish = self.skill().split("## Phase 4: finish")[1].split("Render the page first")[0]
+        text = " ".join(skill_text("SKILL.md").split())
+        finish = text.split("## Phase 4: finish")[1].split("Render the page first")[0]
         claim = self.claim()
         self.assertIn("the body states no testing", claim)
         self.assertIn("the body states no testing", finish)
@@ -749,7 +796,7 @@ class ReviewerNoise(unittest.TestCase):
     every flag with a second read, and let a moved head reopen only what moved."""
 
     def skill(self):
-        return " ".join(SKILL.read_text(encoding="utf-8").split())
+        return " ".join(skill_text().split())
 
     def readme(self):
         return " ".join(README.read_text(encoding="utf-8").split())
@@ -760,7 +807,8 @@ class ReviewerNoise(unittest.TestCase):
             self.assertIn("a change that raises the dropped share is a regression even when it finds more", text)
 
     def test_a_flag_is_read_twice_before_it_is_written(self):
-        walk = self.skill().split("## Phase 3: walk")[1].split("**Persist the beat")[0]
+        text = " ".join(skill_text("SKILL.md").split())
+        walk = text.split("## Phase 3: walk")[1].split("**Persist the beat")[0]
         self.assertIn("A flag gets a second read before you write it.", walk)
         self.assertIn("Did this PR introduce it? Is it real? Would a senior engineer stop at it?", walk)
         self.assertIn("Do not pass your reasoning or your other beats", walk)
@@ -769,17 +817,21 @@ class ReviewerNoise(unittest.TestCase):
         self.assertIn("A stored flag cannot be demoted by a rewrite", walk)
 
     def test_a_replacement_links_its_predecessor_and_plans_only_what_moved(self):
-        text = self.skill()
+        text = " ".join(skill_text("SKILL.md").split())
+        replacement = " ".join(skill_text("references/replacement.md").split())
         ingest = text.split("## Phase 0")[1].split("## Phase 1")[0]
-        self.assertIn('sessionctl.py link-predecessor "$R" "$P"', ingest)
-        self.assertIn("never in it", ingest)
+        self.assertIn('sessionctl.py link-predecessor "$R" "$P"', replacement)
+        self.assertIn("never in it", replacement)
+        self.assertIn("read `$S/references/replacement.md`", ingest)
         self.assertIn('sessionctl.py history "$R"', ingest)
         plan = text.split("## Phase 2: plan the walk")[1].split("## Phase 3")[0]
-        self.assertIn("A replacement plans only what moved.", plan)
-        self.assertIn("it is not included again", plan)
+        self.assertIn("read `$S/references/replacement.md`", plan)
+        self.assertIn("A replacement plans only what moved.", replacement)
+        self.assertIn("it is not included again", replacement)
 
     def test_the_fourth_round_says_reconsider_the_approach(self):
-        orient = self.skill().split("## Phase 1: orient")[1].split("## Phase 2")[0]
+        text = " ".join(skill_text("SKILL.md").split())
+        orient = text.split("## Phase 1: orient")[1].split("## Phase 2")[0]
         self.assertIn("In round 4, the third replacement on one PR, the recommendation says to reconsider the approach", orient)
         self.assertIn("the recommendation says to reconsider the approach", self.readme())
 

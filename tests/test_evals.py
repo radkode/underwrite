@@ -22,8 +22,10 @@ import score  # noqa: E402
 import session_store  # noqa: E402
 
 if __package__:
+    from .skill_support import skill_text
     from .sqlite_support import connected
 else:
+    from skill_support import skill_text
     from sqlite_support import connected
 
 spec = importlib.util.spec_from_file_location("eval_run", EVALS / "run.py")
@@ -44,7 +46,7 @@ class Cases(unittest.TestCase):
         self.assertEqual(kinds, {"miss", "clean"})
 
     def test_the_skill_names_no_case_it_is_scored_on(self):
-        text = (ROOT / "skills" / "underwrite" / "SKILL.md").read_text(encoding="utf-8")
+        text = skill_text()
         for path in sorted((EVALS / "cases").glob("*.json")):
             case = score.load_case(path)
             with self.subTest(case=path.stem):
@@ -424,7 +426,7 @@ class Runner(unittest.TestCase):
         self.assertIn("b did not finish its walk", run.regressions(baseline, report))
 
     def test_the_skill_documents_the_mode_and_the_scratch_reviews_root(self):
-        text = " ".join((ROOT / "skills" / "underwrite" / "SKILL.md").read_text(encoding="utf-8").split())
+        text = " ".join(skill_text().split())
         self.assertIn("An argument carrying `--eval` is a scored replay, not a review", text)
         self.assertIn("Leave every flag open, deliver nothing, skip Phase 4", text)
         self.assertIn("When `UNDERWRITE_REVIEWS` is set, it replaces `~/.claude/reviews`", text)
