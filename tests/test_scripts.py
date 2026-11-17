@@ -2112,6 +2112,66 @@ class RenderCli(unittest.TestCase):
         self.assertNotIn("Outstanding GitHub reviews", self.page())
         self.assertNotIn("A review delivery is still outstanding.", self.page())
 
+    def assert_pending_review_blocks_completion(self, store):
+        self.assertEqual(store.presentation_snapshot()[0]["review_intents"], [])
+        rendered = self.run_cli("--standalone")
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertIn("A review delivery is still outstanding.", rendered.stderr)
+        session, beats = store.presentation_snapshot()
+        fragment = rr.body_html(session, beats, {}, live=True, phase="done")
+        for page in (self.page(), fragment):
+            self.assertIn("<h2>Provisional recommendation</h2>", page)
+            self.assertIn("A review delivery is still outstanding.", page)
+            self.assertNotIn("Final recommendation", page)
+            self.assertNotIn("The review is complete. Nothing is waiting on you.", page)
+            self.assertNotIn("Outstanding GitHub reviews", page)
+        self.assertEqual(self.run_cli("--final").returncode, 2)
+
+    def test_finished_walk_with_retired_submitting_intent_keeps_review_delivery_outstanding(self):
+        store = self.frozen_store(state="open")
+        store.patch_session({
+            "plan": [{"n": 1}], "status": "done",
+            "recommendation": "Address the included finding before merging.",
+        })
+        store.put_beat(beat(n=1, state="flag", where="a.ts:1"))
+        action = store.produce("include", 1, "accept", "Include it")
+        store.ack(action["seq"])
+        intent_id = store.prepare_review("COMMENT", "Summary", {
+            "1": {"path": "a.ts", "line": 1, "side": "RIGHT", "body": "Fix it."},
+        })["intent_id"]
+        with store.review_submission_lock():
+            store.begin_submit_intent(intent_id, posting_actor="reviewer")
+            store.retire_review_intent(
+                intent_id, reconcile=lambda _: {"candidates_examined": 0, "match": None},
+                reconcile_delay=0,
+            )
+
+        self.assert_pending_review_blocks_completion(store)
+        self.assertIn("Review intent retired, delivery still owed", self.page())
+        self.assertEqual([item["beat_n"] for item in store.reconcile()["pending_deliveries"]], [1])
+
+    def test_finished_walk_with_landed_intent_keeps_later_accepted_review_delivery_outstanding(self):
+        store = self.frozen_store(state="open")
+        store.patch_session({
+            "plan": [{"n": 1}, {"n": 2}], "status": "done",
+            "recommendation": "Address the included findings before merging.",
+        })
+        for n in (1, 2):
+            store.put_beat(beat(n=n, state="flag", where="a.ts:1"))
+        action = store.produce("include-first", 1, "accept", "Include it")
+        store.ack(action["seq"])
+        intent_id = store.prepare_review("COMMENT", "Summary", {
+            "1": {"path": "a.ts", "line": 1, "side": "RIGHT", "body": "Fix it."},
+        })["intent_id"]
+        action = store.produce("include-later", 2, "accept", "Include this too")
+        store.ack(action["seq"])
+        store.land_intent(intent_id, "https://example.test/reviews/17")
+
+        self.assert_pending_review_blocks_completion(store)
+        self.assertIn("Included, review pending", self.page())
+        self.assertIn("https://example.test/reviews/17", self.page())
+        self.assertEqual([item["beat_n"] for item in store.reconcile()["pending_deliveries"]], [2])
+
     def test_zero_beat_uncertain_submission_is_visible_in_recovery_and_blocks_final(self):
         pr_snapshot = load("pr_snapshot")
         store = self.frozen_store(state="open")

@@ -1402,7 +1402,14 @@ def assessment(session, beats, problems_by_n, validation_problems=(), walking=Fa
         limits.append(f"{unverified} item{'s' if unverified != 1 else ''} unverified.")
     if problems_by_n or validation_problems:
         limits.append("The report has validation problems; resolve them before relying on it.")
-    if session.get("review_intents"):
+    if session.get("review_intents") or (
+        session_mode(session) == "review" and any(
+            beat.get("state") == "accepted"
+            and isinstance(beat.get("delivery"), dict)
+            and beat["delivery"].get("state") in ("pending", "failed")
+            for beat in beats
+        )
+    ):
         limits.append("A review delivery is still outstanding. Resolve the outstanding GitHub reviews.")
     owed = sum(beat.get("state") == "flag" for beat in beats)
     if limits:
