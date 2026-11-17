@@ -6,9 +6,9 @@ import unittest
 from pathlib import Path
 
 if __package__:
-    from .skill_support import SKILL, skill_text
+    from .skill_support import SKILL, skill_references, skill_text
 else:
-    from skill_support import SKILL, skill_text
+    from skill_support import SKILL, skill_references, skill_text
 
 README = Path(__file__).resolve().parent.parent / "README.md"
 MANIFEST = Path(__file__).resolve().parent.parent / ".claude-plugin"
@@ -17,7 +17,7 @@ MANIFEST = Path(__file__).resolve().parent.parent / ".claude-plugin"
 class SkillCorpus(unittest.TestCase):
     def test_every_reference_is_linked_from_the_core(self):
         core = skill_text("SKILL.md")
-        references = sorted((SKILL.parent / "references").glob("*.md"))
+        references = skill_references()
         self.assertTrue(references)
         for path in references:
             with self.subTest(reference=path.name):
@@ -31,7 +31,7 @@ class SkillCorpus(unittest.TestCase):
                 self.assertTrue((SKILL.parent / link).is_file())
 
     def test_the_core_stays_within_its_line_budget(self):
-        self.assertLessEqual(len(skill_text("SKILL.md").splitlines()), 850)
+        self.assertLessEqual(len(skill_text("SKILL.md").splitlines()), 900)
 
     def test_the_frontmatter_is_unchanged(self):
         expected = (
@@ -48,6 +48,174 @@ class SkillCorpus(unittest.TestCase):
             "---\n"
         )
         self.assertEqual(skill_text("SKILL.md").split("\n\n", 1)[0] + "\n", expected)
+
+
+class SkillReferenceTriggers(unittest.TestCase):
+    def section(self, heading):
+        return skill_text("SKILL.md").split(heading, 1)[1].split("\n## ", 1)[0]
+
+    def test_eval_is_read_before_the_six_rules(self):
+        opening = skill_text("SKILL.md").split("## The six rules", 1)[0]
+        self.assertIn(
+            "If the argument carries `--eval`, read `$S/references/eval-mode.md` first.",
+            opening,
+        )
+        eval_mode = " ".join(skill_text("references/eval-mode.md").split())
+        self.assertIn("Every rule in `$S/SKILL.md` still holds, the second read included", eval_mode)
+
+    def test_the_proof_decision_precedes_its_procedure_pointer_in_phase_three(self):
+        walk = self.section("## Phase 3: walk")
+        decision = "A claim a single run would settle should be run, not read."
+        unavailable = "When `$G` is not set up, there is no proof gateway: write `read` or `inferred`"
+        pointer = "Before running it, read `$S/references/attested-proof.md`."
+        self.assertIn(decision, walk)
+        self.assertIn(unavailable, walk)
+        self.assertIn(pointer, walk)
+        self.assertLess(walk.index(decision), walk.index(unavailable))
+        self.assertLess(walk.index(unavailable), walk.index(pointer))
+        self.assertLess(walk.index(pointer), walk.index("**Read the comments"))
+        self.assertLess(walk.index(pointer), walk.index("**Persist the beat"))
+        procedure = " ".join(skill_text("references/attested-proof.md").split())
+        self.assertIn('proofctl.py prove "$R" <beat> "$G"', procedure)
+        self.assertIn("It exits 2 with `status: failed`", procedure)
+        self.assertIn("It exits 3 with `status: retry` on an unknown outcome; repeat the same call", procedure)
+
+    def test_linked_implementation_is_read_in_phase_three_before_decision_only_flags(self):
+        walk = self.section("## Phase 3: walk")
+        pointer = "Before creating or driving a linked PR implementation, read `$S/references/linked-implementation.md`."
+        self.assertIn(pointer, walk)
+        self.assertLess(walk.index(pointer), walk.index("When the flag itself is a decision"))
+
+    def test_review_finish_is_read_at_phase_four_start_before_render_or_handoff(self):
+        finish = self.section("## Phase 4: finish")
+        pointer = "If the audience is `review`, read `$S/references/finish-review.md` now, before rendering."
+        self.assertEqual(finish.strip().split("\n\n", 1)[0], pointer)
+        for later in ("Refresh `recommendation`", "handoff", "render-report.py", "**Publishing is opt-in.**"):
+            with self.subTest(later=later):
+                self.assertLess(finish.index(pointer), finish.index(later))
+        self.assertEqual(finish.count("$S/references/finish-review.md"), 1)
+
+    def test_session_detail_and_outstanding_intent_pointers_are_at_startup_reconcile(self):
+        session = self.section("## Session state")
+        reconcile = next(
+            paragraph for paragraph in session.split("\n\n")
+            if 'sessionctl.py reconcile "$R"' in paragraph
+        )
+        self.assertIn("At startup and after any interrupted external effect, run", reconcile)
+        self.assertIn(
+            "Before migrating a legacy log, using `reconcile-action` or `abandon-head`, "
+            "reading `target` fields or question history, using `stats`, inspecting the "
+            "on-disk tree, or changing this skill, read `$S/references/session-state.md`.",
+            reconcile,
+        )
+        self.assertIn(
+            "If reconcile or the session shows an outstanding review intent, "
+            "read `$S/references/finish-review.md` before any recovery.",
+            reconcile,
+        )
+        self.assertEqual(skill_text("SKILL.md").count("$S/references/session-state.md"), 1)
+        self.assertNotIn("Before reading or writing session or beat fields", skill_text("SKILL.md"))
+
+    def test_supervised_replacement_pointers_precede_ingest_and_plan_continuation(self):
+        ingest = self.section("## Phase 0: scope and ingest")
+        pointer = "Before starting a supervised replacement, read `$S/references/replacement.md`."
+        self.assertIn(pointer, ingest)
+        self.assertLess(ingest.index("until it is understood."), ingest.index(pointer))
+        self.assertLess(ingest.index(pointer), ingest.index("Otherwise say what is about to happen"))
+        plan = self.section("## Phase 2: plan the walk")
+        pointer = "Before planning a supervised replacement walk, read `$S/references/replacement.md`."
+        self.assertIn(pointer, plan)
+        self.assertLess(plan.index("**Move a file to another tier**"), plan.index(pointer))
+        self.assertLess(plan.index(pointer), plan.index("This is a ten second interaction"))
+
+    def test_replacement_reads_review_recovery_before_building_the_next_session(self):
+        opening = skill_text("references/replacement.md").split("\n\n", 1)[0]
+        pointer = (
+            "If reconcile or the session shows an outstanding review intent, "
+            "read `$S/references/finish-review.md` before any recovery."
+        )
+        self.assertIn("finish whatever\ndelivery it still owes", opening)
+        self.assertIn(pointer, opening)
+        self.assertLess(opening.index(pointer), opening.index("Then build the replacement"))
+
+    def test_small_finish_modes_stay_in_the_core(self):
+        finish = " ".join(self.section("## Phase 4: finish").split())
+        for rule in (
+            "**Branch mode.** The commits already exist from Phase 3.",
+            "Report the branch and `git log --oneline`, and offer to push and open a PR. Do not do either unasked.",
+            "Report its generated local branch and exact commit, but do not push or open a PR as part of that flow.",
+            "Any later publication is a new operation with its own explicit authorization.",
+            "**Report mode.** Run the final render after the walk.",
+            "Report mode does not create a GitHub effect and does not add a `lands[]` entry.",
+            "`report.html` is a regenerable projection of the authoritative store, not a receipt and not a delivery target.",
+        ):
+            with self.subTest(rule=rule):
+                self.assertIn(rule, finish)
+        for name in ("finish-branch.md", "finish-report.md"):
+            with self.subTest(reference=name):
+                self.assertFalse((SKILL.parent / "references" / name).exists())
+                self.assertNotIn(name, skill_text("SKILL.md"))
+
+
+class CoreSessionFields(unittest.TestCase):
+    def session(self):
+        return " ".join(skill_text("SKILL.md").split("## Session state", 1)[1].split("## Formatting", 1)[0].split())
+
+    def test_state_slots_and_raw_diff_format_are_in_the_core(self):
+        session = self.session()
+        for rule in (
+            "`state` is one of `clean`, `flag`, `unverified`, `accepted`, `dropped`, `decided`",
+            "`slots` accepts only the six keys from rule 2, spelled lower case: `what`, `why`, `proof`, `risk`, `prior`, `fix`",
+            "Rule 2 shows how the page labels them, not how the store spells them",
+            "`diff` is a list of raw lines, classified on the first character",
+            "`proof_kind` is `ran`, `read`, `inferred`, or `attested` on every beat written now",
+            "`clean` requires `ran` or `attested`",
+            "`attested` requires `attested_proof`, the number of a verified proof run for that beat",
+            "`recommendation` is nonempty session text",
+        ):
+            with self.subTest(rule=rule):
+                self.assertIn(rule, session)
+
+    def test_landing_basics_are_in_the_core(self):
+        session = self.session()
+        for rule in (
+            "`lands[]` entries are `{state: landed|ready|open, what, where}`",
+            "`landed` names what an accepted beat became: a commit SHA in `branch` mode, the review URL in `review` mode",
+            "A frozen PR records the full SHA",
+            "The `--final` render rejects every such accepted beat that still names nothing",
+            "Report mode is different: acceptance itself is the terminal durable outcome, with delivery state `none`, no `landed` value, and no `lands[]` entry",
+            "A `decided` beat never carries one; its `call` is what it became",
+        ):
+            with self.subTest(rule=rule):
+                self.assertIn(rule, session)
+
+    def test_history_ordering_is_next_to_the_phase_zero_history_read(self):
+        ingest = skill_text("SKILL.md").split("## Phase 0: scope and ingest", 1)[1].split("## Phase 1", 1)[0]
+        history = " ".join(ingest.split('- `$S/scripts/sessionctl.py history "$R"`', 1)[1].split("Run `check-pr`", 1)[0].split())
+        for rule in (
+            "`history` is how a later session reads it",
+            "only earlier sessions appear, marked `order: earlier`",
+            "elsewhere every other session appears marked `order: unknown`, so weigh it as context, not as the record",
+            "Sessions it cannot read are listed as unreadable, never skipped silently",
+        ):
+            with self.subTest(rule=rule):
+                self.assertIn(rule, history)
+
+
+class SkillEvalGate(unittest.TestCase):
+    def test_reference_only_changes_trigger_the_eval_workflow(self):
+        workflow = (SKILL.parents[2] / ".github" / "workflows" / "evals.yml").read_text(encoding="utf-8")
+        paths = workflow.split("    paths:\n", 1)[1].split("\npermissions:", 1)[0]
+        for path in ("skills/underwrite/SKILL.md", "skills/underwrite/references/**", "evals/**"):
+            with self.subTest(path=path):
+                self.assertIn(f'      - "{path}"', paths)
+
+    def test_docs_treat_the_references_as_skill_rules(self):
+        readme = " ".join(README.read_text(encoding="utf-8").split())
+        self.assertIn("change to the skill (`SKILL.md` or `references/`) only when it passes that", readme)
+        self.assertIn("pull requests that touch the skill (`SKILL.md` or `references/`) or the evals", readme)
+        review = (SKILL.parents[2] / "REVIEW.md").read_text(encoding="utf-8")
+        self.assertIn("The skill (`SKILL.md` or `references/`) names", review)
 
 
 class PublishedVersion(unittest.TestCase):
@@ -283,7 +451,10 @@ class ReviewModeContract(unittest.TestCase):
 
         self.assertIn("unresolved review intents, including ones with no findings", prose)
         self.assertIn("Exit 2 means the page rendered but a beat failed validation and carries an `UNPROVEN` chip, or `--final` found an unresolved review intent, even with no findings and no chip", prose)
-        self.assertIn("For an outstanding review intent, read `$S/references/finish-review.md` before recovery", prose)
+        finish = core.split("## Phase 4: finish", 1)[1].split("## Session state", 1)[0]
+        pointer = "If the audience is `review`, read `$S/references/finish-review.md` now, before rendering."
+        self.assertEqual(finish.strip().split("\n\n", 1)[0], pointer)
+        self.assertLess(finish.index(pointer), finish.index("render-report.py"))
         self.assertIn("For an outstanding review intent, follow the Review mode guidance in this file", recovery)
         active, terminal = recovery.split("For a `failed` or `retired` intent,", 1)
         self.assertIn("For a `prepared` or `submitting` intent, use `submit-review` to verify", active)
@@ -487,7 +658,11 @@ class PublishingIsOptIn(unittest.TestCase):
     def finish(self):
         text = " ".join(skill_text("SKILL.md").split())
         core_finish = text[text.index("## Phase 4: finish"):text.index("## Session state")]
-        return core_finish + " " + " ".join(skill_text("references/finish-review.md").split())
+        references = skill_references("finish-*.md")
+        self.assertTrue(references)
+        return core_finish + " " + " ".join(skill_text(*(
+            path.relative_to(SKILL.parent).as_posix() for path in references
+        )).split())
 
     def test_every_phase_four_render_writes_the_local_file(self):
         renders = [
@@ -540,9 +715,10 @@ class FrozenSnapshotContract(unittest.TestCase):
         return skill_text()
 
     def test_ingest_freezes_a_local_exact_diff_before_contextual_reads(self):
-        text = skill_text("SKILL.md")
-        snapshot = text.index('sessionctl.py snapshot-pr "$R"')
-        context = text.index("After the snapshot is frozen")
+        text = self.skill()
+        core = skill_text("SKILL.md")
+        snapshot = core.index('sessionctl.py snapshot-pr "$R"')
+        context = core.index("After the snapshot is frozen")
 
         self.assertLess(snapshot, context)
         self.assertNotIn("gh pr diff", text)
@@ -681,8 +857,8 @@ class DropReasons(unittest.TestCase):
         self.assertIn("is a drop whose words name its reason", text)
 
     def test_the_store_appendix_records_reason_as_a_new_field_only(self):
-        text = " ".join(skill_text("references/session-state.md").split())
-        appendix = text.split("`state` is one of `clean`")[1]
+        text = " ".join(skill_text("SKILL.md").split())
+        appendix = text.split("## Session state", 1)[1].split("`state` is one of `clean`", 1)[1]
         for reason in self.FOUR:
             self.assertIn(reason, appendix)
         self.assertIn("a beat dropped before the field existed has none", appendix)

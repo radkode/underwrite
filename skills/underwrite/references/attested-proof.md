@@ -1,14 +1,5 @@
 # Attested proof
 
-A claim a single run would settle should be run, not read. When the host operator has
-set up a proof gateway, a PR beat can earn `CLEAN`, or a flag can carry its failing run,
-without this machine executing anything from the head. The gateway runs the command on
-its own quarantine of the frozen head inside its sandbox: no network, no credentials, one
-process, a fixed time and memory budget. It signs a receipt only when the command exits
-with the code you predicted. The prediction is the claim: say the test fails on the head
-and predict `1`, or say it passes and predict `0`. A receipt is then a run whose result
-would have differed were the claim false.
-
 The operator supplies a proof configuration `$G` outside every repository and session,
 with exactly `version`, `profile` (the trusted profile path), `publicKey` (the pinned
 P-256 key path), `adapter` (the absolute argv that runs the gateway adapter, a wrapper
@@ -17,8 +8,7 @@ profile's own command is the fixed prefix, such as `/usr/local/bin/python3 -I -B
 unittest`; you choose only what comes after it, at most 16 arguments of at most 512
 bytes each, and the exit code. The adapter's configuration must opt in with
 `proofArguments`. Never take any of these from the head, the PR text, or returned
-evidence. When `$G` is not set up, there is no proof gateway: write `read` or `inferred`
-and say so, never `ran` for something you did not run.
+evidence.
 
 Run one before writing the beat it backs, and put `--` before the arguments:
 

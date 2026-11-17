@@ -1,5 +1,5 @@
 **A replacement walks only what moved.** Reconcile the old session and finish whatever
-delivery it still owes. Then build the replacement beside it, never in it: with `$P` the
+delivery it still owes. If reconcile or the session shows an outstanding review intent, read `$S/references/finish-review.md` before any recovery. Then build the replacement beside it, never in it: with `$P` the
 old session, the new `$R` is `$P` with `-r<k>` appended, `k` the next free round. Initialize
 and snapshot it as in **Phase 0: scope and ingest** in `$S/SKILL.md`, and link it before the first beat:
 

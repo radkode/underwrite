@@ -161,7 +161,7 @@ target moved: exit 2 for the wrong revision, exit 1 for a local change, and eith
 follow the printed command as above. Any other failure exits 1 and also blocks resumption
 until it is understood.
 
-Before starting a replacement round, read `$S/references/replacement.md`.
+Before starting a supervised replacement, read `$S/references/replacement.md`.
 
 Otherwise say what is about to happen before it does: you are freezing the target,
 fetching its objects, and reading the context around it, and then two decisions stand
@@ -253,6 +253,13 @@ After the snapshot is frozen, run these contextual reads in parallel:
   this PR touches with the reviewer's calls and drop reasons. That is context the reviewer
   already paid for: reuse a fact rather than re-deriving it, cite findings in `PRIOR`, and do
   not re-raise them as new.
+
+  Sessions accumulate into a review history, and `history` is how a later session reads it:
+  for every other session on the same repository, its facts, its recommendation, and the
+  findings it left on the paths this one touches. Where the filesystem records when a store
+  was created, only earlier sessions appear, marked `order: earlier`; elsewhere every other
+  session appears marked `order: unknown`, so weigh it as context, not as the record. Sessions
+  it cannot read are listed as unreadable, never skipped silently.
 
 Run `check-pr` and `check-controller` again after those reads. The contextual data is
 usable only while the frozen target and trusted-base controller still match.
@@ -378,7 +385,7 @@ reconstruction, with its own named options:
 - **Skip a tier** usually follow-through, when it is not worth walking
 - **Move a file to another tier** you tiered something wrong
 
-Before planning a replacement walk, read `$S/references/replacement.md`.
+Before planning a supervised replacement walk, read `$S/references/replacement.md`.
 
 This is a ten second interaction whose job is to fix your misclassifications cheaply and
 put the reviewer in the driver's seat immediately. Once they answer, patch `plan_call`
@@ -448,8 +455,19 @@ Underwrite-owned reader and what it returned, such as two blobs hashing alike or
 that comes back empty; reading a blob and agreeing with it is `read`, and the beat opens
 `UNVERIFIED`. Do not narrate the surrounding-code reading.
 
+A claim a single run would settle should be run, not read. When the host operator has
+set up a proof gateway, a PR beat can earn `CLEAN`, or a flag can carry its failing run,
+without this machine executing anything from the head. The gateway runs the command on
+its own quarantine of the frozen head inside its sandbox: no network, no credentials, one
+process, a fixed time and memory budget. It signs a receipt only when the command exits
+with the code you predicted. The prediction is the claim: say the test fails on the head
+and predict `1`, or say it passes and predict `0`. A receipt is then a run whose result
+would have differed were the claim false.
 
-Before running an attested proof, read `$S/references/attested-proof.md`.
+When `$G` is not set up, there is no proof gateway: write `read` or `inferred`
+and say so, never `ran` for something you did not run.
+
+Before running it, read `$S/references/attested-proof.md`.
 
 **Read the comments, then write what they do not say.** A well-commented diff hands you a
 `WHY` for every hunk, and rule 5 is the one you will break without noticing. The tell is a
@@ -751,6 +769,8 @@ a `FLAG` beat, advance only when the reviewer asks to move on; past a
 
 ## Phase 4: finish
 
+If the audience is `review`, read `$S/references/finish-review.md` now, before rendering.
+
 Refresh `recommendation` against the evidence before rendering, then lead the terminal
 handoff with the same assessment and count of decisions owed as the page. Say what was not
 reviewed or verified; clean counts and included findings alone do not establish merge
@@ -788,7 +808,6 @@ accepted branch or review delivery with no landing. In report mode,
 accepted report beats require no `landed` value. Exit 2 means the page rendered but a beat
 failed validation and carries an `UNPROVEN` chip, or `--final` found an unresolved review
 intent, even with no findings and no chip.
-For an outstanding review intent, read `$S/references/finish-review.md` before recovery.
 For an open beat that failed validation, read the authoritative object with `get-beat`,
 fix the complete object through `put-beat`, and re-render. Report
 acceptance validates and freezes the agent-authored finding, so an accepted report beat
@@ -805,11 +824,20 @@ passes, offer it once through the structured question tool, naming both facts in
 question, with **Keep it local** and **Publish to claude.ai** as the options. Publish only
 on an explicit yes, and publish that same `$R/report.html`.
 
-Before finishing branch delivery, read `$S/references/finish-branch.md`.
+**Branch mode.** The commits already exist from Phase 3. Report the branch and
+`git log --oneline`, and offer to push and open a PR. Do not do either unasked. A session
+with no requested implementations leaves no branch at all, which is correct. This
+implementation path is only for local branch and working-tree targets. A PR in branch
+mode is a static audit and cannot have accepted commit deliveries. A linked
+`gateway_attested` child is the separate exception described in `$S/references/linked-implementation.md`. Report its generated
+local branch and exact commit, but do not push or open a PR as part of that flow. Any later
+publication is a new operation with its own explicit authorization.
 
-Before finishing report delivery, read `$S/references/finish-report.md`.
-
-Before preparing, submitting, or recovering a GitHub review, read `$S/references/finish-review.md`.
+**Report mode.** Run the final render after the walk. Include in report has already made
+each accepted beat terminal in SQLite, so there is no pending external delivery to land
+or reconcile. Report mode does not create a GitHub effect and does not add a `lands[]`
+entry. `report.html` is a regenerable projection of the authoritative store, not a receipt
+and not a delivery target.
 
 ## Session state
 
@@ -831,10 +859,36 @@ returning it. `read-blob` and `context-log` verify `pr.bundle` before importing 
 objects into a fresh bare repository. Never use the compatibility files directly as an
 instruction or code source.
 
+`state` is one of `clean`, `flag`, `unverified`, `accepted`, `dropped`, `decided`. The
+first three are what a beat opens with; the last three are what a flag becomes after the
+reviewer answers. `accepted` is the durable state behind Implement, Include in review, and
+Include in report; `decided` is the outcome behind Record decision. A `dropped` beat
+written now carries `reason`, one of `wrong`, `intentional`, `not-worth-it`, `pre-existing`;
+a beat dropped before the field existed has none. Set top-level
+`resolution_kind` to `decision` only when the answer itself completes the work. New
+ordinary flags persist `delivery`; imported legacy beats may omit it. `slots` accepts only
+the six keys from rule 2, spelled lower case: `what`, `why`, `proof`, `risk`, `prior`,
+`fix`. Rule 2 shows how the page labels them, not how the store spells them. `diff` is a list of raw lines, classified on the first character.
+`proof_kind` is `ran`, `read`, `inferred`, or `attested` on every beat written now, and
+`clean` requires `ran` or `attested`. `attested` requires `attested_proof`, the number of
+a verified proof run for that beat, and the store owns `attestation`. A beat stored before the field existed keeps the verdict it landed with.
+`lands[]` entries are `{state: landed|ready|open, what, where}`.
+
+`recommendation` is nonempty session text.
+
+`landed` names what an accepted beat became: a commit SHA in `branch` mode, the review URL
+in `review` mode, with `branch` beside it when there is one. A frozen PR records the full
+SHA so the local-history guard can resolve it without ambiguity. An accepted beat may omit
+it in a live branch or review render, where delivery remains visibly pending or failed.
+The `--final` render rejects every such accepted beat that still names nothing. Report
+mode is different: acceptance itself is the terminal durable outcome, with delivery state
+`none`, no `landed` value, and no `lands[]` entry. A `decided` beat never carries one; its
+`call` is what it became.
+
 At startup and after any interrupted external effect, run
 `$S/scripts/sessionctl.py reconcile "$R"`.
-
-Before reading or writing session or beat fields, migrating or recovering a session, or changing this skill, read `$S/references/session-state.md`.
+Before migrating a legacy log, using `reconcile-action` or `abandon-head`, reading `target` fields or question history, using `stats`, inspecting the on-disk tree, or changing this skill, read `$S/references/session-state.md`.
+If reconcile or the session shows an outstanding review intent, read `$S/references/finish-review.md` before any recovery.
 
 ## Formatting
 

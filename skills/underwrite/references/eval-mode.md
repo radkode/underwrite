@@ -1,5 +1,5 @@
 **Eval mode.** An argument carrying `--eval` is a scored replay, not a review:
-`evals/run.py` drives it headlessly and nobody is at the keyboard. Every rule here still
+`evals/run.py` drives it headlessly and nobody is at the keyboard. Every rule in `$S/SKILL.md` still
 holds, the second read included. At each of the two decisions take the option you would
 recommend and record it in your own words as the call, marked as eval mode. Do not serve
 the page, post status, or park: write each beat and go straight to the next. Leave every

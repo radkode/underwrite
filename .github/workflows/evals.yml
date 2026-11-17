@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - "skills/underwrite/SKILL.md"
+      - "skills/underwrite/references/**"
       - "evals/**"
 
 permissions:
