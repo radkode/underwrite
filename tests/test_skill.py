@@ -241,9 +241,13 @@ class ReviewModeContract(unittest.TestCase):
         self.assertIn("unresolved review intents, including ones with no findings", prose)
         self.assertIn("Exit 2 means the page rendered but a beat failed validation and carries an `UNPROVEN` chip, or `--final` found an unresolved review intent, even with no findings and no chip", prose)
         self.assertIn("For an outstanding review intent, follow the Review mode guidance below", prose)
-        self.assertIn("`submit-review` to verify", prose)
-        self.assertIn("supervised `orphan-review` for a stored review that cannot land", prose)
-        self.assertIn("`retire-review` before a supervised replacement when no review id is stored", prose)
+        active, terminal = prose.split("For a `failed` or `retired` intent,", 1)
+        self.assertIn("For a `prepared` or `submitting` intent, use `submit-review` to verify", active)
+        self.assertIn("supervised `orphan-review` for a stored review that cannot land", active)
+        self.assertIn("`retire-review` before a supervised replacement when no review id is stored", active)
+        self.assertIn("prepare and preview a replacement, then get explicit approval before submitting it", terminal)
+        for command in ("`submit-review`", "`orphan-review`", "`retire-review`"):
+            self.assertNotIn(command, terminal)
         self.assertIn("For an open beat that failed validation", prose)
 
     def test_the_audience_shape_is_explicit(self):

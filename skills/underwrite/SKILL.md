@@ -1019,8 +1019,10 @@ accepted branch or review delivery with no landing. In report mode,
 accepted report beats require no `landed` value. Exit 2 means the page rendered but a beat
 failed validation and carries an `UNPROVEN` chip, or `--final` found an unresolved review
 intent, even with no findings and no chip. For an outstanding review intent, follow the
-Review mode guidance below: `submit-review` to verify, supervised `orphan-review` for a stored review that cannot
-land, or `retire-review` before a supervised replacement when no review id is stored.
+Review mode guidance below. For a `prepared` or `submitting` intent, use `submit-review` to
+verify, supervised `orphan-review` for a stored review that cannot land, or `retire-review`
+before a supervised replacement when no review id is stored. For a `failed` or `retired`
+intent, prepare and preview a replacement, then get explicit approval before submitting it.
 For an open beat that failed validation, read the authoritative object with `get-beat`,
 fix the complete object through `put-beat`, and re-render. Report
 acceptance validates and freezes the agent-authored finding, so an accepted report beat
