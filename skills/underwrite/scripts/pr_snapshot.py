@@ -1830,8 +1830,13 @@ def _submit_review(store, intent_id, *, retry, runner, api):
     try:
         current_actor = _runner_actor(runner)
     except StoreError as error:
-        if state != "prepared" or intent["review_id"] is not None or isinstance(error, Conflict):
+        if isinstance(error, Conflict):
             raise
+        if state == "submitting" or intent["review_id"] is not None:
+            raise ReviewSubmissionUncertain(
+                f"review intent {intent_id} could not check GitHub before posting ({error}); "
+                "repeat submit-review to reconcile before any retry"
+            ) from error
         raise ReviewPrePostCheckFailed(
             f"could not check GitHub before posting ({error}); nothing posted; "
             "intent unchanged; rerun submit-review"
@@ -1878,8 +1883,13 @@ def _submit_review(store, intent_id, *, retry, runner, api):
             f"target moved before POST; this invocation did not post, intent unchanged: {error}"
         ) from error
     except StoreError as error:
-        if state != "prepared" or intent["review_id"] is not None or isinstance(error, Conflict):
+        if isinstance(error, Conflict):
             raise
+        if state == "submitting" or intent["review_id"] is not None:
+            raise ReviewSubmissionUncertain(
+                f"review intent {intent_id} could not check GitHub before posting ({error}); "
+                "repeat submit-review to reconcile before any retry"
+            ) from error
         raise ReviewPrePostCheckFailed(
             f"could not check GitHub before posting ({error}); nothing posted; "
             "intent unchanged; rerun submit-review"

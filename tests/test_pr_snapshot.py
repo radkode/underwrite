@@ -2672,17 +2672,68 @@ class SubmitReview(unittest.TestCase):
         self.assertEqual(self.invoke()[0], 0)
         self.assertEqual(len(self.runner.posts), 1)
 
-    def test_prepared_pre_post_read_conflicts_remain_exit_1(self):
-        before = self.store.review_intent(self.intent_id)
-        for field in ("actor_error", "metadata_error"):
-            with self.subTest(field=field):
-                setattr(self.runner, field, session_store.Conflict("read conflict"))
-                code, _output, error = self.invoke()
-                self.assertEqual(code, 1, error)
-                self.assertIn("read conflict", error)
-                self.assertEqual(self.runner.posts, [])
-                self.assertEqual(self.store.review_intent(self.intent_id), before)
-                setattr(self.runner, field, None)
+    def assert_uncertain_pre_post_read_failure(self, *args):
+        before = self.store.review_intent(self.intent_id, include_payload=True)
+        state = self.store.delivery_state()
+        preview = (self.root / "review.fixed.json").read_bytes()
+
+        code, output, error = self.invoke(*args)
+
+        self.assertEqual(code, 3, error)
+        self.assertEqual(output, "")
+        self.assertIn("could not check GitHub before posting", error)
+        self.assertIn("repeat submit-review to reconcile before any retry", error)
+        self.assertEqual(self.runner.posts, [])
+        self.assertEqual(self.store.review_intent(self.intent_id, include_payload=True), before)
+        self.assertEqual(self.store.delivery_state(), state)
+        self.assertEqual((self.root / "review.fixed.json").read_bytes(), preview)
+
+    def test_submitting_actor_read_failure_exits_3_without_post_or_intent_change(self):
+        self.start_submitting()
+        self.runner.actor_error = pr_snapshot.ReviewApiError("HTTP 503", status=503)
+
+        self.assert_uncertain_pre_post_read_failure()
+
+        self.assertEqual([command for command, _ in self.runner.calls], [
+            ["gh", "api", "user", "--jq", ".login"],
+        ])
+
+    def test_bound_prepared_actor_read_failure_exits_3_without_post_or_intent_change(self):
+        self.store.bind_review_id(self.intent_id, 17, posting_actor=self.runner.actor)
+        self.runner.actor_error = pr_snapshot.ReviewApiError("HTTP 503", status=503)
+
+        self.assert_uncertain_pre_post_read_failure()
+
+        self.assertEqual([command for command, _ in self.runner.calls], [
+            ["gh", "api", "user", "--jq", ".login"],
+        ])
+
+    def test_submitting_metadata_read_failure_exits_3_without_post_or_intent_change(self):
+        self.start_submitting()
+        self.runner.metadata_error = pr_snapshot.ReviewApiError("HTTP 503", status=503)
+
+        self.assert_uncertain_pre_post_read_failure("--retry")
+
+        self.assertEqual([command for command, _ in self.runner.calls], [
+            ["gh", "api", "user", "--jq", ".login"],
+            ["gh", "api", "--paginate", "--slurp", "repos/acme/widget/pulls/7/reviews"],
+            ["gh", "api", "-H", "Accept: application/vnd.github+json", "repos/acme/widget/pulls/7"],
+        ])
+
+    def test_pre_post_read_conflicts_remain_exit_1(self):
+        for state in ("prepared", "submitting"):
+            if state == "submitting":
+                self.start_submitting()
+            before = self.store.review_intent(self.intent_id)
+            for field in ("actor_error", "metadata_error"):
+                with self.subTest(state=state, field=field):
+                    setattr(self.runner, field, session_store.Conflict("read conflict"))
+                    code, _output, error = self.invoke("--retry")
+                    self.assertEqual(code, 1, error)
+                    self.assertIn("read conflict", error)
+                    self.assertEqual(self.runner.posts, [])
+                    self.assertEqual(self.store.review_intent(self.intent_id), before)
+                    setattr(self.runner, field, None)
 
     def test_prepared_reconciliation_failure_exits_5_without_post_or_intent_change(self):
         before = self.store.review_intent(self.intent_id)
