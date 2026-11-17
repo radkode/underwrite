@@ -29,6 +29,7 @@ from pr_snapshot import (  # noqa: E402
     context_log,
     gh_runner,
     moved_lines,
+    orphan_review,
     read_blob,
     review_identity,
     review_receipt,
@@ -314,6 +315,12 @@ def parser():
     retire = commands.add_parser("retire-review")
     retire.add_argument("session")
     retire.add_argument("--intent", required=True)
+    retire.add_argument("--reconcile-delay", type=float, default=30)
+
+    orphan = commands.add_parser("orphan-review")
+    orphan.add_argument("session")
+    orphan.add_argument("--intent", required=True)
+    orphan.add_argument("--reason", required=True)
 
     receipt = commands.add_parser("review-receipt")
     receipt.add_argument("session")
@@ -392,9 +399,9 @@ def confine(args):
     if not root:
         return
     boundary = Path(root).resolve()
-    for name in ("session", "predecessor", "reviews", "body_file", "comments_file"):
+    for name in ("session", "predecessor", "reviews", "body_file", "comments_file", "source", "entry"):
         value = getattr(args, name, None)
-        if value is None:
+        if value is None or (name == "source" and value == "-" and args.command != "review-receipt"):
             continue
         target = Path(value).expanduser().resolve()
         if target != boundary and boundary not in target.parents:
@@ -456,11 +463,15 @@ def run(args, *, runner=gh_runner):
         result = store.prepare_review(
             args.event, body, comments, replace=args.replace
         )
-    elif args.command in ("submit-review", "retire-review"):
+    elif args.command in ("submit-review", "retire-review", "orphan-review"):
         store = SessionStore(args.session)
         try:
             if args.command == "retire-review":
-                result = retire_review(store, args.intent, runner=runner)
+                result = retire_review(
+                    store, args.intent, runner=runner, reconcile_delay=args.reconcile_delay
+                )
+            elif args.command == "orphan-review":
+                result = orphan_review(store, args.intent, args.reason, runner=runner)
             else:
                 result = submit_review(
                     store, args.intent, retry=args.retry, runner=runner

@@ -788,16 +788,19 @@ def delivery_html(beat, mode, replacement=False, untrusted_pr=False):
             "prepared": "Review prepared, awaiting submission",
             "submitting": "Review submitting, outcome not yet verified",
             "dismissed": "Review dismissed, needs supervised handling",
+            "orphaned": "Posted review could not be landed, needs supervised handling",
             "retired": "Review intent retired, delivery still owed",
         }
         label = labels.get(str(intent.get("state", "")))
         if label:
             detail = ""
-            if intent.get("state") == "dismissed":
+            if intent.get("state") in ("dismissed", "orphaned"):
                 detail = (
                     f'<span class="delivery-error">{md(intent.get("review_url", ""))} '
                     "Do not retry or repost.</span>"
                 )
+            if intent.get("state") == "orphaned" and intent.get("orphan_reason"):
+                detail += f'<span class="delivery-error">Reason: {md(intent["orphan_reason"])}</span>'
             return (
                 '<div class="call delivery pending">'
                 f'<span class="lbl">{label}</span>{detail}</div>'

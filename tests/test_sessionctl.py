@@ -505,6 +505,33 @@ class TargetCommands(SessionCtlCase):
         accepted = self.invoke(*args, env=env)
         self.assertEqual(accepted.returncode, 0, accepted.stderr)
 
+    def test_confines_review_receipt_source_and_land_entry_including_symlinks(self):
+        env = dict(os.environ, UNDERWRITE_CONFINE=str(self.root))
+        with tempfile.TemporaryDirectory() as outside:
+            external = Path(outside) / "input.json"
+            external.write_text("{}", encoding="utf-8")
+            link = self.root / "escaped-receipt"
+            link.symlink_to(external)
+            for path in (external, link):
+                commands = (
+                    ("review-receipt", self.root, path, "--actor", "reviewer"),
+                    ("land", self.root, "1", "1", "https://example.test/reviews/17", "--kind", "review", "--entry", path),
+                )
+                for args in commands:
+                    with self.subTest(command=args[0], path=path):
+                        refused = self.invoke(*args, env=env)
+                        self.assertEqual(refused.returncode, 1)
+                        self.assertIn("outside UNDERWRITE_CONFINE", refused.stderr)
+        dash = self.invoke("review-receipt", self.root, "-", "--actor", "reviewer", env=env)
+        self.assertEqual(dash.returncode, 1)
+        self.assertIn("outside UNDERWRITE_CONFINE", dash.stderr)
+        inside = self.root / "receipt.json"
+        inside.write_text("{}", encoding="utf-8")
+        accepted_path = self.invoke("review-receipt", self.root, inside, "--actor", "reviewer", env=env)
+        self.assertNotIn("outside UNDERWRITE_CONFINE", accepted_path.stderr)
+        stdin = self.invoke("patch-session", self.root, value={"status": "Still reviewing"}, env=env)
+        self.assertEqual(stdin.returncode, 0, stdin.stderr)
+
     def test_prepare_review_requires_comments_to_be_a_json_object(self):
         args = self.review_inputs()
         (self.root / "comments.json").write_text("[]", encoding="utf-8")

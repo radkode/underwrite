@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import re
 import secrets
@@ -15,6 +16,7 @@ import stat
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1102,9 +1104,12 @@ class SessionStore:
                 beats_json TEXT NOT NULL,
                 report_json TEXT NOT NULL,
                 state TEXT NOT NULL
-                    CHECK (state IN ('prepared', 'submitting', 'landed', 'failed', 'replaced', 'dismissed', 'retired')),
+                    CHECK (state IN ('prepared', 'submitting', 'landed', 'failed', 'replaced', 'dismissed', 'retired', 'orphaned')),
                 review_id INTEGER UNIQUE,
                 review_url TEXT,
+                review_url_source TEXT,
+                orphan_reason TEXT,
+                orphaned_at TEXT,
                 land_entry_json TEXT,
                 failure TEXT,
                 created_at TEXT NOT NULL,
@@ -4342,14 +4347,15 @@ class SessionStore:
                 })
             review_intents = {}
             for row in db.execute(
-                "SELECT intent_id, state, review_url, beats_json FROM review_intents "
-                "WHERE state IN ('prepared', 'submitting', 'dismissed', 'retired') ORDER BY rowid"
+                "SELECT intent_id, state, review_url, orphan_reason, beats_json FROM review_intents "
+                "WHERE state IN ('prepared', 'submitting', 'dismissed', 'retired', 'orphaned') ORDER BY rowid"
             ):
                 for covered in json.loads(row["beats_json"]):
                     review_intents[covered["beat_n"]] = {
                         "intent_id": row["intent_id"],
                         "state": row["state"],
                         "review_url": row["review_url"],
+                        "orphan_reason": row["orphan_reason"],
                     }
             beats = []
             for row in db.execute("SELECT * FROM beats ORDER BY n"):
@@ -5215,6 +5221,9 @@ class SessionStore:
             "anchor_report": report,
             "review_id": row["review_id"],
             "review_url": row["review_url"],
+            "review_url_source": row["review_url_source"],
+            "orphan_reason": row["orphan_reason"],
+            "orphaned_at": row["orphaned_at"],
             "land_entry": (
                 None if row["land_entry_json"] is None else json.loads(row["land_entry_json"])
             ),
@@ -5289,12 +5298,13 @@ class SessionStore:
             marker = self._review_token(session_row["session_id"])
 
             owed = self._pending_review_beats(db)
-            for dismissed in db.execute(
-                "SELECT intent_id, beats_json FROM review_intents WHERE state = 'dismissed'"
+            for blocked in db.execute(
+                "SELECT intent_id, state, beats_json FROM review_intents "
+                "WHERE state IN ('dismissed', 'orphaned')"
             ):
-                if any(item["beat_n"] in owed for item in json.loads(dismissed["beats_json"])):
+                if any(item["beat_n"] in owed for item in json.loads(blocked["beats_json"])):
                     raise Conflict(
-                        f"dismissed review intent {dismissed['intent_id']} covers pending beats; "
+                        f"{blocked['state']} review intent {blocked['intent_id']} covers pending beats; "
                         "stop for supervised handling without reposting"
                     )
             missing = sorted(set(owed) - set(parsed_comments))
@@ -5578,25 +5588,32 @@ class SessionStore:
             )
         return disk
 
-    def bind_review_id(self, intent_id, review_id):
+    def bind_review_id(self, intent_id, review_id, *, review_url=None):
         _positive(review_id, "review id")
+        if review_url is not None and (not isinstance(review_url, str) or not review_url.strip()):
+            raise StoreError("review_url must be non-empty text")
         with self._write() as db:
             intent = self._review_intent_row(db, intent_id)
             if intent["review_id"] is not None:
                 if intent["review_id"] != review_id:
                     raise Conflict(f"review intent {intent_id} already has review id {intent['review_id']}")
-                return
-            if intent["state"] not in ("prepared", "submitting"):
-                raise Conflict(f"review intent {intent_id} is {intent['state']}, cannot bind a review")
-            bound = db.execute(
-                "SELECT intent_id FROM review_intents WHERE review_id = ?", (review_id,)
-            ).fetchone()
-            if bound is not None:
-                raise Conflict(f"review {review_id} is already bound to intent {bound['intent_id']}")
-            db.execute(
-                "UPDATE review_intents SET review_id = ? WHERE intent_id = ?",
-                (review_id, intent_id),
-            )
+            else:
+                if intent["state"] not in ("prepared", "submitting"):
+                    raise Conflict(f"review intent {intent_id} is {intent['state']}, cannot bind a review")
+                bound = db.execute(
+                    "SELECT intent_id FROM review_intents WHERE review_id = ?", (review_id,)
+                ).fetchone()
+                if bound is not None:
+                    raise Conflict(f"review {review_id} is already bound to intent {bound['intent_id']}")
+                db.execute(
+                    "UPDATE review_intents SET review_id = ? WHERE intent_id = ?",
+                    (review_id, intent_id),
+                )
+            if review_url is not None and intent["review_url"] is None:
+                db.execute(
+                    "UPDATE review_intents SET review_url = ?, review_url_source = 'review_object' "
+                    "WHERE intent_id = ?", (review_url.strip(), intent_id),
+                )
 
     def begin_submit_intent(self, intent_id, *, retry=False, include_payload=False):
         if self._review_submission_owner != (os.getpid(), threading.get_ident()):
@@ -5618,6 +5635,15 @@ class SessionStore:
                     f"review intent {intent_id} already has review id {intent['review_id']}; "
                     "verify that review without reposting"
                 )
+            for item in json.loads(intent["beats_json"]):
+                beat = json.loads(self._beat_row(db, item["beat_n"])["body_json"])
+                if beat.get("state") != "accepted":
+                    raise Conflict(f"beat {item['beat_n']} is {beat.get('state')}, not accepted")
+                pinned_sha256 = hashlib.sha256(self._pinned_beat(beat).encode("utf-8")).hexdigest()
+                if pinned_sha256 != item["beat_sha256"]:
+                    raise Conflict(
+                        f"beat {item['beat_n']} content changed since review intent {intent_id} was prepared"
+                    )
             if intent["state"] == "submitting":
                 if not retry:
                     raise Conflict(
@@ -5642,9 +5668,11 @@ class SessionStore:
                 updated, include_payload=include_payload
             )
 
-    def retire_review_intent(self, intent_id, *, reconcile=None):
+    def retire_review_intent(self, intent_id, *, reconcile=None, reconcile_delay=30, sleep=time.sleep):
         if self._review_submission_owner != (os.getpid(), threading.get_ident()):
             raise StoreError("retire_review_intent requires the review submission lock")
+        if not isinstance(reconcile_delay, (int, float)) or not math.isfinite(reconcile_delay) or reconcile_delay < 0:
+            raise StoreError("reconcile delay must be a finite non-negative number of seconds")
         intent = self.review_intent(intent_id, include_payload=True)
         if intent["review_id"] is not None:
             raise Conflict(f"review intent {intent_id} has a stored review id; cannot retire")
@@ -5654,20 +5682,30 @@ class SessionStore:
         if intent["state"] == "submitting":
             if reconcile is None:
                 raise Conflict("submitting review retirement requires reconciliation")
-            result = reconcile(intent)
-            if (
-                not isinstance(result, dict)
-                or type(result.get("candidates_examined")) is not int
-                or result["candidates_examined"] < 0
-                or "match" not in result
-            ):
-                raise Conflict("review retirement requires reconciliation evidence")
-            if result["match"] is not None:
-                raise Conflict("a matching review exists; cannot retire")
-            evidence = {
-                "candidates_examined": result["candidates_examined"],
-                "reconciled_at": _now(),
-            }
+            observations = []
+            for attempt in range(2):
+                if attempt:
+                    sleep(reconcile_delay)
+                result = reconcile(intent)
+                if (
+                    not isinstance(result, dict)
+                    or type(result.get("candidates_examined")) is not int
+                    or result["candidates_examined"] < 0
+                    or "match" not in result
+                ):
+                    raise Conflict("review retirement requires reconciliation evidence")
+                if result["match"] is not None:
+                    current = self.review_intent(intent_id)
+                    if current["state"] == "landed":
+                        landed = self.land_intent(intent_id, current["review_url"])
+                        landed["receipt"] = result["match"]
+                        return landed
+                    raise Conflict("a matching review exists; cannot retire")
+                observations.append({
+                    "candidates_examined": result["candidates_examined"],
+                    "reconciled_at": _now(),
+                })
+            evidence = {"delay_seconds": reconcile_delay, "observations": observations}
         with self._write() as db:
             current = self._review_intent_row(db, intent_id)
             if current["review_id"] is not None or current["state"] != intent["state"]:
@@ -5678,6 +5716,34 @@ class SessionStore:
                 (_now(), None if evidence is None else _dump(evidence), intent_id),
             )
             self._bump_render(db)
+            return self._review_intent_document(self._review_intent_row(db, intent_id))
+
+    def orphan_review_intent(self, intent_id, reason, review_url, url_source):
+        if self._review_submission_owner != (os.getpid(), threading.get_ident()):
+            raise StoreError("orphan_review_intent requires the review submission lock")
+        if not isinstance(reason, str) or not reason.strip():
+            raise StoreError("orphan reason must be non-empty text")
+        if not isinstance(review_url, str) or not review_url.strip():
+            raise StoreError("review_url must be non-empty text")
+        if url_source not in ("review_object", "fetched_review", "derived"):
+            raise StoreError("invalid orphan review URL source")
+        reason, review_url = reason.strip(), review_url.strip()
+        with self._write() as db:
+            intent = self._review_intent_row(db, intent_id)
+            if intent["review_id"] is None:
+                raise Conflict(f"review intent {intent_id} has no stored review id; cannot orphan")
+            if intent["state"] == "orphaned":
+                if intent["orphan_reason"] != reason:
+                    raise Conflict(f"review intent {intent_id} already orphaned with a different reason")
+            elif intent["state"] not in ("prepared", "submitting"):
+                raise Conflict(f"review intent {intent_id} is {intent['state']}, cannot orphan")
+            else:
+                db.execute(
+                    "UPDATE review_intents SET state = 'orphaned', review_url = ?, "
+                    "review_url_source = ?, orphan_reason = ?, orphaned_at = ? WHERE intent_id = ?",
+                    (review_url, url_source, reason, _now(), intent_id),
+                )
+                self._bump_render(db)
             return self._review_intent_document(self._review_intent_row(db, intent_id))
 
     def fail_intent(self, intent_id, error, owed="publish the accepted finding"):

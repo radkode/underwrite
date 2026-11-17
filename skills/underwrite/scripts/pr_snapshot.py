@@ -12,6 +12,7 @@ import shutil
 import stat
 import subprocess
 import tempfile
+import time
 from collections import Counter
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -1611,7 +1612,12 @@ def _verified_review_receipt(runner, target, marker, actor, intent, response):
         )
 
     def comment_key(comment):
-        values = tuple(comment.get(key) for key in ("path", "side", "line", "body"))
+        line = comment.get("line")
+        side = comment.get("side")
+        if line is None:
+            line = comment.get("original_line")
+            side = side or comment.get("original_side")
+        values = (comment.get("path"), side, line, comment.get("body"))
         if (
             not all(isinstance(value, str) for value in (values[0], values[1], values[3]))
             or type(values[2]) is not int
@@ -1625,19 +1631,30 @@ def _verified_review_receipt(runner, target, marker, actor, intent, response):
     return receipt
 
 
-def _reconcile_reviews(runner, target, marker, actor, intent, *, bound_review_ids=()):
+def _reconcile_reviews(store, runner, target, marker, actor, intent, *, bound_review_ids=()):
     return _review_reconciliation(
-        runner, target, marker, actor, intent, bound_review_ids=bound_review_ids
+        store, runner, target, marker, actor, intent, bound_review_ids=bound_review_ids
     )["match"]
 
 
-def _review_reconciliation(runner, target, marker, actor, intent, *, bound_review_ids=()):
+def _review_reconciliation(store, runner, target, marker, actor, intent, *, bound_review_ids=()):
     if intent.get("review_id") is not None:
         response = _runner_json(
             runner,
             ["gh", "api", f"repos/{target['repo']}/pulls/{target['number']}/reviews/{intent['review_id']}"],
             description="stored review",
         )
+        if (
+            isinstance(response, dict)
+            and type(response.get("id")) is int
+            and response["id"] == intent["review_id"]
+        ):
+            try:
+                url = _review_url(response)
+            except SnapshotError:
+                pass
+            else:
+                store.bind_review_id(intent["intent_id"], intent["review_id"], review_url=url)
         return {
             "candidates_examined": 1,
             "match": _verified_review_receipt(runner, target, marker, actor, intent, response),
@@ -1679,7 +1696,7 @@ def _review_reconciliation(runner, target, marker, actor, intent, *, bound_revie
 
 
 def _land_or_dismiss(store, intent, receipt):
-    store.bind_review_id(intent["intent_id"], receipt["review_id"])
+    store.bind_review_id(intent["intent_id"], receipt["review_id"], review_url=receipt["url"])
     if receipt["state"] == "DISMISSED":
         store.record_dismissed_intent(intent["intent_id"], receipt)
         raise Conflict(
@@ -1696,7 +1713,7 @@ def _land_or_dismiss(store, intent, receipt):
     return result
 
 
-def retire_review(store, intent_id, *, runner=gh_runner):
+def retire_review(store, intent_id, *, runner=gh_runner, reconcile_delay=30, sleep=time.sleep):
     with store.review_submission_lock():
         def reconcile(intent):
             target = store.frozen_target()
@@ -1708,14 +1725,50 @@ def retire_review(store, intent_id, *, runner=gh_runner):
                 if item["intent_id"] != intent_id and item["review_id"] is not None
             }
             result = _review_reconciliation(
-                runner, target, store.review_marker(), actor, intent,
+                store, runner, target, store.review_marker(), actor, intent,
                 bound_review_ids=bound_review_ids,
             )
             if result["match"] is not None:
                 _land_or_dismiss(store, intent, result["match"])
             return result
 
-        return store.retire_review_intent(intent_id, reconcile=reconcile)
+        return store.retire_review_intent(
+            intent_id, reconcile=reconcile, reconcile_delay=reconcile_delay, sleep=sleep
+        )
+
+
+def orphan_review(store, intent_id, reason, *, runner=gh_runner):
+    with store.review_submission_lock():
+        intent = store.review_intent(intent_id)
+        if intent["review_id"] is None:
+            raise Conflict(f"review intent {intent_id} has no stored review id; cannot orphan")
+        if intent["state"] not in ("prepared", "submitting", "orphaned"):
+            raise Conflict(f"review intent {intent_id} is {intent['state']}, cannot orphan")
+        if not isinstance(reason, str) or not reason.strip():
+            raise StoreError("orphan reason must be non-empty text")
+        url, source = intent["review_url"], intent["review_url_source"]
+        if url is None:
+            target = store.frozen_target()
+            try:
+                response = _runner_json(
+                    runner,
+                    ["gh", "api", f"repos/{target['repo']}/pulls/{target['number']}/reviews/{intent['review_id']}"],
+                    description="stored review",
+                )
+                if (
+                    not isinstance(response, dict)
+                    or type(response.get("id")) is not int
+                    or response["id"] != intent["review_id"]
+                ):
+                    raise SnapshotError("stored review response has the wrong id")
+                url, source = _review_url(response), "fetched_review"
+            except StoreError:
+                url = (
+                    f"https://github.com/{target['repo']}/pull/{target['number']}"
+                    f"#pullrequestreview-{intent['review_id']}"
+                )
+                source = "derived"
+        return store.orphan_review_intent(intent_id, reason, url, source or "review_object")
 
 
 def submit_review(store, intent_id, *, retry=False, runner=gh_runner, api=None):
@@ -1747,7 +1800,7 @@ def _submit_review(store, intent_id, *, retry, runner, api):
     }
     try:
         reconciled = _reconcile_reviews(
-            runner, target, marker, actor, intent, bound_review_ids=bound_review_ids
+            store, runner, target, marker, actor, intent, bound_review_ids=bound_review_ids
         )
     except StoreError as error:
         if isinstance(error, Conflict) and intent["review_id"] is None:
@@ -1768,7 +1821,7 @@ def _submit_review(store, intent_id, *, retry, runner, api):
         target = check(store, require_open=True, api=pr_api)
     except TargetMoved as error:
         raise ReviewTargetMovedBeforePost(
-            f"target moved before POST; nothing posted, intent unchanged: {error}"
+            f"target moved before POST; this invocation did not post, intent unchanged: {error}"
         ) from error
     intent = store.begin_submit_intent(
         intent_id, retry=state == "submitting" and retry, include_payload=True
@@ -1787,7 +1840,7 @@ def _submit_review(store, intent_id, *, retry, runner, api):
             return _verify_posted_review(store, runner, target, marker, actor, intent, post_error.response)
         try:
             reconciled = _reconcile_reviews(
-                runner, target, marker, actor, intent, bound_review_ids=bound_review_ids
+                store, runner, target, marker, actor, intent, bound_review_ids=bound_review_ids
             )
         except StoreError as reconcile_error:
             raise ReviewSubmissionUncertain(
@@ -1818,9 +1871,17 @@ def _submit_review(store, intent_id, *, retry, runner, api):
 
 def _verify_posted_review(store, runner, target, marker, actor, intent, response):
     try:
-        if isinstance(response, dict) and type(response.get("id")) is int:
-            store.bind_review_id(intent["intent_id"], response["id"])
-            intent = store.review_intent(intent["intent_id"], include_payload=True)
+        if not isinstance(response, dict) or not _matching_review(response, target, marker, actor):
+            raise Conflict("review response did not match the frozen commit, delivery marker, and actor")
+        review_id = response.get("id")
+        if type(review_id) is not int or review_id <= 0:
+            raise SnapshotError("review response has no positive integer id")
+        try:
+            review_url = _review_url(response)
+        except SnapshotError:
+            review_url = None
+        store.bind_review_id(intent["intent_id"], review_id, review_url=review_url)
+        intent = store.review_intent(intent["intent_id"], include_payload=True)
         receipt = _verified_review_receipt(runner, target, marker, actor, intent, response)
     except StoreError as error:
         raise ReviewSubmissionUncertain(

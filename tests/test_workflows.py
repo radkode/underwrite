@@ -477,10 +477,12 @@ class ReviewWorkflow(WorkflowCase):
         self.submit_review("--retry", expected=4)
         retired = self.script_json(
             "sessionctl.py", "retire-review", self.session,
-            "--intent", self.prepared_intent["intent_id"], env=self.gh_env,
+            "--intent", self.prepared_intent["intent_id"], "--reconcile-delay", "0", env=self.gh_env,
         )
         self.assertEqual(retired["state"], "retired")
-        self.assertEqual(retired["retirement_reconciliation"]["candidates_examined"], 0)
+        evidence = retired["retirement_reconciliation"]
+        self.assertEqual(evidence["delay_seconds"], 0)
+        self.assertEqual([item["candidates_examined"] for item in evidence["observations"]], [0, 0])
         self.assertEqual(len(self.fake_gh_state()["post_attempts"]), 1)
         self.assertEqual(self.fake_gh_state()["reviews"], [])
 

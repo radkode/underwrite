@@ -1547,7 +1547,8 @@ class SubmitReview(unittest.TestCase):
         output, error = io.StringIO(), io.StringIO()
         with contextlib.redirect_stdout(output), contextlib.redirect_stderr(error):
             code = sessionctl.main(
-                [command, str(self.root), "--intent", self.intent_id, *args],
+                [command, str(self.root), "--intent", self.intent_id,
+                 *(["--reconcile-delay", "0"] if command == "retire-review" else []), *args],
                 runner=self.runner,
             )
         return code, output.getvalue(), error.getvalue()
@@ -1593,6 +1594,42 @@ class SubmitReview(unittest.TestCase):
         self.assertEqual(self.runner.calls, [])
         self.assertEqual(self.state(), "prepared")
 
+    def test_changed_pinned_content_refuses_before_post(self):
+        second = next(beat for beat in self.store.snapshot()[1] if beat["n"] == 2)
+        self.store.put_beat(dict(second, claim="rewritten finding"))
+        before = self.store.review_intent(self.intent_id)
+        code, _output, error = self.invoke()
+        self.assertEqual(code, 1)
+        self.assertIn("content changed since review intent", error)
+        self.assertEqual(self.runner.posts, [])
+        self.assertEqual(self.store.review_intent(self.intent_id), before)
+
+    def test_outdated_comments_use_original_line_and_side(self):
+        for page in self.runner.comments[17]:
+            for comment in page:
+                comment["original_line"] = comment["line"]
+                comment["line"] = None
+                comment["original_side"] = comment.pop("side")
+        self.runner.comments[17][0][0]["side"] = "RIGHT"
+        code, output, error = self.invoke()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output)["state"], "landed")
+        self.assertEqual(len(self.runner.posts), 1)
+
+    def test_http_error_object_with_id_but_no_review_identity_is_uncertain_without_binding(self):
+        self.runner.post_error = pr_snapshot.ReviewApiError(
+            "HTTP 403", status=403, response={"id": 17, "message": "Forbidden"}
+        )
+        code, _output, error = self.invoke()
+        self.assertEqual(code, 3)
+        self.assertIn("did not match", error)
+        self.assertIsNone(self.store.review_intent(self.intent_id)["review_id"])
+        self.assertEqual(self.state(), "submitting")
+        self.assertEqual(self.pending_beats(), [1, 2])
+        self.assertEqual(self.store.reconcile()["failed_deliveries"], [])
+        self.assertEqual(self.invoke()[0], 3)
+        self.assertEqual(len(self.runner.posts), 1)
+
     def test_event_state_mismatch_refuses_landing(self):
         self.runner.response["state"] = "APPROVED"
 
@@ -1620,9 +1657,9 @@ class SubmitReview(unittest.TestCase):
         with self.assertRaisesRegex(pr_snapshot.ReviewSubmissionUncertain, "did not match"):
             pr_snapshot.submit_review(self.store, self.intent_id, runner=self.runner)
         self.assertEqual(self.state(), "submitting")
-        self.assertEqual(self.store.review_intent(self.intent_id)["review_id"], 17)
+        self.assertIsNone(self.store.review_intent(self.intent_id)["review_id"])
         self.assertEqual(self.pending_beats(), [1, 2])
-        self.assertEqual(self.invoke("--retry")[0], 3)
+        self.assertEqual(self.invoke()[0], 3)
         self.assertEqual(len(self.runner.posts), 1)
 
     def test_approve_requires_approved_receipt(self):
@@ -1703,10 +1740,12 @@ class SubmitReview(unittest.TestCase):
         self.assertEqual(self.store.reconcile()["failed_deliveries"], [])
 
     def test_stored_review_identity_mismatches_are_uncertain_and_never_reposted(self):
-        self.runner.response["commit_id"] = "c" * 40
+        comments = self.runner.comments[17]
+        self.runner.comments[17] = [[]]
         self.assertEqual(self.invoke()[0], 3)
         self.assertEqual(self.store.review_intent(self.intent_id)["review_id"], 17)
-        original = dict(self.runner.response, commit_id="b" * 40)
+        self.runner.comments[17] = comments
+        original = dict(self.runner.response)
         for change in (
             {"commit_id": "c" * 40},
             {"body": "missing marker"},
@@ -2019,7 +2058,7 @@ class SubmitReview(unittest.TestCase):
 
         self.assertEqual(code, 4)
         self.assertIn("head_sha changed", error)
-        self.assertIn("nothing posted, intent unchanged", error)
+        self.assertIn("this invocation did not post, intent unchanged", error)
         self.assertEqual(self.runner.posts, [])
         self.assertEqual(self.store.review_intent(self.intent_id), before)
 
@@ -2031,9 +2070,130 @@ class SubmitReview(unittest.TestCase):
         code, _output, error = self.invoke("--retry")
 
         self.assertEqual(code, 4)
-        self.assertIn("nothing posted, intent unchanged", error)
+        self.assertIn("this invocation did not post, intent unchanged", error)
         self.assertEqual(self.runner.posts, [])
         self.assertEqual(self.store.review_intent(self.intent_id), before)
+
+    def test_orphan_stored_review_after_content_changed_blocks_reprepare(self):
+        def change_content():
+            second = next(beat for beat in self.store.snapshot()[1] if beat["n"] == 2)
+            self.store.put_beat(dict(second, claim="changed while posting"))
+
+        self.runner.on_post = change_content
+        code, _output, error = self.invoke()
+        self.assertEqual(code, 1)
+        self.assertIn("content changed", error)
+        self.assertEqual(self.store.review_intent(self.intent_id)["review_id"], 17)
+        self.assert_orphan_blocks_reprepare("content changed")
+
+    def test_orphan_stored_review_with_unverifiable_comments_blocks_reprepare(self):
+        self.runner.comments[17] = pr_snapshot.ReviewApiError("HTTP 503", status=503)
+        self.assertEqual(self.invoke()[0], 3)
+        self.assertEqual(self.invoke("--retry")[0], 3)
+        self.assert_orphan_blocks_reprepare("comments cannot be verified")
+
+    def assert_orphan_blocks_reprepare(self, reason):
+        before_calls = len(self.runner.calls)
+        with mock.patch.object(session_store.SessionStore, "fail_intent", side_effect=AssertionError("must not fail")):
+            code, output, error = self.invoke_command("orphan-review", "--reason", reason)
+        self.assertEqual((code, error), (0, ""))
+        orphaned = json.loads(output)
+        self.assertEqual(orphaned["state"], "orphaned")
+        self.assertEqual(orphaned["orphan_reason"], reason)
+        self.assertTrue(orphaned["orphaned_at"])
+        self.assertEqual(orphaned["review_url"], "https://example.test/reviews/17")
+        self.assertEqual(orphaned["review_url_source"], "review_object")
+        self.assertEqual(len(self.runner.calls), before_calls)
+        self.assertEqual(len(self.runner.posts), 1)
+        self.assertEqual(self.pending_beats(), [1, 2])
+        self.assertEqual(self.store.reconcile()["failed_deliveries"], [])
+        for replace in (False, True):
+            with self.assertRaisesRegex(session_store.Conflict, "orphaned review intent.*supervised handling"):
+                self.store.prepare_review("COMMENT", "New review", self.comments, replace=replace)
+        self.assertEqual(self.invoke("--retry")[0], 1)
+        self.assertEqual(self.invoke_command("orphan-review", "--reason", reason)[0], 0)
+        self.assertEqual(len(self.runner.posts), 1)
+
+    def test_orphan_refuses_intent_without_stored_review_id(self):
+        code, _output, error = self.invoke_command("orphan-review", "--reason", "unknown")
+        self.assertEqual(code, 1)
+        self.assertIn("has no stored review id", error)
+        self.assertEqual(self.runner.calls, [])
+        self.assertEqual(self.state(), "prepared")
+
+    def test_orphan_keeps_url_seen_on_an_unverifiable_stored_review_read(self):
+        self.runner.response.pop("html_url")
+        self.assertEqual(self.invoke()[0], 3)
+        self.assertIsNone(self.store.review_intent(self.intent_id)["review_url"])
+        self.runner.response["_links"] = {"html": {"href": "https://example.test/reviews/17"}}
+        self.runner.comments[17] = [[]]
+        self.assertEqual(self.invoke()[0], 3)
+        self.runner.read_error = pr_snapshot.ReviewApiError("HTTP 503", status=503)
+        self.assert_orphan_blocks_reprepare("comments unavailable after URL was read")
+
+    def test_orphan_fetches_missing_review_url_from_links(self):
+        self.start_submitting()
+        self.store.bind_review_id(self.intent_id, 17)
+        self.runner.response.pop("html_url")
+        self.runner.response["_links"] = {"html": {"href": "https://example.test/reviews/17"}}
+        code, output, error = self.invoke_command("orphan-review", "--reason", "cannot land")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output)["review_url"], "https://example.test/reviews/17")
+        self.assertEqual(json.loads(output)["review_url_source"], "fetched_review")
+        self.assertEqual(len(self.runner.calls), 1)
+        self.assertEqual(self.runner.posts, [])
+
+    def test_orphan_uses_derived_url_only_when_fetch_fails(self):
+        self.start_submitting()
+        self.store.bind_review_id(self.intent_id, 17)
+        self.runner.read_error = pr_snapshot.ReviewApiError("HTTP 503", status=503)
+        code, output, error = self.invoke_command("orphan-review", "--reason", "cannot land")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output)["review_url"], "https://github.com/acme/widget/pull/7#pullrequestreview-17")
+        self.assertEqual(json.loads(output)["review_url_source"], "derived")
+        self.assertEqual(len(self.runner.calls), 1)
+        self.assertEqual(self.runner.posts, [])
+
+    def test_retire_waits_between_zero_match_reads_with_injected_sleep(self):
+        self.start_submitting()
+        events = []
+        self.runner.on_actor = lambda: events.append("read")
+
+        def sleep(delay):
+            events.append(("sleep", delay))
+            self.assertEqual(self.invoke()[0], 1)
+            self.assertEqual(self.state(), "submitting")
+
+        retired = pr_snapshot.retire_review(
+            self.store, self.intent_id, runner=self.runner, reconcile_delay=12, sleep=sleep
+        )
+        self.assertEqual(events, ["read", ("sleep", 12), "read"])
+        self.assertEqual(retired["retirement_reconciliation"]["delay_seconds"], 12)
+        self.assertEqual(len(retired["retirement_reconciliation"]["observations"]), 2)
+        self.assertEqual(self.runner.posts, [])
+
+    def test_retire_second_read_match_lands_instead_of_retiring(self):
+        self.start_submitting()
+
+        def sleep(delay):
+            self.assertEqual(delay, 30)
+            self.runner.reviews = [[self.runner.response]]
+
+        landed = pr_snapshot.retire_review(
+            self.store, self.intent_id, runner=self.runner, sleep=sleep
+        )
+        self.assertEqual(landed["state"], "landed")
+        self.assertEqual(landed["receipt"]["review_id"], 17)
+        self.assertEqual(self.pending_beats(), [])
+        self.assertEqual(self.runner.posts, [])
+
+    def test_retire_refuses_negative_delay_before_github_calls(self):
+        self.start_submitting()
+        code, _output, error = self.invoke_command("retire-review", "--reconcile-delay", "-1")
+        self.assertEqual(code, 1)
+        self.assertIn("finite non-negative", error)
+        self.assertEqual(self.runner.calls, [])
+        self.assertEqual(self.state(), "submitting")
 
     def test_retire_prepared_intent_without_github_calls_then_prepare_again(self):
         code, output, error = self.invoke_command("retire-review")
@@ -2057,8 +2217,10 @@ class SubmitReview(unittest.TestCase):
         self.assertEqual((code, error), (0, ""))
         retired = json.loads(output)
         self.assertEqual(retired["state"], "retired")
-        self.assertEqual(retired["retirement_reconciliation"]["candidates_examined"], 1)
-        self.assertTrue(retired["retirement_reconciliation"]["reconciled_at"])
+        evidence = retired["retirement_reconciliation"]
+        self.assertEqual(evidence["delay_seconds"], 0)
+        self.assertEqual([item["candidates_examined"] for item in evidence["observations"]], [1, 1])
+        self.assertTrue(all(item["reconciled_at"] for item in evidence["observations"]))
         self.assertEqual(self.pending_beats(), [1, 2])
         self.assertEqual(self.runner.posts, [])
         self.assertFalse(any("-H" in command for command, _stdin in self.runner.calls))
@@ -2066,9 +2228,12 @@ class SubmitReview(unittest.TestCase):
     def test_retire_submitting_with_match_lands_receipt_instead_of_retiring(self):
         self.start_submitting()
         self.runner.reviews = [[self.runner.response]]
-        code, _output, error = self.invoke_command("retire-review")
-        self.assertEqual(code, 1)
-        self.assertIn("a matching review exists; cannot retire", error)
+        code, output, error = self.invoke_command("retire-review")
+        self.assertEqual((code, error), (0, ""))
+        landed = json.loads(output)
+        self.assertEqual(landed["state"], "landed")
+        self.assertEqual(landed["receipt"]["url"], "https://example.test/reviews/17")
+        self.assertEqual([item["beat_n"] for item in landed["deliveries"]], [1, 2])
         self.assertEqual(self.state(), "landed")
         self.assertEqual(self.pending_beats(), [])
         self.assertEqual(self.runner.posts, [])

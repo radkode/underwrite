@@ -2047,7 +2047,7 @@ class RenderCli(unittest.TestCase):
         check_page("Review submitting, outcome not yet verified")
         with store.review_submission_lock():
             store.retire_review_intent(
-                intent_id, reconcile=lambda _: {"candidates_examined": 0, "match": None}
+                intent_id, reconcile=lambda _: {"candidates_examined": 0, "match": None}, reconcile_delay=0
             )
         check_page("Review intent retired, delivery still owed")
         replacement = store.prepare_review("COMMENT", "Summary", comments)
@@ -2066,6 +2066,30 @@ class RenderCli(unittest.TestCase):
         self.assertEqual(self.run_cli().returncode, 0)
         self.assertEqual(self.page().count("Included, review pending"), 1)
         self.assertEqual(self.page().count("Review dismissed, needs supervised handling"), 1)
+
+    def test_orphaned_review_renders_url_and_supervised_no_repost_warning(self):
+        store = self.frozen_store(state="open")
+        store.put_beat(beat(n=1, state="flag", where="a.ts:1"))
+        action = store.produce("include", 1, "accept", "Include it")
+        store.ack(action["seq"])
+        intent = store.prepare_review("COMMENT", "Summary", {
+            "1": {"path": "a.ts", "line": 1, "side": "RIGHT", "body": "Fix it."}
+        })
+        store.bind_review_id(intent["intent_id"], 17)
+        with store.review_submission_lock():
+            store.orphan_review_intent(
+                intent["intent_id"], "comments cannot be verified <reason>",
+                "https://example.test/reviews/17?detail=<orphaned>", "review_object",
+            )
+        rendered = self.run_cli("--standalone")
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertIn("Posted review could not be landed, needs supervised handling", self.page())
+        self.assertIn("https://example.test/reviews/17?detail=&lt;orphaned&gt;", self.page())
+        self.assertIn("Reason: comments cannot be verified &lt;reason&gt;", self.page())
+        self.assertIn("Do not retry or repost.", self.page())
+        self.assertNotIn("Included, review pending", self.page())
+        self.assertEqual(self.run_cli("--final").returncode, 2)
+        self.assertNotIn("landed", store.snapshot()[1][0])
 
     def test_persisted_recommendation_leads_terminal_and_page_output(self):
         store = self.frozen_store()

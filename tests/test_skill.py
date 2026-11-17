@@ -554,12 +554,23 @@ class FrozenSnapshotContract(unittest.TestCase):
     def test_review_distinguishes_pre_post_drift_and_safe_retirement(self):
         rule = self.review_rule()
         prose = " ".join(rule.split())
-        self.assertIn("Exit 4 means the target moved before POST: nothing posted, intent unchanged", prose)
+        self.assertIn("Exit 4 means the target moved before POST: this invocation did not post, intent unchanged", prose)
+        self.assertIn("For a submitting intent, an earlier POST may still surface", prose)
         self.assertIn('sessionctl.py retire-review "$R" --intent <intent-id>', prose)
         self.assertIn("before a supervised replacement", prose)
-        self.assertIn("Retirement accepts a prepared intent, or a submitting one only after zero-match", prose)
-        self.assertIn("reconciliation under the submission lock; it refuses any stored review id", prose)
+        self.assertIn("Retirement accepts a prepared intent, or a submitting one only after two zero-match", prose)
+        self.assertIn("reconciliations under the submission lock, at least 30 seconds apart by default", prose)
+        self.assertIn("`--reconcile-delay` configures seconds", prose)
+        self.assertIn("it refuses any stored review id", prose)
+        self.assertIn("A matching review lands with exit 0 and prints its receipt", prose)
         self.assertIn("Exit 2 now means posted but stale", prose)
+
+    def test_review_documents_supervised_orphan_handling_without_repost(self):
+        rule = self.review_rule()
+        prose = " ".join(rule.split())
+        self.assertIn('supervised `sessionctl.py orphan-review "$R" --intent <intent-id> --reason <text>`', prose)
+        self.assertIn("records URL and reason, leaves beats pending, blocks repost", prose)
+        self.assertLess(len(rule.splitlines()), 100)
 
     def test_review_keeps_verdict_stale_receipt_and_page_publication_rules(self):
         rule = self.review_rule()

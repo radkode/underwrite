@@ -1098,10 +1098,15 @@ rechecks the open target. A stored review id is verified without reposting, even
 retry. A definite other 4xx with no match records publication failure for every covered
 beat, preserving the accepted findings. An unknown outcome must never be marked failed.
 
-Exit 4 means the target moved before POST: nothing posted, intent unchanged. Stop and use
+Exit 4 means the target moved before POST: this invocation did not post, intent unchanged.
+For a submitting intent, an earlier POST may still surface. Stop and use
 `sessionctl.py retire-review "$R" --intent <intent-id>` before a supervised replacement.
-Retirement accepts a prepared intent, or a submitting one only after zero-match
-reconciliation under the submission lock; it refuses any stored review id.
+Retirement accepts a prepared intent, or a submitting one only after two zero-match
+reconciliations under the submission lock, at least 30 seconds apart by default
+(`--reconcile-delay` configures seconds); it refuses any stored review id.
+A matching review lands with exit 0 and prints its receipt; follow the landing steps below.
+For a stored review that cannot land, use supervised `sessionctl.py orphan-review "$R"
+--intent <intent-id> --reason <text>`: records URL and reason, leaves beats pending, blocks repost.
 
 After landing, persist the outcome, review URL, and `status` as one `patch-session` object.
 Recheck the target after posting:

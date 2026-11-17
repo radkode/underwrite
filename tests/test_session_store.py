@@ -2514,6 +2514,8 @@ class CreatingAndMigrating(StoreCase):
             self.assertIn("dismissed_at", columns)
             self.assertIn("retired_at", columns)
             self.assertIn("retirement_reconciliation_json", columns)
+            for column in ("orphan_reason", "orphaned_at", "review_url_source"):
+                self.assertIn(column, columns)
             payload = b'{"comments": []}'
             db.execute(
                 "INSERT INTO review_intents "
@@ -2532,6 +2534,19 @@ class CreatingAndMigrating(StoreCase):
                  "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z",
                  json.dumps({"candidates_examined": 2, "reconciled_at": "2026-01-02T00:00:00Z"})),
             )
+            db.execute(
+                "INSERT INTO review_intents "
+                "(intent_id, event, payload, payload_sha256, beats_json, report_json, "
+                "state, review_id, review_url, review_url_source, orphan_reason, created_at, orphaned_at) "
+                "VALUES (?, 'COMMENT', ?, ?, '[]', '[]', 'orphaned', 18, ?, 'review_object', ?, ?, ?)",
+                ("e" * 64, payload, hashlib.sha256(payload).hexdigest(),
+                 "https://example.test/reviews/18", "cannot land", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"),
+            )
+        orphaned = upgraded.review_intent("e" * 64)
+        self.assertEqual(orphaned["state"], "orphaned")
+        self.assertEqual(orphaned["orphan_reason"], "cannot land")
+        self.assertEqual(orphaned["orphaned_at"], "2026-01-02T00:00:00Z")
+        self.assertEqual(orphaned["review_url_source"], "review_object")
         self.assertIn("review_intents", tables)
         dismissed = upgraded.review_intent("c" * 64)
         self.assertEqual(dismissed["state"], "dismissed")
@@ -4871,6 +4886,65 @@ class ReviewIntents(unittest.TestCase):
             retry = self.store.begin_submit_intent(intent_id, retry=True)
         self.assertEqual(retry["state"], "submitting")
 
+    def test_begin_submit_intent_refuses_changed_pins_including_retry(self):
+        self.accept(1)
+        prepared = self.store.prepare_review("COMMENT", "Summary", {"1": self.comment()})
+        intent_id = prepared["intent_id"]
+        original = self.store.snapshot()[1][0]
+        for retry in (False, True):
+            with self.subTest(retry=retry):
+                if retry:
+                    self.store.put_beat(original)
+                    with self.store.review_submission_lock():
+                        self.store.begin_submit_intent(intent_id)
+                self.store.put_beat(dict(original, claim="rewritten finding"))
+                before = self.store.review_intent(intent_id)
+                with self.store.review_submission_lock(), self.assertRaisesRegex(
+                    session_store.Conflict, "content changed since review intent"
+                ):
+                    self.store.begin_submit_intent(intent_id, retry=retry)
+                self.assertEqual(self.store.review_intent(intent_id), before)
+
+    def test_begin_submit_intent_refuses_beat_no_longer_accepted(self):
+        with connected(str(self.root / "session.sqlite3")) as db:
+            row = db.execute("SELECT body_json FROM beats WHERE n = 2").fetchone()
+            legacy = json.loads(row[0])
+            legacy.pop("resolution_kind")
+            db.execute("UPDATE beats SET body_json = ? WHERE n = 2", (json.dumps(legacy),))
+        intent_id = self.prepare_two_and_start()
+        decision = self.store.produce("decide-2", 2, "decide", "Handle this separately")
+        self.store.ack(decision["seq"])
+        before = self.store.review_intent(intent_id)
+        with self.store.review_submission_lock(), self.assertRaisesRegex(
+            session_store.Conflict, "beat 2 is decided, not accepted"
+        ):
+            self.store.begin_submit_intent(intent_id, retry=True)
+        self.assertEqual(self.store.review_intent(intent_id), before)
+
+    def test_orphan_review_intent_requires_lock_stored_id_and_reason(self):
+        intent_id = self.prepare_two_and_start()
+        args = (intent_id, "cannot land", "https://example.test/reviews/17", "review_object")
+        with self.assertRaisesRegex(session_store.StoreError, "requires the review submission lock"):
+            self.store.orphan_review_intent(*args)
+        with self.store.review_submission_lock():
+            with self.assertRaisesRegex(session_store.Conflict, "has no stored review id"):
+                self.store.orphan_review_intent(*args)
+            self.store.bind_review_id(intent_id, 17)
+            with self.assertRaisesRegex(session_store.StoreError, "reason must be non-empty"):
+                self.store.orphan_review_intent(intent_id, " ", args[2], args[3])
+            orphaned = self.store.orphan_review_intent(*args)
+            self.assertEqual(self.store.orphan_review_intent(*args), orphaned)
+            with self.assertRaisesRegex(session_store.Conflict, "different reason"):
+                self.store.orphan_review_intent(intent_id, "other", args[2], args[3])
+        self.assertEqual(session_store.SessionStore(self.root).review_intent(intent_id), orphaned)
+        self.assertEqual(orphaned["state"], "orphaned")
+        self.assertIsNone(orphaned["failed_at"])
+        with self.assertRaisesRegex(session_store.Conflict, "cannot land"):
+            self.store.land_intent(intent_id, args[2])
+        with self.assertRaisesRegex(session_store.Conflict, "cannot fail"):
+            self.store.fail_intent(intent_id, "error")
+        self.assertEqual([item["beat_n"] for item in self.store.reconcile()["pending_deliveries"]], [1, 2])
+
     def test_retire_review_intent_requires_submission_lock_and_zero_match_evidence(self):
         intent_id = self.prepare_two_and_start()
         with self.assertRaisesRegex(session_store.StoreError, "requires the review submission lock"):
@@ -4902,12 +4976,14 @@ class ReviewIntents(unittest.TestCase):
             return {"candidates_examined": 3, "match": None}
 
         with self.store.review_submission_lock():
-            retired = self.store.retire_review_intent(intent_id, reconcile=reconcile)
-        self.assertEqual(calls, [intent_id])
+            retired = self.store.retire_review_intent(intent_id, reconcile=reconcile, reconcile_delay=0)
+        self.assertEqual(calls, [intent_id, intent_id])
         self.assertEqual(retired["state"], "retired")
         self.assertTrue(retired["retired_at"])
-        self.assertEqual(retired["retirement_reconciliation"]["candidates_examined"], 3)
-        self.assertTrue(retired["retirement_reconciliation"]["reconciled_at"])
+        evidence = retired["retirement_reconciliation"]
+        self.assertEqual(evidence["delay_seconds"], 0)
+        self.assertEqual([item["candidates_examined"] for item in evidence["observations"]], [3, 3])
+        self.assertTrue(all(item["reconciled_at"] for item in evidence["observations"]))
         self.assertEqual(session_store.SessionStore(self.root).review_intent(intent_id), retired)
         self.assertEqual([item["beat_n"] for item in self.store.reconcile()["pending_deliveries"]], [1, 2])
         prepared = self.store.prepare_review(
@@ -4915,6 +4991,17 @@ class ReviewIntents(unittest.TestCase):
         )
         self.assertEqual(prepared["state"], "prepared")
         self.assertNotEqual(prepared["intent_id"], intent_id)
+
+    def test_retire_second_read_error_does_not_persist_retirement(self):
+        intent_id = self.prepare_two_and_start()
+        before = self.store.review_intent(intent_id)
+        reconcile = mock.Mock(side_effect=[
+            {"candidates_examined": 0, "match": None}, session_store.StoreError("read failed")
+        ])
+        with self.store.review_submission_lock(), self.assertRaisesRegex(session_store.StoreError, "read failed"):
+            self.store.retire_review_intent(intent_id, reconcile=reconcile, reconcile_delay=0)
+        self.assertEqual(reconcile.call_count, 2)
+        self.assertEqual(self.store.review_intent(intent_id), before)
 
     def test_retire_review_refuses_stored_id_even_on_prepared_intent(self):
         self.accept(1)
