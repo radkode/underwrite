@@ -1698,21 +1698,33 @@ def _review_reconciliation(store, runner, target, marker, actor, intent, *, boun
             continue
         if not _matching_review(item, target, marker, actor):
             continue
-        if item["state"] not in (_EVENT_STATE[intent["event"]], "DISMISSED"):
-            continue
-        try:
-            receipt = _verified_review_receipt(
-                runner, target, marker, actor, intent, item
-            )
-        except Conflict:
-            continue
-        matches.append(receipt)
+        matches.append(item)
     if len(matches) > 1:
         raise Conflict(
-            "expected at most one review matching the frozen commit, marker, actor, "
-            f"event, body, and inline comments; found {len(matches)}"
+            "expected at most one review matching the frozen commit, marker, and actor; "
+            f"found {len(matches)}"
         )
-    return {"candidates_examined": len(candidates), "match": matches[0] if matches else None}
+    receipt = None
+    if matches:
+        response = matches[0]
+        try:
+            receipt = _verified_review_receipt(
+                runner, target, marker, actor, intent, response
+            )
+        except StoreError as error:
+            try:
+                url = _review_url(response)
+            except SnapshotError:
+                url = None
+            store.bind_review_id(
+                intent["intent_id"], response["id"], review_url=url, posting_actor=actor
+            )
+            raise ReviewSubmissionUncertain(
+                f"review {response['id']} matches intent {intent['intent_id']} identity "
+                f"but could not be verified ({error}); do not repost; repeat submit-review "
+                "to verify or use supervised orphan-review"
+            ) from error
+    return {"candidates_examined": len(candidates), "match": receipt}
 
 
 def _land_or_dismiss(store, intent, receipt, actor):

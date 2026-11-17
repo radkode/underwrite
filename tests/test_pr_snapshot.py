@@ -1652,7 +1652,7 @@ class SubmitReview(unittest.TestCase):
         comment.pop("start_side")
         self.assertEqual(self.invoke()[0], 3)
         self.assertEqual(self.state(), "submitting")
-        self.assertIsNone(self.store.review_intent(self.intent_id)["review_id"])
+        self.assertEqual(self.store.review_intent(self.intent_id)["review_id"], 17)
         self.assertEqual(self.runner.posts, [])
 
     def test_reconciliation_refuses_different_multiline_range(self):
@@ -1664,7 +1664,7 @@ class SubmitReview(unittest.TestCase):
                 comment.update(changes)
                 self.assertEqual(self.invoke()[0], 3)
                 self.assertEqual(self.state(), "submitting")
-                self.assertIsNone(self.store.review_intent(self.intent_id)["review_id"])
+                self.assertEqual(self.store.review_intent(self.intent_id)["review_id"], 17)
                 self.assertEqual(self.runner.posts, [])
 
     def test_http_error_object_with_id_but_no_review_identity_is_uncertain_without_binding(self):
@@ -1857,9 +1857,9 @@ class SubmitReview(unittest.TestCase):
         code, _output, error = self.invoke()
 
         self.assertEqual(code, 3)
-        self.assertIn("no matching review", error)
+        self.assertIn("body does not match", error)
         self.assertEqual(self.state(), "submitting")
-        self.assertIsNone(self.store.review_intent(self.intent_id)["review_id"])
+        self.assertEqual(self.store.review_intent(self.intent_id)["review_id"], 17)
         self.assertEqual(self.pending_beats(), [1, 2])
         self.assertEqual(self.runner.posts, [])
 
@@ -1874,7 +1874,7 @@ class SubmitReview(unittest.TestCase):
 
         self.assertEqual(self.invoke()[0], 3)
         self.assertEqual(self.state(), "submitting")
-        self.assertIsNone(self.store.review_intent(self.intent_id)["review_id"])
+        self.assertEqual(self.store.review_intent(self.intent_id)["review_id"], 17)
         self.assertEqual(self.pending_beats(), [1, 2])
         self.assertEqual(self.runner.posts, [])
 
@@ -1896,7 +1896,7 @@ class SubmitReview(unittest.TestCase):
                 self.runner.reviews = [[self.runner.response]]
                 self.assertEqual(self.invoke()[0], 3)
                 self.assertEqual(self.state(), "submitting")
-                self.assertIsNone(self.store.review_intent(self.intent_id)["review_id"])
+                self.assertEqual(self.store.review_intent(self.intent_id)["review_id"], 17)
         self.assertEqual(self.runner.posts, [])
 
     def test_5xx_reconciles_every_page_and_lands_one_verified_match(self):
@@ -1918,45 +1918,48 @@ class SubmitReview(unittest.TestCase):
         self.assertEqual(self.pending_beats(), [])
         self.assertEqual(len(self.runner.posts), 1)
 
-    def test_reconciliation_matches_only_event_body_and_inline_comment_content(self):
-        self.runner.post_error = pr_snapshot.ReviewApiError("HTTP 503", status=503)
+    def test_reconciliation_counts_identity_matches_even_when_content_or_event_differs(self):
         match = self.runner.response
         self.runner.reviews = [[dict(match, id=18, state="APPROVED")], [
-            dict(match, id=19), match,
+            dict(match, id=19, body="Edited\n\n" + self.store.review_marker()), match,
         ]]
-        self.runner.comments[19] = [[]]
 
-        self.assertEqual(self.invoke()[0], 0)
-        self.assertEqual(self.state(), "landed")
+        code, _output, error = self.invoke("--retry")
 
-    def test_reconciliation_checks_inline_bijection_and_fetches_every_cheap_match(self):
-        match = self.runner.response
-        candidates = []
-        expected = list(self.comments.values())
-        for review_id, change in enumerate((
-            {"path": "different.py"},
-            {"side": "LEFT"},
-            {"line": 12},
-            {"body": "A different finding."},
-        ), 20):
-            candidates.append(dict(match, id=review_id))
-            self.runner.comments[review_id] = [[dict(expected[0], **change), expected[1]]]
-        candidates.append(dict(match, id=24))
-        self.runner.comments[24] = [[expected[0], expected[0]]]
-        self.runner.comments[17] = [[expected[1]], [expected[0]]]
-        self.runner.reviews = [candidates, [match]]
-
-        code, output, error = self.invoke()
-
-        self.assertEqual((code, error), (0, ""))
-        self.assertEqual(json.loads(output)["receipt"]["review_id"], 17)
+        self.assertEqual(code, 1)
+        self.assertIn("found 3", error)
+        self.assertEqual(self.state(), "prepared")
+        self.assertIsNone(self.store.review_intent(self.intent_id)["review_id"])
         self.assertEqual(self.runner.posts, [])
-        comment_reads = [command[-1] for command, _stdin in self.runner.calls
-                         if command[-1].endswith("/comments")]
-        self.assertEqual(comment_reads, [
-            f"repos/acme/widget/pulls/7/reviews/{review_id}/comments"
-            for review_id in (20, 21, 22, 23, 24, 17)
-        ])
+
+    def test_reconciliation_binds_unique_review_with_wrong_event_without_posting(self):
+        self.runner.response["state"] = "APPROVED"
+        self.runner.reviews = [[self.runner.response]]
+
+        code, _output, error = self.invoke("--retry")
+
+        self.assertEqual(code, 3)
+        self.assertIn("does not match intent event", error)
+        self.assertEqual(self.store.review_intent(self.intent_id)["review_id"], 17)
+        self.assertEqual(self.runner.posts, [])
+
+    def test_reconciliation_checks_inline_bijection_without_treating_mismatch_as_absence(self):
+        self.start_submitting()
+        self.runner.reviews = [[self.runner.response]]
+        expected = list(self.comments.values())
+        for change in (
+            {"path": "different.py"}, {"side": "LEFT"}, {"line": 12},
+            {"body": "A different finding."},
+        ):
+            with self.subTest(change=change):
+                self.runner.comments[17] = [[dict(expected[0], **change), expected[1]]]
+                self.assertEqual(self.invoke("--retry")[0], 3)
+                self.assertEqual(self.store.review_intent(self.intent_id)["review_id"], 17)
+        self.runner.comments[17] = [[expected[0], expected[0]]]
+        self.assertEqual(self.invoke("--retry")[0], 3)
+        self.runner.comments[17] = [[expected[1]], [expected[0]]]
+        self.assertEqual(self.invoke()[0], 0)
+        self.assertEqual(self.runner.posts, [])
 
     def test_two_folded_zero_comment_intents_cannot_share_one_review(self):
         folded = {key: dict(item, path="outside.py") for key, item in self.comments.items()}
@@ -1999,10 +2002,11 @@ class SubmitReview(unittest.TestCase):
         self.runner.post_error = pr_snapshot.ReviewApiError("HTTP 503", status=503)
 
         self.assertEqual(self.invoke()[0], 3)
-        self.assertEqual(self.state(), "submitting")
+        self.assertEqual(self.state(), "prepared")
+        self.assertEqual(self.store.review_intent(self.intent_id)["review_id"], 16)
         self.assertEqual(self.pending_beats(), [1, 2])
         self.assertFalse((self.root / "review.dismissed.json").exists())
-        self.assertEqual(len(self.runner.posts), 1)
+        self.assertEqual(self.runner.posts, [])
 
     def test_prepared_intent_adopts_an_existing_matching_review_after_v8_upgrade(self):
         with connected(str(self.root / "session.sqlite3")) as db:
@@ -2422,6 +2426,38 @@ class SubmitReview(unittest.TestCase):
         self.assertEqual(json.loads(output)["review_url_source"], "derived")
         self.assertEqual(len(self.runner.calls), 1)
         self.assertEqual(self.runner.posts, [])
+
+    def lost_response_then_edited_inline_comment(self):
+        self.runner.post_error = pr_snapshot.ReviewApiError("connection lost")
+        self.assertEqual(self.invoke()[0], 3)
+        self.assertIsNone(self.store.review_intent(self.intent_id)["review_id"])
+        self.runner.comments[17][0][0]["body"] = "Edited after posting."
+        self.runner.reviews = [[self.runner.response]]
+
+    def test_retry_after_lost_response_and_edited_comment_binds_id_without_reposting(self):
+        self.lost_response_then_edited_inline_comment()
+
+        code, _output, error = self.invoke("--retry")
+
+        self.assertEqual(code, 3)
+        self.assertIn("inline comments do not match", error)
+        self.assertEqual(self.store.review_intent(self.intent_id)["review_id"], 17)
+        self.assertEqual(self.invoke("--retry")[0], 3)
+        self.assert_orphan_blocks_reprepare("comment edited after posting")
+
+    def test_retire_after_lost_response_and_edited_comment_refuses_zero_match_evidence(self):
+        self.lost_response_then_edited_inline_comment()
+
+        code, _output, error = self.invoke_command("retire-review")
+
+        self.assertEqual(code, 3)
+        self.assertIn("inline comments do not match", error)
+        intent = self.store.review_intent(self.intent_id)
+        self.assertEqual(intent["review_id"], 17)
+        self.assertEqual(intent["state"], "submitting")
+        self.assertIsNone(intent["retirement_reconciliation"])
+        self.assertEqual(self.invoke_command("retire-review")[0], 1)
+        self.assertEqual(len(self.runner.posts), 1)
 
     def test_retire_waits_between_zero_match_reads_with_injected_sleep(self):
         self.start_submitting()
