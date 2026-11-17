@@ -1422,6 +1422,7 @@ class ReviewRunner:
             "state": "COMMENTED",
             "html_url": "https://example.test/reviews/17",
         }
+        self.actor = "REVIEWER"
         self.post_error = None
         self.read_error = None
         self.reviews = [[], []]
@@ -1430,7 +1431,7 @@ class ReviewRunner:
         self.review_responses = {17: self.response}
         self.on_comments: Callable[[], object] | None = None
         self.on_post: Callable[[], object] | None = None
-        self.on_actor: Callable[[], object] | None = None
+        self.on_read: Callable[[], object] | None = None
 
     @property
     def posts(self):
@@ -1440,23 +1441,26 @@ class ReviewRunner:
         self.calls.append((command, stdin))
         endpoint = "repos/acme/widget/pulls/7"
         if command == ["gh", "api", "user", "--jq", ".login"]:
-            if self.on_actor:
-                self.on_actor()
-            return b"REVIEWER\n"
+            return (self.actor + "\n").encode()
         if command == [
             "gh", "api", "-H", "Accept: application/vnd.github+json", endpoint
         ]:
             return json.dumps(self.metadata).encode()
         if command == ["gh", "api", endpoint + "/reviews", "--method", "POST", "--input", "-"]:
             durable = session_store.SessionStore(self.store.root).review_intent(self.intent_id)
-            if durable["state"] != "submitting" or not durable["submitting_at"]:
-                raise AssertionError("POST must follow the durable submitting transition")
+            if (
+                durable["state"] != "submitting" or not durable["submitting_at"]
+                or durable["posting_actor"].casefold() != self.actor.casefold()
+            ):
+                raise AssertionError("POST must follow the durable submitting transition with its actor")
             if self.on_post:
                 self.on_post()
             if self.post_error:
                 raise self.post_error
             return json.dumps(self.response).encode()
         if command == ["gh", "api", "--paginate", "--slurp", endpoint + "/reviews"]:
+            if self.on_read:
+                self.on_read()
             if self.read_error:
                 raise self.read_error
             return json.dumps(self.reviews).encode()
@@ -1555,7 +1559,7 @@ class SubmitReview(unittest.TestCase):
 
     def start_submitting(self):
         with self.store.review_submission_lock():
-            self.store.begin_submit_intent(self.intent_id)
+            self.store.begin_submit_intent(self.intent_id, posting_actor=self.runner.actor)
 
     def state(self):
         return self.store.review_intent(self.intent_id)["state"]
@@ -1615,6 +1619,53 @@ class SubmitReview(unittest.TestCase):
         self.assertEqual((code, error), (0, ""))
         self.assertEqual(json.loads(output)["state"], "landed")
         self.assertEqual(len(self.runner.posts), 1)
+
+    def prepare_multiline_review(self):
+        self.comments["2"].update(start_line=11, start_side="RIGHT")
+        self.intent = self.store.prepare_review("COMMENT", "Summary", self.comments, replace=True)
+        self.intent_id = self.intent["intent_id"]
+        self.runner = ReviewRunner(self.store, self.intent_id)
+        self.runner.reviews = [[self.runner.response]]
+        self.start_submitting()
+
+    def test_reconciliation_lands_exact_multiline_range(self):
+        self.prepare_multiline_review()
+        code, output, error = self.invoke()
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output)["state"], "landed")
+        self.assertEqual(self.runner.posts, [])
+
+    def test_reconciliation_lands_outdated_multiline_range_using_original_coordinates(self):
+        self.prepare_multiline_review()
+        comment = self.runner.comments[17][1][0]
+        for field in ("line", "side", "start_line", "start_side"):
+            comment["original_" + field] = comment[field]
+            comment[field] = None
+        self.assertEqual(self.invoke()[0], 0)
+        self.assertEqual(self.state(), "landed")
+        self.assertEqual(self.runner.posts, [])
+
+    def test_reconciliation_refuses_missing_multiline_range(self):
+        self.prepare_multiline_review()
+        comment = self.runner.comments[17][1][0]
+        comment.pop("start_line")
+        comment.pop("start_side")
+        self.assertEqual(self.invoke()[0], 3)
+        self.assertEqual(self.state(), "submitting")
+        self.assertIsNone(self.store.review_intent(self.intent_id)["review_id"])
+        self.assertEqual(self.runner.posts, [])
+
+    def test_reconciliation_refuses_different_multiline_range(self):
+        self.prepare_multiline_review()
+        comment = self.runner.comments[17][1][0]
+        for changes in ({"start_line": 10}, {"start_side": "LEFT"}):
+            with self.subTest(changes=changes):
+                comment.update(start_line=11, start_side="RIGHT")
+                comment.update(changes)
+                self.assertEqual(self.invoke()[0], 3)
+                self.assertEqual(self.state(), "submitting")
+                self.assertIsNone(self.store.review_intent(self.intent_id)["review_id"])
+                self.assertEqual(self.runner.posts, [])
 
     def test_http_error_object_with_id_but_no_review_identity_is_uncertain_without_binding(self):
         self.runner.post_error = pr_snapshot.ReviewApiError(
@@ -2033,6 +2084,105 @@ class SubmitReview(unittest.TestCase):
         self.assertEqual(self.pending_beats(), [])
         self.assertEqual(len(self.runner.posts), 2)
 
+    def uncertain_post_then_switch_actor(self):
+        self.runner.actor = "account-A"
+        self.runner.response["user"]["login"] = "account-A"
+        self.runner.post_error = pr_snapshot.ReviewApiError("connection lost")
+        self.runner.on_post = lambda: setattr(
+            self.runner, "read_error", pr_snapshot.ReviewApiError("reconciliation unavailable")
+        )
+        self.assertEqual(self.invoke()[0], 3)
+        self.assertEqual(len(self.runner.posts), 1)
+        self.assertEqual(
+            session_store.SessionStore(self.root).review_intent(self.intent_id)["posting_actor"],
+            "account-A",
+        )
+        self.runner.actor = "account-B"
+        self.runner.read_error = None
+        self.runner.post_error = None
+        self.runner.on_post = None
+
+    def test_retry_after_account_switch_lands_original_actors_review_without_post(self):
+        self.uncertain_post_then_switch_actor()
+        self.runner.reviews = [[self.runner.response]]
+
+        code, output, error = self.invoke("--retry")
+
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output)["receipt"]["review_id"], 17)
+        self.assertEqual(self.state(), "landed")
+        self.assertEqual(len(self.runner.posts), 1)
+        self.assertEqual(self.pending_beats(), [])
+
+    def test_retry_after_account_switch_refuses_post_and_preserves_intent(self):
+        self.uncertain_post_then_switch_actor()
+        before = self.store.review_intent(self.intent_id)
+        self.runner.metadata["head"]["sha"] = "c" * 40
+        for reviews in ([[]], [[dict(self.runner.response, user={"login": "account-B"})]]):
+            with self.subTest(reviews=reviews):
+                self.runner.reviews = reviews
+                code, _output, error = self.invoke("--retry")
+                self.assertEqual(code, 1)
+                self.assertIn("posting actor account-A; current actor account-B cannot POST", error)
+                self.assertEqual(self.store.review_intent(self.intent_id), before)
+                self.assertEqual(len(self.runner.posts), 1)
+                self.assertEqual(self.pending_beats(), [1, 2])
+
+    def test_stored_review_reconciliation_after_account_switch_uses_posting_actor(self):
+        self.runner.actor = "account-A"
+        self.runner.response["user"]["login"] = "account-A"
+        self.runner.comments[17] = pr_snapshot.ReviewApiError("comments unavailable")
+        self.assertEqual(self.invoke()[0], 3)
+        self.assertEqual(self.store.review_intent(self.intent_id)["review_id"], 17)
+        self.runner.actor = "account-B"
+        self.runner.comments[17] = [[dict(comment) for comment in self.comments.values()]]
+
+        code, output, error = self.invoke("--retry")
+
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output)["state"], "landed")
+        self.assertEqual(len(self.runner.posts), 1)
+
+    def test_orphan_lookup_after_account_switch_uses_posting_actor(self):
+        self.runner.actor = "account-A"
+        self.runner.response["user"]["login"] = "account-A"
+        url = self.runner.response.pop("html_url")
+        self.assertEqual(self.invoke()[0], 3)
+        self.runner.actor = "account-B"
+        self.runner.response["html_url"] = url
+
+        code, output, error = self.invoke_command("orphan-review", "--reason", "cannot land")
+
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output)["review_url"], url)
+        self.assertEqual(json.loads(output)["review_url_source"], "fetched_review")
+        self.assertEqual(json.loads(output)["posting_actor"], "account-A")
+        self.assertEqual(len(self.runner.posts), 1)
+
+    def test_orphan_lookup_refuses_a_review_from_a_different_actor(self):
+        self.start_submitting()
+        self.store.bind_review_id(self.intent_id, 17)
+        self.runner.response["user"]["login"] = "someone-else"
+        code, output, error = self.invoke_command("orphan-review", "--reason", "cannot land")
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output)["review_url_source"], "derived")
+        self.assertEqual(
+            json.loads(output)["review_url"],
+            "https://github.com/acme/widget/pull/7#pullrequestreview-17",
+        )
+        self.assertEqual(self.runner.posts, [])
+
+    def test_retirement_after_account_switch_finds_original_actors_review(self):
+        self.uncertain_post_then_switch_actor()
+        self.runner.reviews = [[self.runner.response]]
+
+        code, output, error = self.invoke_command("retire-review")
+
+        self.assertEqual((code, error), (0, ""))
+        self.assertEqual(json.loads(output)["state"], "landed")
+        self.assertEqual(len(self.runner.posts), 1)
+        self.assertEqual(self.pending_beats(), [])
+
     def test_explicit_retry_reconciles_then_rechecks_before_posting(self):
         self.start_submitting()
 
@@ -2171,6 +2321,8 @@ class SubmitReview(unittest.TestCase):
         before = self.store.review_intent(self.intent_id)
         self.assertEqual(before["state"], "prepared")
         self.assertEqual(before["review_id"], 17)
+        self.assertEqual(before["posting_actor"], "REVIEWER")
+        self.runner.actor = "different-account"
         preview = (self.root / "review.fixed.json").read_bytes()
         for replace in (False, True):
             with self.subTest(replace=replace), self.assertRaisesRegex(
@@ -2274,7 +2426,7 @@ class SubmitReview(unittest.TestCase):
     def test_retire_waits_between_zero_match_reads_with_injected_sleep(self):
         self.start_submitting()
         events = []
-        self.runner.on_actor = lambda: events.append("read")
+        self.runner.on_read = lambda: events.append("read")
 
         def sleep(delay):
             events.append(("sleep", delay))
@@ -2327,7 +2479,7 @@ class SubmitReview(unittest.TestCase):
         self.start_submitting()
         self.runner.metadata["head"]["sha"] = "c" * 40
         self.runner.reviews = [[dict(self.runner.response, body="another intent")]]
-        self.runner.on_actor = lambda: self.assertEqual(self.invoke()[0], 1)
+        self.runner.on_read = lambda: self.assertEqual(self.invoke()[0], 1)
 
         code, output, error = self.invoke_command("retire-review")
 
@@ -2418,6 +2570,21 @@ class SubmitReview(unittest.TestCase):
         self.assertIsInstance(results[0], dict)
         self.assertEqual(self.state(), "landed")
         self.assertEqual(self.pending_beats(), [3])
+
+    def test_prepared_reconciliation_failure_exits_5_without_post_or_intent_change(self):
+        before = self.store.review_intent(self.intent_id)
+        self.runner.read_error = pr_snapshot.ReviewApiError("connection lost")
+
+        code, _output, error = self.invoke()
+
+        self.assertEqual(code, 5)
+        self.assertIn("could not check GitHub before posting", error)
+        self.assertIn("nothing posted; intent unchanged; rerun submit-review", error)
+        self.assertEqual(self.runner.posts, [])
+        self.assertEqual(self.store.review_intent(self.intent_id), before)
+        self.runner.read_error = None
+        self.assertEqual(self.invoke()[0], 0)
+        self.assertEqual(len(self.runner.posts), 1)
 
     def test_reconciliation_transport_failure_exits_3_without_posting(self):
         self.start_submitting()

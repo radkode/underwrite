@@ -1082,16 +1082,19 @@ $S/scripts/sessionctl.py submit-review "$R" --intent <intent-id>
 ```
 
 `submit-review` refuses changed preview bytes, runs `check-pr --require-open`, and durably
-marks the intent submitting before the POST. It verifies the frozen commit, marker,
-authenticated actor, event/state, the validated body including folded findings, and inline
-comment content. Only CRLF line endings and trailing body whitespace are normalized.
+marks the intent submitting before the POST, storing the posting actor in the same transition.
+It verifies the frozen commit, marker, stored actor, event/state, the validated body including
+folded findings, and inline comment content including multiline ranges. Only CRLF line endings
+and trailing body whitespace are normalized. Reconciliation uses the stored actor even after
+an account switch; a different current actor cannot POST (exit 1, naming both logins).
 A verified receipt lands exactly the intent's beats and adds one shared `lands[]` entry, atomically. Beats
 accepted later stay pending and need a separate approved intent. Never POST or land review
 beats by hand.
 
 Transport failures, 408, 429, 5xx, and 422 are uncertain. The command reconciles every page of
-reviews: one verified match lands, more than one is a conflict. Exit 3 leaves the intent
-submitting, not failed. Repeat the same `submit-review` command to read again; it does not
+reviews: one verified match lands, more than one is a conflict. Exit 3 means a POST may exist;
+the intent stays submitting or keeps its stored review id, not failed.
+Repeat the same `submit-review` command to read again; it does not
 POST again without `--retry`. Allow for API visibility and repeat the read before seeking
 explicit approval for `--retry`; retry only after reconciliation finds no review. A retry
 rechecks the open target. A stored review id is verified without reposting, even with
@@ -1102,6 +1105,8 @@ match as publication failure for every covered beat, preserving the accepted fin
 A retry after an uncertain attempt stays submitting even on 4xx.
 An unknown outcome must never be marked failed.
 
+Exit 5 means could not check GitHub before posting: nothing posted, intent unchanged; rerun
+`submit-review`. This is a prepared intent's pre-POST read failure, with no stored review id.
 Exit 4 means the target moved before POST: this invocation did not post, intent unchanged.
 For a submitting intent, an earlier POST may still surface. Stop and use
 `sessionctl.py retire-review "$R" --intent <intent-id>` before a supervised replacement.

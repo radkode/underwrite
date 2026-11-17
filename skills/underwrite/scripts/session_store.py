@@ -1106,6 +1106,7 @@ class SessionStore:
                 state TEXT NOT NULL
                     CHECK (state IN ('prepared', 'submitting', 'landed', 'failed', 'replaced', 'dismissed', 'retired', 'orphaned')),
                 review_id INTEGER UNIQUE,
+                posting_actor TEXT,
                 review_url TEXT,
                 review_url_source TEXT,
                 orphan_reason TEXT,
@@ -4347,13 +4348,14 @@ class SessionStore:
                 })
             review_intents = {}
             for row in db.execute(
-                "SELECT intent_id, state, review_url, orphan_reason, beats_json FROM review_intents "
+                "SELECT intent_id, state, review_id, review_url, orphan_reason, beats_json FROM review_intents "
                 "ORDER BY rowid"
             ):
                 for covered in json.loads(row["beats_json"]):
                     review_intents[covered["beat_n"]] = {
                         "intent_id": row["intent_id"],
                         "state": row["state"],
+                        "review_id": row["review_id"],
                         "review_url": row["review_url"],
                         "orphan_reason": row["orphan_reason"],
                     }
@@ -5220,6 +5222,7 @@ class SessionStore:
             "anchors_folded": folded,
             "anchor_report": report,
             "review_id": row["review_id"],
+            "posting_actor": row["posting_actor"],
             "review_url": row["review_url"],
             "review_url_source": row["review_url_source"],
             "orphan_reason": row["orphan_reason"],
@@ -5593,12 +5596,28 @@ class SessionStore:
             )
         return disk
 
-    def bind_review_id(self, intent_id, review_id, *, review_url=None):
+    def bind_review_id(self, intent_id, review_id, *, review_url=None, posting_actor=None):
         _positive(review_id, "review id")
+        if posting_actor is not None and (not isinstance(posting_actor, str) or not posting_actor.strip()):
+            raise StoreError("posting actor must be non-empty text")
         if review_url is not None and (not isinstance(review_url, str) or not review_url.strip()):
             raise StoreError("review_url must be non-empty text")
         with self._write() as db:
             intent = self._review_intent_row(db, intent_id)
+            before = db.total_changes
+            if posting_actor is not None:
+                posting_actor = posting_actor.strip()
+                if intent["posting_actor"] is not None:
+                    if intent["posting_actor"].casefold() != posting_actor.casefold():
+                        raise Conflict(
+                            f"review intent {intent_id} belongs to posting actor {intent['posting_actor']}; "
+                            f"current actor {posting_actor} cannot bind it"
+                        )
+                else:
+                    db.execute(
+                        "UPDATE review_intents SET posting_actor = ? WHERE intent_id = ?",
+                        (posting_actor, intent_id),
+                    )
             if intent["review_id"] is not None:
                 if intent["review_id"] != review_id:
                     raise Conflict(f"review intent {intent_id} already has review id {intent['review_id']}")
@@ -5619,12 +5638,22 @@ class SessionStore:
                     "UPDATE review_intents SET review_url = ?, review_url_source = 'review_object' "
                     "WHERE intent_id = ?", (review_url.strip(), intent_id),
                 )
+            if db.total_changes != before:
+                self._bump_render(db)
 
-    def begin_submit_intent(self, intent_id, *, retry=False, include_payload=False):
+    def begin_submit_intent(self, intent_id, *, posting_actor, retry=False, include_payload=False):
         if self._review_submission_owner != (os.getpid(), threading.get_ident()):
             raise StoreError("begin_submit_intent requires the review submission lock")
+        if not isinstance(posting_actor, str) or not posting_actor.strip():
+            raise StoreError("posting actor must be non-empty text")
+        posting_actor = posting_actor.strip()
         with self._write() as db:
             intent = self._review_intent_row(db, intent_id)
+            if intent["posting_actor"] is not None and intent["posting_actor"].casefold() != posting_actor.casefold():
+                raise Conflict(
+                    f"review intent {intent_id} belongs to posting actor {intent['posting_actor']}; "
+                    f"current actor {posting_actor} cannot POST"
+                )
             session, execution_policy = self._session_execution_policy(db)
             if self._expected_delivery_kind(session) != "review":
                 raise Conflict(
@@ -5663,9 +5692,9 @@ class SessionStore:
                     f"review intent {intent_id} is {intent['state']}, cannot submit"
                 )
             db.execute(
-                "UPDATE review_intents SET state = 'submitting', submitting_at = ? "
+                "UPDATE review_intents SET state = 'submitting', submitting_at = ?, posting_actor = ? "
                 "WHERE intent_id = ?",
-                (_now(), intent_id),
+                (_now(), posting_actor, intent_id),
             )
             self._bump_render(db)
             updated = self._review_intent_row(db, intent_id)

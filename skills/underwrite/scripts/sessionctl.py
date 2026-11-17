@@ -18,6 +18,7 @@ if str(HERE) not in sys.path:
 from session_store import DROP_REASONS, FLAG_STATES, SessionStore, StoreError  # noqa: E402
 from diff_lines import LOCATION_LINE, resolve_path  # noqa: E402
 from pr_snapshot import (  # noqa: E402
+    ReviewPrePostCheckFailed,
     ReviewSubmissionUncertain,
     ReviewTargetMovedBeforePost,
     TargetMoved,
@@ -403,7 +404,7 @@ def confine(args):
         value = getattr(args, name, None)
         if value is None or (
             value == "-"
-            and (name == "entry" or (name == "source" and args.command != "review-receipt"))
+            and (name in ("entry", "comments_file") or (name == "source" and args.command != "review-receipt"))
         ):
             continue
         target = Path(value).expanduser().resolve()
@@ -583,6 +584,9 @@ def main(argv=None, *, runner=gh_runner):
     except ReviewTargetMovedBeforePost as error:
         print(f"sessionctl: {error}", file=sys.stderr)
         return 4
+    except ReviewPrePostCheckFailed as error:
+        print(f"sessionctl: {error}", file=sys.stderr)
+        return 5
     except TargetMoved as error:
         print(f"sessionctl: {error}", file=sys.stderr)
         return 2

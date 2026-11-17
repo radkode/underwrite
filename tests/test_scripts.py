@@ -2043,7 +2043,7 @@ class RenderCli(unittest.TestCase):
 
         check_page("Review prepared, awaiting submission")
         with store.review_submission_lock():
-            store.begin_submit_intent(intent_id)
+            store.begin_submit_intent(intent_id, posting_actor="reviewer")
         check_page("Review submitting, outcome not yet verified")
         with store.review_submission_lock():
             store.retire_review_intent(
@@ -2067,6 +2067,53 @@ class RenderCli(unittest.TestCase):
         self.assertEqual(self.page().count("Included, review pending"), 1)
         self.assertEqual(self.page().count("Review dismissed, needs supervised handling"), 1)
 
+    def test_prepared_adoption_with_changed_content_renders_receipt_and_verify_or_orphan(self):
+        pr_snapshot = load("pr_snapshot")
+        store = self.frozen_store(state="open")
+        store.put_beat(beat(n=1, state="flag", where="a.ts:1"))
+        action = store.produce("include", 1, "accept", "Include it")
+        store.ack(action["seq"])
+        comment = {"path": "a.ts", "line": 1, "side": "RIGHT", "body": "Fix it."}
+        intent = store.prepare_review("COMMENT", "Summary", {"1": comment})
+        original = store.snapshot()[1][0]
+        store.put_beat(dict(original, claim="Changed before reconciliation"))
+        self.assertEqual(self.run_cli("--standalone").returncode, 0)
+        self.assertIn("Review prepared, awaiting submission", self.page())
+        revision = store.reconcile()["render_revision"]
+        url = "https://example.test/reviews/17?detail=<adopted>"
+        response = {
+            "id": 17, "commit_id": "b" * 40, "user": {"login": "reviewer"},
+            "body": "Summary\n\n" + store.review_marker(),
+            "state": "COMMENTED", "html_url": url,
+        }
+
+        def runner(command, stdin=None):
+            if command == ["gh", "api", "user", "--jq", ".login"]:
+                return b"reviewer\n"
+            if command == ["gh", "api", "--paginate", "--slurp", "repos/acme/widget/pulls/42/reviews"]:
+                return json.dumps([[response]]).encode()
+            if command == ["gh", "api", "--paginate", "--slurp", "repos/acme/widget/pulls/42/reviews/17/comments"]:
+                return json.dumps([[comment]]).encode()
+            self.fail(f"unexpected GitHub call: {command!r}")
+
+        with self.assertRaisesRegex(pr_snapshot.Conflict, "content changed"):
+            pr_snapshot.submit_review(store, intent["intent_id"], runner=runner)
+
+        self.assertGreater(store.reconcile()["render_revision"], revision)
+        projected = store.presentation_snapshot()[1][0]["delivery"]["review_intent"]
+        self.assertEqual(projected["state"], "prepared")
+        self.assertEqual(projected["review_id"], 17)
+        self.assertEqual(projected["review_url"], url)
+        rendered = self.run_cli("--standalone")
+        self.assertEqual(rendered.returncode, 0, rendered.stderr)
+        self.assertIn("Posted review found but not landed", self.page())
+        self.assertIn("https://example.test/reviews/17?detail=&lt;adopted&gt;", self.page())
+        self.assertIn("Use submit-review to verify or supervised orphan-review if it cannot land.", self.page())
+        self.assertIn("Do not repost.", self.page())
+        self.assertNotIn("awaiting submission", self.page())
+        self.assertNotIn("landed", store.snapshot()[1][0])
+        self.assertEqual(self.run_cli("--final").returncode, 2)
+
     def test_failed_replacement_review_renders_failure_instead_of_older_retirement(self):
         store = self.frozen_store(state="open")
         store.put_beat(beat(n=1, state="flag", where="a.ts:1"))
@@ -2078,7 +2125,7 @@ class RenderCli(unittest.TestCase):
             store.retire_review_intent(first["intent_id"])
         replacement = store.prepare_review("COMMENT", "Replacement summary", comments)
         with store.review_submission_lock():
-            store.begin_submit_intent(replacement["intent_id"])
+            store.begin_submit_intent(replacement["intent_id"], posting_actor="reviewer")
         store.fail_intent(replacement["intent_id"], "HTTP 403: publication refused <reason>")
 
         delivery = store.presentation_snapshot()[1][0]["delivery"]

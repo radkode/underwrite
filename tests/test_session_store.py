@@ -4868,7 +4868,7 @@ class ReviewIntents(unittest.TestCase):
             "COMMENT", "Summary", {"1": self.comment(), "2": self.comment(line=12)}
         )
         with self.store.review_submission_lock():
-            self.store.begin_submit_intent(prepared["intent_id"])
+            self.store.begin_submit_intent(prepared["intent_id"], posting_actor="reviewer")
         return prepared["intent_id"]
 
     def test_begin_submit_intent_requires_submission_lock_even_on_retry(self):
@@ -4876,15 +4876,40 @@ class ReviewIntents(unittest.TestCase):
         prepared = self.store.prepare_review("COMMENT", "Summary", {"1": self.comment()})
         intent_id = prepared["intent_id"]
         with self.assertRaisesRegex(session_store.StoreError, "requires the review submission lock"):
-            self.store.begin_submit_intent(intent_id)
+            self.store.begin_submit_intent(intent_id, posting_actor="reviewer")
         self.assertEqual(self.store.review_intent(intent_id)["state"], "prepared")
         with self.store.review_submission_lock():
-            self.store.begin_submit_intent(intent_id)
+            self.store.begin_submit_intent(intent_id, posting_actor="reviewer")
         with self.assertRaisesRegex(session_store.StoreError, "requires the review submission lock"):
-            self.store.begin_submit_intent(intent_id, retry=True)
+            self.store.begin_submit_intent(intent_id, posting_actor="reviewer", retry=True)
         with self.store.review_submission_lock():
-            retry = self.store.begin_submit_intent(intent_id, retry=True)
+            retry = self.store.begin_submit_intent(intent_id, posting_actor="REVIEWER", retry=True)
         self.assertEqual(retry["state"], "submitting")
+        self.assertEqual(retry["posting_actor"], "reviewer")
+
+    def test_begin_submit_persists_actor_and_refuses_account_switch_on_retry(self):
+        self.accept(1)
+        prepared = self.store.prepare_review("COMMENT", "Summary", {"1": self.comment()})
+        intent_id = prepared["intent_id"]
+        self.assertIsNone(prepared["posting_actor"])
+        before = self.store.review_intent(intent_id)
+        with self.store.review_submission_lock():
+            for actor in (None, "", " "):
+                with self.subTest(actor=actor), self.assertRaisesRegex(
+                    session_store.StoreError, "posting actor must be non-empty"
+                ):
+                    self.store.begin_submit_intent(intent_id, posting_actor=actor)
+            self.assertEqual(self.store.review_intent(intent_id), before)
+            self.store.begin_submit_intent(intent_id, posting_actor="account-A")
+        reopened = session_store.SessionStore(self.root)
+        before = reopened.review_intent(intent_id)
+        self.assertEqual(before["state"], "submitting")
+        self.assertEqual(before["posting_actor"], "account-A")
+        with reopened.review_submission_lock(), self.assertRaisesRegex(
+            session_store.Conflict, "posting actor account-A; current actor account-B cannot POST"
+        ):
+            reopened.begin_submit_intent(intent_id, posting_actor="account-B", retry=True)
+        self.assertEqual(reopened.review_intent(intent_id), before)
 
     def test_begin_submit_intent_refuses_changed_pins_including_retry(self):
         self.accept(1)
@@ -4896,13 +4921,13 @@ class ReviewIntents(unittest.TestCase):
                 if retry:
                     self.store.put_beat(original)
                     with self.store.review_submission_lock():
-                        self.store.begin_submit_intent(intent_id)
+                        self.store.begin_submit_intent(intent_id, posting_actor="reviewer")
                 self.store.put_beat(dict(original, claim="rewritten finding"))
                 before = self.store.review_intent(intent_id)
                 with self.store.review_submission_lock(), self.assertRaisesRegex(
                     session_store.Conflict, "content changed since review intent"
                 ):
-                    self.store.begin_submit_intent(intent_id, retry=retry)
+                    self.store.begin_submit_intent(intent_id, posting_actor="reviewer", retry=retry)
                 self.assertEqual(self.store.review_intent(intent_id), before)
 
     def test_begin_submit_intent_refuses_beat_no_longer_accepted(self):
@@ -4918,7 +4943,7 @@ class ReviewIntents(unittest.TestCase):
         with self.store.review_submission_lock(), self.assertRaisesRegex(
             session_store.Conflict, "beat 2 is decided, not accepted"
         ):
-            self.store.begin_submit_intent(intent_id, retry=True)
+            self.store.begin_submit_intent(intent_id, posting_actor="reviewer", retry=True)
         self.assertEqual(self.store.review_intent(intent_id), before)
 
     def test_prepare_review_with_stored_id_allows_only_identical_replay(self):
@@ -5046,7 +5071,7 @@ class ReviewIntents(unittest.TestCase):
             reopened.review_submission_lock(),
             self.assertRaisesRegex(session_store.Conflict, "verify that review without reposting"),
         ):
-            reopened.begin_submit_intent(first["intent_id"], retry=True)
+            reopened.begin_submit_intent(first["intent_id"], posting_actor="reviewer", retry=True)
         reopened.land_intent(first["intent_id"], "https://example.test/reviews/17")
         self.accept(2)
         second = self.store.prepare_review("COMMENT", "Second", {"2": self.comment(line=12)})
@@ -5249,7 +5274,7 @@ class ReviewIntents(unittest.TestCase):
         self.accept(1)
         prepared = self.store.prepare_review("COMMENT", "Summary", {"1": self.comment()})
         with self.store.review_submission_lock():
-            self.store.begin_submit_intent(prepared["intent_id"])
+            self.store.begin_submit_intent(prepared["intent_id"], posting_actor="reviewer")
         preview = self.root / "review.fixed.json"
         payload = preview.read_bytes()
         for changed in (False, True):

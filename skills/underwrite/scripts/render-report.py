@@ -791,9 +791,19 @@ def delivery_html(beat, mode, replacement=False, untrusted_pr=False):
             "orphaned": "Posted review could not be landed, needs supervised handling",
             "retired": "Review intent retired, delivery still owed",
         }
-        label = labels.get(str(intent.get("state", "")))
+        bound_prepared = intent.get("state") == "prepared" and intent.get("review_id") is not None
+        label = (
+            "Posted review found but not landed"
+            if bound_prepared else labels.get(str(intent.get("state", "")))
+        )
         if label:
             detail = ""
+            if bound_prepared:
+                detail = (
+                    f'<span class="delivery-error">{md(intent.get("review_url") or "")} '
+                    "Use submit-review to verify or supervised orphan-review if it cannot land. "
+                    "Do not repost.</span>"
+                )
             if intent.get("state") in ("dismissed", "orphaned"):
                 detail = (
                     f'<span class="delivery-error">{md(intent.get("review_url", ""))} '

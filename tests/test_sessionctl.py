@@ -471,6 +471,27 @@ class TargetCommands(SessionCtlCase):
         ])
         self.assertEqual(self.store().review_intent(result["intent_id"])["state"], "prepared")
 
+    def test_confined_prepare_review_accepts_stdin_comments_from_outside_cwd(self):
+        args = self.review_inputs()
+        comments = (self.root / "comments.json").read_text(encoding="utf-8")
+        args[args.index("--comments-file") + 1] = "-"
+        env = dict(os.environ, UNDERWRITE_CONFINE=str(self.root))
+        with tempfile.TemporaryDirectory() as outside:
+            completed = subprocess.run(
+                [sys.executable, str(SESSIONCTL), *map(str, args)],
+                input=comments, text=True, capture_output=True, env=env, cwd=outside,
+            )
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["state"], "prepared")
+        self.assertEqual([item["beat_n"] for item in result["beats"]], [1, 2])
+        self.assertEqual(result["comment_count"], 1)
+        payload = json.loads((self.root / "review.fixed.json").read_bytes())
+        self.assertEqual(payload["comments"], [
+            {"path": "a.py", "line": 1, "side": "RIGHT", "body": "Snap it."}
+        ])
+        self.assertIn("Fold it.", payload["body"])
+
     def test_prepare_review_missing_beat_exits_one_without_an_intent(self):
         args = self.review_inputs()
         comments = self.root / "comments.json"
