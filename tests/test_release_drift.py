@@ -3,7 +3,7 @@
 
 The threshold is the whole design, so most of this replays the detector over this
 repo's own history: it has to fire on the five cycles that shipped behavior no
-install could reach, and stay silent on the nine that did not.
+install could reach, and stay silent on the ten that did not.
 """
 import importlib.util
 import json
@@ -159,7 +159,7 @@ class Synthetic(unittest.TestCase):
 
 # The last release this replay knows about. Pinned so the next bump extends the corpus
 # deliberately instead of reddening main; move it forward together with EXPECTED.
-HISTORY_END = "29da0b3fde9b2f763af4a3c215e285b3d3c3cb36"
+HISTORY_END = "2ea5ab05855822a28727049a60053be41252f811"
 
 
 def has_commit(sha):
@@ -190,6 +190,7 @@ class OverThisRepoHistory(unittest.TestCase):
         "0.7.0": True,
         "0.8.0": False,
         "0.8.1": True,
+        "0.9.0": False,
     }
 
     def releases(self):
