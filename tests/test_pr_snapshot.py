@@ -2227,6 +2227,23 @@ class SubmitReview(unittest.TestCase):
         self.assertEqual(self.runner.posts, [])
         self.assertEqual(self.pending_beats(), [1, 2])
 
+    def test_multiple_identity_matches_after_lost_post_response_are_a_conflict(self):
+        self.runner.post_error = pr_snapshot.ReviewApiError("connection lost")
+        matches = [[self.runner.response], [dict(
+            self.runner.response, id=18, body="Edited\n\n" + self.store.review_marker()
+        )]]
+        self.runner.on_post = lambda: setattr(self.runner, "reviews", matches)
+
+        code, _output, error = self.invoke()
+
+        self.assertEqual(code, 1)
+        self.assertIn("found 2", error)
+        self.assertEqual(self.state(), "submitting")
+        self.assertIsNone(self.store.review_intent(self.intent_id)["review_id"])
+        self.assertEqual(self.invoke("--retry")[0], 1)
+        self.assertEqual(self.invoke_command("retire-review")[0], 1)
+        self.assertEqual(len(self.runner.posts), 1)
+
     def test_dismissed_response_records_receipt_without_landing(self):
         self.runner.response["state"] = "DISMISSED"
         self.runner.comments[17] = pr_snapshot.ReviewApiError("comments unavailable")

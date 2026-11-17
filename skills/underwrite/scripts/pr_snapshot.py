@@ -1889,6 +1889,10 @@ def _submit_review(store, intent_id, *, retry, runner, api):
                 store, runner, target, marker, actor, intent, bound_review_ids=bound_review_ids
             )
         except StoreError as reconcile_error:
+            if isinstance(reconcile_error, Conflict) and not isinstance(
+                reconcile_error, ReviewSubmissionUncertain
+            ):
+                raise
             raise ReviewSubmissionUncertain(
                 f"review POST outcome is unknown ({post_error}) and reconciliation "
                 f"failed ({reconcile_error}); repeat submit-review to reconcile before "
