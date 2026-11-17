@@ -1827,7 +1827,15 @@ def _submit_review(store, intent_id, *, retry, runner, api):
     replacement_reason = store.replacement_reason()
     if replacement_reason:
         raise Conflict(replacement_reason + "; start a supervised replacement session")
-    current_actor = _runner_actor(runner)
+    try:
+        current_actor = _runner_actor(runner)
+    except StoreError as error:
+        if state != "prepared" or intent["review_id"] is not None or isinstance(error, Conflict):
+            raise
+        raise ReviewPrePostCheckFailed(
+            f"could not check GitHub before posting ({error}); nothing posted; "
+            "intent unchanged; rerun submit-review"
+        ) from error
     actor = intent["posting_actor"] or current_actor
     marker = store.review_marker()
     bound_review_ids = {
@@ -1868,6 +1876,13 @@ def _submit_review(store, intent_id, *, retry, runner, api):
     except TargetMoved as error:
         raise ReviewTargetMovedBeforePost(
             f"target moved before POST; this invocation did not post, intent unchanged: {error}"
+        ) from error
+    except StoreError as error:
+        if state != "prepared" or intent["review_id"] is not None or isinstance(error, Conflict):
+            raise
+        raise ReviewPrePostCheckFailed(
+            f"could not check GitHub before posting ({error}); nothing posted; "
+            "intent unchanged; rerun submit-review"
         ) from error
     intent = store.begin_submit_intent(
         intent_id, posting_actor=current_actor, retry=state == "submitting" and retry, include_payload=True
