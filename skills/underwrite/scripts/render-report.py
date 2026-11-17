@@ -782,6 +782,39 @@ def delivery_html(beat, mode, replacement=False, untrusted_pr=False):
             '<span class="lbl">Blocked, replacement required</span>'
             f'{" ".join(detail)}</div>'
         )
+    intent = delivery.get("review_intent")
+    if mode == "review" and state in ("pending", "failed") and isinstance(intent, dict):
+        labels = {
+            "prepared": "Review prepared, awaiting submission",
+            "submitting": "Review submitting, outcome not yet verified",
+            "dismissed": "Review dismissed, needs supervised handling",
+            "orphaned": "Posted review could not be landed, needs supervised handling",
+            "retired": "Review intent retired, delivery still owed",
+        }
+        bound_prepared = intent.get("state") == "prepared" and intent.get("review_id") is not None
+        label = (
+            "Posted review found but not landed"
+            if bound_prepared else labels.get(str(intent.get("state", "")))
+        )
+        if label:
+            detail = ""
+            if bound_prepared:
+                detail = (
+                    f'<span class="delivery-error">{md(intent.get("review_url") or "")} '
+                    "Use submit-review to verify or supervised orphan-review if it cannot land. "
+                    "Do not repost.</span>"
+                )
+            if intent.get("state") in ("dismissed", "orphaned"):
+                detail = (
+                    f'<span class="delivery-error">{md(intent.get("review_url", ""))} '
+                    "Do not retry or repost.</span>"
+                )
+            if intent.get("state") == "orphaned" and intent.get("orphan_reason"):
+                detail += f'<span class="delivery-error">Reason: {md(intent["orphan_reason"])}</span>'
+            return (
+                '<div class="call delivery pending">'
+                f'<span class="lbl">{label}</span>{detail}</div>'
+            )
     if state == "pending":
         label = {
             "branch": "Implementation pending",
@@ -1369,6 +1402,15 @@ def assessment(session, beats, problems_by_n, validation_problems=(), walking=Fa
         limits.append(f"{unverified} item{'s' if unverified != 1 else ''} unverified.")
     if problems_by_n or validation_problems:
         limits.append("The report has validation problems; resolve them before relying on it.")
+    if session.get("review_intents") or (
+        session_mode(session) == "review" and any(
+            beat.get("state") == "accepted"
+            and isinstance(beat.get("delivery"), dict)
+            and beat["delivery"].get("state") in ("pending", "failed")
+            for beat in beats
+        )
+    ):
+        limits.append("A review delivery is still outstanding. Resolve the outstanding GitHub reviews.")
     owed = sum(beat.get("state") == "flag" for beat in beats)
     if limits:
         label = "Provisional recommendation"
@@ -1440,6 +1482,49 @@ def assessment_html(
     )
 
 
+def review_intents_html(session):
+    intents = session.get("review_intents") or []
+    if not intents:
+        return ""
+    rows = []
+    for intent in intents:
+        state = intent["state"]
+        if state in ("dismissed", "orphaned"):
+            guidance = "Stop for supervised handling. Do not retry or repost."
+        elif state in ("failed", "retired"):
+            guidance = "Review delivery is still owed. Prepare and preview a replacement for approval."
+        else:
+            guidance = (
+                "Use submit-review to verify before any retry; do not repost while a matching "
+                "review exists. "
+            )
+            if intent.get("review_id") is not None:
+                guidance += "Use supervised orphan-review if it cannot land."
+            else:
+                guidance += "Use retire-review before a supervised replacement; it requires reconciliation if submitting."
+        covered = ", ".join(str(item["beat_n"]) for item in intent["beats"]) or "none"
+        detail = (
+            f'<span class="delivery-owed">Covered beats: {md(covered)}. {guidance}</span>'
+        )
+        if intent.get("review_id") is not None:
+            detail += f'<span>Stored review id: {md(intent["review_id"])}</span>'
+        if intent.get("review_url"):
+            detail += f'<span class="delivery-error">{md(intent["review_url"])}</span>'
+        if intent.get("orphan_reason") or intent.get("failure"):
+            reason = intent.get("orphan_reason") or intent["failure"]
+            detail += f'<span class="delivery-error">Reason: {md(reason)}</span>'
+        rows.append(
+            '<div class="call delivery pending">'
+            f'<span class="lbl">{md(intent["event"])} review: {md(state)}</span>'
+            f'<span>Intent: <code>{md(intent["intent_id"])}</code></span>{detail}</div>'
+        )
+    return (
+        '<section class="sec"><div class="sec-head"><h2>Outstanding GitHub reviews</h2>'
+        '<span class="hint">Delivery is unresolved, including reviews with no findings.</span>'
+        f'</div>{"".join(rows)}</section>'
+    )
+
+
 def body_html(
     session, beats, problems_by_n, live=False, phase=None, paths=(),
     validation_problems=(),
@@ -1482,6 +1567,7 @@ def body_html(
     ledger = [b for b in beats if b is not current]
 
     parts.append(coverage_html(session, beats))
+    parts.append(review_intents_html(session))
 
     counts = {}
     for beat in beats:
@@ -1786,6 +1872,12 @@ def load(root, css_path, final=False):
                 and beat.get("landed")
             ):
                 beat.setdefault("delivery_kind", expected_delivery)
+    if final:
+        for intent in session.get("review_intents") or []:
+            problems.append(
+                f"review intent {intent['intent_id']} is {intent['state']}; "
+                "review delivery is unresolved"
+            )
     for beat in beats:
         found = validate(beat, mode, final)
         if found:
@@ -1828,7 +1920,7 @@ def main():
     ap.add_argument(
         "--final",
         action="store_true",
-        help="require every accepted beat to have its audience outcome",
+        help="require every accepted beat and outstanding review intent to have its audience outcome",
     )
     args = ap.parse_args()
 

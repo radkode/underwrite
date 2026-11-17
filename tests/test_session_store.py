@@ -407,7 +407,7 @@ class QuestionMigration(StoreCase):
 
         self.store = session_store.SessionStore(self.root)
 
-        self.assertEqual(self.database_state()[0], 8)
+        self.assertEqual(self.database_state()[0], 9)
         self.assertEqual(self.database_state()[2], actions)
         self.assertEqual(self.store.snapshot(), before)
         self.assertEqual(self.store.head(), pending)
@@ -438,7 +438,7 @@ class QuestionMigration(StoreCase):
         self.assertEqual(self.database_state(), before)
         restored = session_store.SessionStore(self.root)
         self.assertEqual(restored.head()["note"], "Reviewer words.")
-        self.assertEqual(self.database_state()[0], 8)
+        self.assertEqual(self.database_state()[0], 9)
 
     def test_v6_migration_rejects_orphaned_references_without_advancing_version(self):
         self.downgrade(self.store)
@@ -1328,10 +1328,13 @@ class FrozenTargets(unittest.TestCase):
         accepted = self.store.produce("accept-1", 1, "accept", "include it")
         self.assertEqual(self.store.ack(accepted["seq"]), {"handled_seq": 1})
         self.assertTrue(self.store.delivery_state()["recovery"])
-        landed = self.store.land(
-            accepted["seq"], 1, "https://example.test/review/1", "review"
+        intent = self.store.prepare_review("COMMENT", "Summary", {
+            "1": {"path": "a.py", "line": 1, "side": "RIGHT", "body": "Pin it."}
+        })
+        landed = self.store.land_intent(
+            intent["intent_id"], "https://example.test/review/1"
         )
-        self.assertEqual(landed["kind"], "review")
+        self.assertEqual(landed["deliveries"][0]["kind"], "review")
         self.assertFalse(self.store.delivery_state()["recovery"])
         session = self.store.snapshot()[0]
         self.assertEqual(session["audience"]["mode"], "review")
@@ -2120,7 +2123,7 @@ class CreatingAndMigrating(StoreCase):
 
     def test_the_database_and_export_format_are_versioned(self):
         with connected(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 8)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 9)
             self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "delete")
         db = self.store._connect()
         try:
@@ -2140,7 +2143,7 @@ class CreatingAndMigrating(StoreCase):
 
         self.assertNotIn("execution_policy", upgraded.snapshot()[0])
         with connected(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 8)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 9)
 
     def test_the_session_identity_survives_restart_but_not_recreation(self):
         first = self.store.delivery_state()["session_id"]
@@ -2165,7 +2168,7 @@ class CreatingAndMigrating(StoreCase):
         self.assertEqual(upgraded.head()["action_id"], action["action_id"])
         self.assertTrue(upgraded.delivery_state()["session_id"])
         with connected(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 8)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 9)
             columns = {row[1] for row in db.execute("PRAGMA table_info(session)")}
         self.assertIn("session_id", columns)
 
@@ -2187,7 +2190,7 @@ class CreatingAndMigrating(StoreCase):
         failed = upgraded.presentation_snapshot()[1][0]["delivery"]
         self.assertEqual(failed["owed"], "retry with the fixture")
         with connected(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 8)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 9)
 
     def test_a_v2_upgrade_strips_a_failure_injected_fix_written_in_upper_case(self):
         """The restore reads the six lowercase keys, so the slot repair has to run before
@@ -2351,7 +2354,7 @@ class CreatingAndMigrating(StoreCase):
 
         self.assertEqual({path: path.stat().st_mtime_ns for path in derived}, before)
         with connected(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 8)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 9)
 
     def test_a_current_session_opens_in_a_directory_it_cannot_write(self):
         """Reading a published review out of a directory someone locked down."""
@@ -2476,14 +2479,85 @@ class CreatingAndMigrating(StoreCase):
         (self.root / "session.sqlite3").unlink()
         with connected(str(self.root / "session.sqlite3")) as db:
             self.assertEqual(db.execute("PRAGMA journal_mode = WAL").fetchone()[0], "wal")
-            db.execute("PRAGMA user_version = 9")
+            db.execute("PRAGMA user_version = 10")
 
         with self.assertRaisesRegex(session_store.StoreError, "newer than supported"):
             session_store.SessionStore(self.root)
 
         with connected(str(self.root / "session.sqlite3")) as db:
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 9)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 10)
             self.assertEqual(db.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+
+    def test_v8_database_upgrades_with_review_intents_table_and_keeps_data(self):
+        action = self.store.produce("click-1", 1, "accept", "yes")
+        before_snapshot = self.store.snapshot()
+        before_reconcile = self.store.reconcile()
+        with connected(str(self.root / "session.sqlite3")) as db:
+            db.execute("DROP TABLE review_intents")
+            db.execute("PRAGMA user_version = 8")
+
+        upgraded = session_store.SessionStore(self.root)
+
+        self.assertEqual(upgraded.snapshot(), before_snapshot)
+        self.assertEqual(upgraded.reconcile(), before_reconcile)
+        self.assertEqual(upgraded.head()["seq"], action["seq"])
+        with connected(str(self.root / "session.sqlite3")) as db:
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 9)
+            tables = {
+                row[0]
+                for row in db.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+            columns = {row[1] for row in db.execute("PRAGMA table_info(review_intents)")}
+            self.assertIn("review_id", columns)
+            self.assertIn("dismissed_at", columns)
+            self.assertIn("retired_at", columns)
+            self.assertIn("retirement_reconciliation_json", columns)
+            for column in ("orphan_reason", "orphaned_at", "review_url_source"):
+                self.assertIn(column, columns)
+            payload = b'{"comments": []}'
+            db.execute(
+                "INSERT INTO review_intents "
+                "(intent_id, event, payload, payload_sha256, beats_json, report_json, "
+                "state, review_id, review_url, created_at, dismissed_at) "
+                "VALUES (?, 'COMMENT', ?, ?, '[]', '[]', 'dismissed', 17, ?, ?, ?)",
+                ("c" * 64, payload, hashlib.sha256(payload).hexdigest(),
+                 "https://example.test/reviews/17", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"),
+            )
+            db.execute(
+                "INSERT INTO review_intents "
+                "(intent_id, event, payload, payload_sha256, beats_json, report_json, "
+                "state, created_at, retired_at, retirement_reconciliation_json) "
+                "VALUES (?, 'COMMENT', ?, ?, '[]', '[]', 'retired', ?, ?, ?)",
+                ("d" * 64, payload, hashlib.sha256(payload).hexdigest(),
+                 "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z",
+                 json.dumps({"candidates_examined": 2, "reconciled_at": "2026-01-02T00:00:00Z"})),
+            )
+            db.execute(
+                "INSERT INTO review_intents "
+                "(intent_id, event, payload, payload_sha256, beats_json, report_json, "
+                "state, review_id, review_url, review_url_source, orphan_reason, created_at, orphaned_at) "
+                "VALUES (?, 'COMMENT', ?, ?, '[]', '[]', 'orphaned', 18, ?, 'review_object', ?, ?, ?)",
+                ("e" * 64, payload, hashlib.sha256(payload).hexdigest(),
+                 "https://example.test/reviews/18", "cannot land", "2026-01-01T00:00:00Z", "2026-01-02T00:00:00Z"),
+            )
+        orphaned = upgraded.review_intent("e" * 64)
+        self.assertEqual(orphaned["state"], "orphaned")
+        self.assertEqual(orphaned["orphan_reason"], "cannot land")
+        self.assertEqual(orphaned["orphaned_at"], "2026-01-02T00:00:00Z")
+        self.assertEqual(orphaned["review_url_source"], "review_object")
+        self.assertIn("review_intents", tables)
+        dismissed = upgraded.review_intent("c" * 64)
+        self.assertEqual(dismissed["state"], "dismissed")
+        self.assertEqual(dismissed["review_id"], 17)
+        self.assertEqual(dismissed["dismissed_at"], "2026-01-02T00:00:00Z")
+        retired = upgraded.review_intent("d" * 64)
+        self.assertEqual(retired["state"], "retired")
+        self.assertEqual(retired["retired_at"], "2026-01-02T00:00:00Z")
+        self.assertEqual(retired["retirement_reconciliation"], {
+            "candidates_examined": 2, "reconciled_at": "2026-01-02T00:00:00Z",
+        })
 
     def test_legacy_actions_without_an_ack_migrate_as_handled(self):
         (self.root / "session.sqlite3").unlink()
@@ -3444,7 +3518,8 @@ class RecoveringAndDelivering(StoreCase):
         raw_session, raw_beats = self.store.snapshot()
         presented_session, presented_beats = self.store.presentation_snapshot()
 
-        self.assertEqual(presented_session, raw_session)
+        self.assertEqual(presented_session, {**raw_session, "review_intents": []})
+        self.assertNotIn("review_intents", raw_session)
         self.assertNotIn("delivery", raw_beats[0])
         self.assertEqual(presented_beats[0]["delivery"], {"state": "none"})
 
@@ -4025,6 +4100,29 @@ class LinkedImplementations(unittest.TestCase):
             )
             self.assertEqual(db.execute("SELECT * FROM beats WHERE n = 1").fetchone(), beat_before)
 
+    def test_v8_linked_child_upgrades_on_create_replay_and_link_completion(self):
+        link = self.authorize()
+        created = self.source.create_linked_implementation(link["link_id"])
+        database = Path(created["child_root"]) / "session.sqlite3"
+        for operation in ("create", "complete"):
+            with self.subTest(operation=operation):
+                with connected(str(database)) as db:
+                    db.execute("PRAGMA user_version = 8")
+                if operation == "create":
+                    self.assertEqual(
+                        self.source.create_linked_implementation(link["link_id"]), created
+                    )
+                else:
+                    ready = self.source.complete_implementation_link(
+                        link["link_id"], created["child_session_id"]
+                    )
+                    self.assertEqual(ready["state"], "ready")
+                with connected(str(database)) as db:
+                    self.assertEqual(
+                        db.execute("PRAGMA user_version").fetchone()[0],
+                        session_store.DB_SCHEMA_VERSION,
+                    )
+
     def test_create_is_recoverable_and_seeds_one_immutable_gateway_child(self):
         link = self.authorize()
         with connected(str(self.source_root / "session.sqlite3")) as db:
@@ -4460,7 +4558,10 @@ class LinkedImplementations(unittest.TestCase):
         created = self.source.create_linked_implementation(link["link_id"])
         store = session_store.SessionStore(self.source_root)
         store.produce("note-1", 1, "note", "worth doing first")
-        store.land(self.source_action, 1, "review-url", "review")
+        intent = store.prepare_review("COMMENT", "Summary", {
+            "1": {"path": "a.py", "line": 1, "side": "RIGHT", "body": "Pin it."}
+        })
+        store.land_intent(intent["intent_id"], "review-url")
 
         resumed = store.authorize_implementation(
             self.source_action, 1, "reviewer", "implement this finding"
@@ -4543,7 +4644,10 @@ class LinkedImplementations(unittest.TestCase):
         """Nothing about an authorization may stand between a review and its PR."""
         _child, link, _created = self.create_child()
 
-        landed = self.source.land(self.source_action, 1, "review-url", "review")
+        intent = self.source.prepare_review("COMMENT", "Summary", {
+            "1": {"path": "a.py", "line": 1, "side": "RIGHT", "body": "Pin it."}
+        })
+        landed = self.source.land_intent(intent["intent_id"], "review-url")
 
         self.assertEqual(landed["state"], "landed")
         self.assertEqual(self.source.implementation_link(link["link_id"])["state"], "ready")
@@ -4566,7 +4670,7 @@ class LinkedImplementations(unittest.TestCase):
                     "SELECT name FROM sqlite_master WHERE type = 'table'"
                 )
             }
-            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 8)
+            self.assertEqual(db.execute("PRAGMA user_version").fetchone()[0], 9)
         self.assertIn("implementation_links", names)
         self.assertIn("implementation_attempts", names)
 
@@ -4704,6 +4808,861 @@ class SecondRead(StoreCase):
         with self.assertRaisesRegex(session_store.StoreError, "demotes the flag"):
             self.store.put_beat(self.demoted(second_read=self.DISPUTED))
         self.assertEqual(self.beat(3)["state"], "flag")
+
+
+class ReviewIntents(unittest.TestCase):
+    DIFF = (
+        "diff --git a/a.py b/a.py\n--- a/a.py\n+++ b/a.py\n"
+        "@@ -10,2 +10,3 @@\n ctx\n+line eleven\n+line twelve\n"
+    )
+
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.root, True)
+        self.store = session_store.SessionStore(self.root, create=True)
+        target = {
+            "version": 1,
+            "kind": "github_pr",
+            "repo": "acme/widget",
+            "number": 7,
+            "state": "open",
+            "merged_at": None,
+            "base_sha": "a" * 40,
+            "head_sha": "b" * 40,
+            "head_repo_id": 123,
+            "head_repo": "acme/widget",
+            "head_ref": "feature",
+            "merge_base_sha": "e" * 40,
+            "changed_files": 1,
+        }
+        diff = self.root / "source.diff"
+        metadata = self.root / "source.json"
+        context = self.root / "source-context.json"
+        diff.write_bytes(self.DIFF.encode("utf-8"))
+        metadata.write_text(json.dumps({"number": 7}), encoding="utf-8")
+        context.write_text(
+            json.dumps(
+                {"version": 1, "base_sha": target["base_sha"], "files": []},
+                separators=(",", ":"),
+                sort_keys=True,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        self.target = self.store.freeze_target(target, diff, metadata, context)
+        self.store.freeze_execution("no_exec")
+        self.store.put_beat(dict(FLAG, n=1, where="a.py:11", claim="first finding"))
+        self.store.put_beat(dict(FLAG, n=2, where="a.py:12", claim="second finding"))
+
+    def accept(self, n):
+        action = self.store.produce(f"accept-{n}", n, "accept", f"yes {n}")
+        self.store.ack(action["seq"])
+        return action
+
+    def comment(self, line=11, path="a.py", body="Fix this."):
+        return {"path": path, "line": line, "side": "RIGHT", "body": body}
+
+    def prepare_two_and_start(self):
+        self.accept(1)
+        self.accept(2)
+        prepared = self.store.prepare_review(
+            "COMMENT", "Summary", {"1": self.comment(), "2": self.comment(line=12)}
+        )
+        with self.store.review_submission_lock():
+            self.store.begin_submit_intent(prepared["intent_id"], posting_actor="reviewer")
+        return prepared["intent_id"]
+
+    def test_begin_submit_intent_requires_submission_lock_even_on_retry(self):
+        self.accept(1)
+        prepared = self.store.prepare_review("COMMENT", "Summary", {"1": self.comment()})
+        intent_id = prepared["intent_id"]
+        with self.assertRaisesRegex(session_store.StoreError, "requires the review submission lock"):
+            self.store.begin_submit_intent(intent_id, posting_actor="reviewer")
+        self.assertEqual(self.store.review_intent(intent_id)["state"], "prepared")
+        with self.store.review_submission_lock():
+            self.store.begin_submit_intent(intent_id, posting_actor="reviewer")
+        with self.assertRaisesRegex(session_store.StoreError, "requires the review submission lock"):
+            self.store.begin_submit_intent(intent_id, posting_actor="reviewer", retry=True)
+        with self.store.review_submission_lock():
+            retry = self.store.begin_submit_intent(intent_id, posting_actor="REVIEWER", retry=True)
+        self.assertEqual(retry["state"], "submitting")
+        self.assertEqual(retry["posting_actor"], "reviewer")
+
+    def test_begin_submit_persists_actor_and_refuses_account_switch_on_retry(self):
+        self.accept(1)
+        prepared = self.store.prepare_review("COMMENT", "Summary", {"1": self.comment()})
+        intent_id = prepared["intent_id"]
+        self.assertIsNone(prepared["posting_actor"])
+        before = self.store.review_intent(intent_id)
+        with self.store.review_submission_lock():
+            for actor in (None, "", " "):
+                with self.subTest(actor=actor), self.assertRaisesRegex(
+                    session_store.StoreError, "posting actor must be non-empty"
+                ):
+                    self.store.begin_submit_intent(intent_id, posting_actor=actor)
+            self.assertEqual(self.store.review_intent(intent_id), before)
+            self.store.begin_submit_intent(intent_id, posting_actor="account-A")
+        reopened = session_store.SessionStore(self.root)
+        before = reopened.review_intent(intent_id)
+        self.assertEqual(before["state"], "submitting")
+        self.assertEqual(before["posting_actor"], "account-A")
+        with reopened.review_submission_lock(), self.assertRaisesRegex(
+            session_store.Conflict, "posting actor account-A; current actor account-B cannot POST"
+        ):
+            reopened.begin_submit_intent(intent_id, posting_actor="account-B", retry=True)
+        self.assertEqual(reopened.review_intent(intent_id), before)
+
+    def test_begin_submit_intent_refuses_changed_pins_including_retry(self):
+        self.accept(1)
+        prepared = self.store.prepare_review("COMMENT", "Summary", {"1": self.comment()})
+        intent_id = prepared["intent_id"]
+        original = self.store.snapshot()[1][0]
+        for retry in (False, True):
+            with self.subTest(retry=retry):
+                if retry:
+                    self.store.put_beat(original)
+                    with self.store.review_submission_lock():
+                        self.store.begin_submit_intent(intent_id, posting_actor="reviewer")
+                self.store.put_beat(dict(original, claim="rewritten finding"))
+                before = self.store.review_intent(intent_id)
+                with self.store.review_submission_lock(), self.assertRaisesRegex(
+                    session_store.Conflict, "content changed since review intent"
+                ):
+                    self.store.begin_submit_intent(intent_id, posting_actor="reviewer", retry=retry)
+                self.assertEqual(self.store.review_intent(intent_id), before)
+
+    def test_begin_submit_intent_refuses_beat_no_longer_accepted(self):
+        with connected(str(self.root / "session.sqlite3")) as db:
+            row = db.execute("SELECT body_json FROM beats WHERE n = 2").fetchone()
+            legacy = json.loads(row[0])
+            legacy.pop("resolution_kind")
+            db.execute("UPDATE beats SET body_json = ? WHERE n = 2", (json.dumps(legacy),))
+        intent_id = self.prepare_two_and_start()
+        decision = self.store.produce("decide-2", 2, "decide", "Handle this separately")
+        self.store.ack(decision["seq"])
+        before = self.store.review_intent(intent_id)
+        with self.store.review_submission_lock(), self.assertRaisesRegex(
+            session_store.Conflict, "beat 2 is decided, not accepted"
+        ):
+            self.store.begin_submit_intent(intent_id, posting_actor="reviewer", retry=True)
+        self.assertEqual(self.store.review_intent(intent_id), before)
+
+    def test_prepare_review_with_stored_id_allows_only_identical_replay(self):
+        intent_id = self.prepare_two_and_start()
+        self.store.bind_review_id(intent_id, 17)
+        before = self.store.review_intent(intent_id)
+        comments = {"1": self.comment(), "2": self.comment(line=12)}
+        for replace in (False, True):
+            with self.subTest(replace=replace):
+                replay = self.store.prepare_review("COMMENT", "Summary", comments, replace=replace)
+                self.assertEqual(replay["intent_id"], intent_id)
+                self.assertEqual(replay["review_id"], 17)
+                with self.assertRaisesRegex(
+                    session_store.Conflict, "stored review id; use submit-review.*orphan-review"
+                ):
+                    self.store.prepare_review("COMMENT", "Changed", comments, replace=replace)
+                self.assertEqual(self.store.review_intent(intent_id), before)
+                self.assertEqual(len(self.store.review_intents()), 1)
+
+    def test_orphan_review_intent_requires_lock_stored_id_and_reason(self):
+        intent_id = self.prepare_two_and_start()
+        args = (intent_id, "cannot land", "https://example.test/reviews/17", "review_object")
+        with self.assertRaisesRegex(session_store.StoreError, "requires the review submission lock"):
+            self.store.orphan_review_intent(*args)
+        with self.store.review_submission_lock():
+            with self.assertRaisesRegex(session_store.Conflict, "has no stored review id"):
+                self.store.orphan_review_intent(*args)
+            self.store.bind_review_id(intent_id, 17)
+            with self.assertRaisesRegex(session_store.StoreError, "reason must be non-empty"):
+                self.store.orphan_review_intent(intent_id, " ", args[2], args[3])
+            orphaned = self.store.orphan_review_intent(*args)
+            self.assertEqual(self.store.orphan_review_intent(*args), orphaned)
+            with self.assertRaisesRegex(session_store.Conflict, "different reason"):
+                self.store.orphan_review_intent(intent_id, "other", args[2], args[3])
+        self.assertEqual(session_store.SessionStore(self.root).review_intent(intent_id), orphaned)
+        self.assertEqual(orphaned["state"], "orphaned")
+        self.assertIsNone(orphaned["failed_at"])
+        with self.assertRaisesRegex(session_store.Conflict, "cannot land"):
+            self.store.land_intent(intent_id, args[2])
+        with self.assertRaisesRegex(session_store.Conflict, "cannot fail"):
+            self.store.fail_intent(intent_id, "error")
+        self.assertEqual([item["beat_n"] for item in self.store.reconcile()["pending_deliveries"]], [1, 2])
+
+    def test_retire_review_intent_requires_submission_lock_and_zero_match_evidence(self):
+        intent_id = self.prepare_two_and_start()
+        with self.assertRaisesRegex(session_store.StoreError, "requires the review submission lock"):
+            self.store.retire_review_intent(intent_id, reconcile=lambda _: None)
+        with self.store.review_submission_lock():
+            with self.assertRaisesRegex(session_store.Conflict, "requires reconciliation"):
+                self.store.retire_review_intent(intent_id)
+            for result in (None, {}, {"candidates_examined": -1, "match": None},
+                           {"candidates_examined": True, "match": None}):
+                with self.subTest(result=result), self.assertRaisesRegex(
+                    session_store.Conflict, "requires reconciliation evidence"
+                ):
+                    self.store.retire_review_intent(intent_id, reconcile=lambda _, result=result: result)
+            with self.assertRaisesRegex(session_store.Conflict, "a matching review exists"):
+                self.store.retire_review_intent(
+                    intent_id, reconcile=lambda _: {"candidates_examined": 1, "match": {"review_id": 17}}
+                )
+        self.assertEqual(self.store.review_intent(intent_id)["state"], "submitting")
+
+    def test_retire_submitting_intent_persists_reconciliation_and_leaves_beats_pending(self):
+        intent_id = self.prepare_two_and_start()
+        calls = []
+
+        def reconcile(intent):
+            self.assertEqual(intent["intent_id"], intent_id)
+            self.assertEqual(self.store._review_submission_owner, (os.getpid(), threading.get_ident()))
+            with self.store._write():
+                calls.append(intent_id)
+            return {"candidates_examined": 3, "match": None}
+
+        with self.store.review_submission_lock():
+            retired = self.store.retire_review_intent(intent_id, reconcile=reconcile, reconcile_delay=0)
+        self.assertEqual(calls, [intent_id, intent_id])
+        self.assertEqual(retired["state"], "retired")
+        self.assertTrue(retired["retired_at"])
+        evidence = retired["retirement_reconciliation"]
+        self.assertEqual(evidence["delay_seconds"], 0)
+        self.assertEqual([item["candidates_examined"] for item in evidence["observations"]], [3, 3])
+        self.assertTrue(all(item["reconciled_at"] for item in evidence["observations"]))
+        self.assertEqual(session_store.SessionStore(self.root).review_intent(intent_id), retired)
+        self.assertEqual([item["beat_n"] for item in self.store.reconcile()["pending_deliveries"]], [1, 2])
+        prepared = self.store.prepare_review(
+            "COMMENT", "Summary", {"1": self.comment(), "2": self.comment(line=12)}
+        )
+        self.assertEqual(prepared["state"], "prepared")
+        self.assertNotEqual(prepared["intent_id"], intent_id)
+
+    def test_retire_second_read_error_does_not_persist_retirement(self):
+        intent_id = self.prepare_two_and_start()
+        before = self.store.review_intent(intent_id)
+        reconcile = mock.Mock(side_effect=[
+            {"candidates_examined": 0, "match": None}, session_store.StoreError("read failed")
+        ])
+        with self.store.review_submission_lock(), self.assertRaisesRegex(session_store.StoreError, "read failed"):
+            self.store.retire_review_intent(intent_id, reconcile=reconcile, reconcile_delay=0)
+        self.assertEqual(reconcile.call_count, 2)
+        self.assertEqual(self.store.review_intent(intent_id), before)
+
+    def test_retire_review_refuses_stored_id_even_on_prepared_intent(self):
+        self.accept(1)
+        prepared = self.store.prepare_review("COMMENT", "Summary", {"1": self.comment()})
+        intent_id = prepared["intent_id"]
+        self.store.bind_review_id(intent_id, 17)
+        reconcile = mock.Mock()
+        with self.store.review_submission_lock(), self.assertRaisesRegex(
+            session_store.Conflict, "has a stored review id; cannot retire"
+        ):
+            self.store.retire_review_intent(intent_id, reconcile=reconcile)
+        reconcile.assert_not_called()
+        self.assertEqual(self.store.review_intent(intent_id)["state"], "prepared")
+
+    def test_review_id_binding_is_durable_unique_and_immutable(self):
+        self.accept(1)
+        first = self.store.prepare_review("COMMENT", "First", {"1": self.comment()})
+        self.store.bind_review_id(first["intent_id"], 17)
+        reopened = session_store.SessionStore(self.root)
+        self.assertEqual(reopened.review_intent(first["intent_id"])["review_id"], 17)
+        reopened.bind_review_id(first["intent_id"], 17)
+        with self.assertRaisesRegex(session_store.Conflict, "already has review id 17"):
+            reopened.bind_review_id(first["intent_id"], 18)
+        with (
+            reopened.review_submission_lock(),
+            self.assertRaisesRegex(session_store.Conflict, "verify that review without reposting"),
+        ):
+            reopened.begin_submit_intent(first["intent_id"], posting_actor="reviewer", retry=True)
+        reopened.land_intent(first["intent_id"], "https://example.test/reviews/17")
+        self.accept(2)
+        second = self.store.prepare_review("COMMENT", "Second", {"2": self.comment(line=12)})
+        with self.assertRaisesRegex(session_store.Conflict, "already bound to intent"):
+            self.store.bind_review_id(second["intent_id"], 17)
+        self.assertIsNone(self.store.review_intent(second["intent_id"])["review_id"])
+        self.store.bind_review_id(second["intent_id"], 18)
+
+    def test_dismissed_intent_blocks_prepare_for_its_pending_beats(self):
+        self.accept(1)
+        prepared = self.store.prepare_review("COMMENT", "Summary", {"1": self.comment()})
+        receipt = {"url": "https://example.test/reviews/17", "state": "DISMISSED", "review_id": 17}
+        self.store.bind_review_id(prepared["intent_id"], 17)
+        dismissed = self.store.record_dismissed_intent(prepared["intent_id"], receipt)
+        self.assertEqual(dismissed["state"], "dismissed")
+        self.assertIsNotNone(dismissed["dismissed_at"])
+        self.assertIsNone(dismissed["failed_at"])
+        self.assertEqual(self.store.record_dismissed_intent(prepared["intent_id"], receipt), dismissed)
+        for replace in (False, True):
+            with self.subTest(replace=replace), self.assertRaisesRegex(
+                session_store.Conflict, "stop for supervised handling without reposting"
+            ):
+                self.store.prepare_review("COMMENT", "Another review", {"1": self.comment()}, replace=replace)
+        self.assertEqual([item["beat_n"] for item in self.store.reconcile()["pending_deliveries"]], [1])
+        self.assertEqual(len(self.store.review_intents()), 1)
+
+    def test_fail_intent_rolls_back_all_beats_and_intent_on_later_write_fault(self):
+        intent_id = self.prepare_two_and_start()
+        before = self.store.delivery_state()
+        save = self.store._save_beat
+        saved = []
+
+        def fail_second(db, beat, *args, **kwargs):
+            if beat["n"] == 2:
+                raise OSError("disk full")
+            saved.append(beat["n"])
+            return save(db, beat, *args, **kwargs)
+
+        with (
+            mock.patch.object(self.store, "_save_beat", side_effect=fail_second),
+            self.assertRaisesRegex(OSError, "disk full"),
+        ):
+            self.store.fail_intent(intent_id, "HTTP 403")
+        self.assertEqual(saved, [1])
+        self.assertEqual(self.store.review_intent(intent_id)["state"], "submitting")
+        self.assertEqual(self.store.delivery_state(), before)
+        self.assertEqual([item["beat_n"] for item in self.store.reconcile()["pending_deliveries"]], [1, 2])
+        self.assertEqual(self.store.reconcile()["failed_deliveries"], [])
+
+    def test_fail_intent_refuses_changed_digest_without_partially_failing(self):
+        intent_id = self.prepare_two_and_start()
+        second = next(beat for beat in self.store.snapshot()[1] if beat["n"] == 2)
+        self.store.put_beat(dict(second, claim="rewritten finding"))
+        with self.assertRaisesRegex(session_store.Conflict, "content changed since review intent"):
+            self.store.fail_intent(intent_id, "HTTP 403")
+        self.assertEqual(self.store.review_intent(intent_id)["state"], "submitting")
+        self.assertEqual([item["beat_n"] for item in self.store.reconcile()["pending_deliveries"]], [1, 2])
+        self.assertEqual(self.store.reconcile()["failed_deliveries"], [])
+
+    def test_fail_intent_replay_refuses_a_changed_pinned_digest(self):
+        intent_id = self.prepare_two_and_start()
+        self.store.fail_intent(intent_id, "HTTP 403")
+        second = next(beat for beat in self.store.snapshot()[1] if beat["n"] == 2)
+        self.store.put_beat(dict(second, claim="rewritten after failure"))
+        with self.assertRaisesRegex(session_store.Conflict, "content changed since review intent"):
+            self.store.fail_intent(intent_id, "HTTP 403")
+        self.assertEqual(self.store.review_intent(intent_id)["state"], "failed")
+
+    def test_fail_intent_refuses_decided_beat_without_partially_failing(self):
+        with connected(str(self.root / "session.sqlite3")) as db:
+            row = db.execute("SELECT body_json FROM beats WHERE n = 2").fetchone()
+            legacy = json.loads(row[0])
+            legacy.pop("resolution_kind")
+            db.execute("UPDATE beats SET body_json = ? WHERE n = 2", (json.dumps(legacy),))
+        intent_id = self.prepare_two_and_start()
+        decision = self.store.produce("decide-2", 2, "decide", "Handle this separately")
+        self.store.ack(decision["seq"])
+        before = self.store.snapshot()
+        with self.assertRaisesRegex(session_store.Conflict, "beat 2 is decided, not accepted"):
+            self.store.fail_intent(intent_id, "HTTP 403")
+        self.assertEqual(self.store.review_intent(intent_id)["state"], "submitting")
+        self.assertEqual(self.store.snapshot(), before)
+        self.assertEqual(self.store.reconcile()["failed_deliveries"], [])
+
+    def test_direct_review_land_requires_a_landed_intent_for_the_same_beat_and_url(self):
+        first = self.accept(1)
+        url = "https://example.test/review/1"
+        with self.assertRaisesRegex(session_store.Conflict, "land_intent / submit-review"):
+            self.store.land(first["seq"], 1, url, "review")
+        intent = self.store.prepare_review(
+            "COMMENT", "Summary", {"1": self.comment()}
+        )
+        with self.assertRaisesRegex(session_store.Conflict, "land_intent / submit-review"):
+            self.store.land(first["seq"], 1, url, "review")
+        self.store.land_intent(intent["intent_id"], url)
+        replay = self.store.land(first["seq"], 1, url, "review")
+        self.assertEqual(replay["state"], "landed")
+        self.assertEqual(replay["intent_id"], intent["intent_id"])
+        with self.assertRaisesRegex(session_store.Conflict, "land_intent / submit-review"):
+            self.store.land(first["seq"], 1, url + "-other", "review")
+        second = self.accept(2)
+        with self.assertRaisesRegex(session_store.Conflict, "land_intent / submit-review"):
+            self.store.land(second["seq"], 2, url, "review")
+        self.assertEqual(
+            [item["beat_n"] for item in self.store.reconcile()["pending_deliveries"]], [2]
+        )
+
+    def test_prepare_review_persists_intent_validates_anchors_and_writes_fixed_json(self):
+        first = self.accept(1)
+        second = self.accept(2)
+
+        prepared = self.store.prepare_review(
+            "REQUEST_CHANGES",
+            "Review summary",
+            {
+                "1": self.comment(line=15, body="Near hunk snaps to 12."),
+                "2": self.comment(line=99, path="outside.py", body="Folds into body."),
+            },
+        )
+
+        self.assertEqual(prepared["event"], "REQUEST_CHANGES")
+        self.assertEqual(prepared["state"], "prepared")
+        self.assertEqual(prepared["comment_count"], 1)
+        self.assertEqual(prepared["anchors_snapped"], 1)
+        self.assertEqual(prepared["anchors_folded"], 1)
+        self.assertEqual(
+            [(item["beat_n"], item["action_seq"]) for item in prepared["beats"]],
+            [(1, first["seq"]), (2, second["seq"])],
+        )
+        for item in prepared["beats"]:
+            self.assertEqual(item["beat_revision"], 2)
+            self.assertRegex(item["beat_sha256"], r"^[0-9a-f]{64}$")
+
+        fixed_path = self.root / "review.fixed.json"
+        self.assertEqual(prepared["payload_file"], str(fixed_path))
+        disk_bytes = fixed_path.read_bytes()
+        self.assertEqual(
+            hashlib.sha256(disk_bytes).hexdigest(), prepared["payload_sha256"]
+        )
+        stored = self.store.review_intent(prepared["intent_id"], include_payload=True)
+        self.assertEqual(stored["payload"], disk_bytes)
+
+        payload = json.loads(disk_bytes.decode("utf-8"))
+        marker = self.store.review_marker()
+        self.assertEqual(payload["commit_id"], self.target["head_sha"])
+        self.assertEqual(payload["event"], "REQUEST_CHANGES")
+        self.assertEqual(
+            payload["comments"],
+            [{"path": "a.py", "line": 12, "side": "RIGHT", "body": "Near hunk snaps to 12."}],
+        )
+        self.assertTrue(payload["body"].startswith("Review summary\n\n`outside.py:99` Folds into body."))
+        self.assertTrue(payload["body"].endswith("\n\n" + marker))
+
+    def test_prepare_review_writes_preview_only_after_commit(self):
+        self.accept(1)
+        prepared = self.store.prepare_review("COMMENT", "First", {"1": self.comment()})
+        preview = self.root / "review.fixed.json"
+        original = preview.read_bytes()
+        connect = self.store._connect
+
+        def fail_commit():
+            db = connect()
+            proxy = mock.Mock(wraps=db)
+
+            def execute(sql, *args):
+                if sql == "COMMIT":
+                    raise sqlite3.OperationalError("injected commit failure")
+                return db.execute(sql, *args)
+
+            proxy.execute.side_effect = execute
+            return proxy
+
+        with (
+            mock.patch.object(self.store, "_connect", side_effect=fail_commit),
+            mock.patch.object(session_store, "_atomic_write") as write,
+            self.assertRaisesRegex(sqlite3.OperationalError, "injected commit failure"),
+        ):
+            self.store.prepare_review("COMMENT", "Replacement", {"1": self.comment()}, replace=True)
+        write.assert_not_called()
+        self.assertEqual(preview.read_bytes(), original)
+        self.assertEqual(self.store.review_intents(), [self.store.review_intent(prepared["intent_id"])])
+        self.assertEqual(self.store.review_intent(prepared["intent_id"])["state"], "prepared")
+
+        atomic_write = session_store._atomic_write
+        observed_states = []
+
+        def check_commit(path, payload):
+            with connected(str(self.root / "session.sqlite3")) as db:
+                observed_states.extend(db.execute(
+                    "SELECT state FROM review_intents ORDER BY rowid"
+                ).fetchall())
+            atomic_write(path, payload)
+
+        with mock.patch.object(session_store, "_atomic_write", side_effect=check_commit):
+            self.store.prepare_review("COMMENT", "Replacement", {"1": self.comment()}, replace=True)
+        self.assertEqual(observed_states, [("replaced",), ("prepared",)])
+        self.assertNotEqual(preview.read_bytes(), original)
+
+    def test_prepare_review_preserves_submitting_preview_unless_missing(self):
+        self.accept(1)
+        prepared = self.store.prepare_review("COMMENT", "Summary", {"1": self.comment()})
+        with self.store.review_submission_lock():
+            self.store.begin_submit_intent(prepared["intent_id"], posting_actor="reviewer")
+        preview = self.root / "review.fixed.json"
+        payload = preview.read_bytes()
+        for changed in (False, True):
+            with self.subTest(changed=changed):
+                if changed:
+                    preview.write_bytes(payload.replace(b"Summary", b"Changed"))
+                before = preview.stat()
+                with mock.patch.object(session_store, "_atomic_write") as write:
+                    replay = self.store.prepare_review("COMMENT", "Summary", {"1": self.comment()})
+                self.assertEqual(replay["state"], "submitting")
+                write.assert_not_called()
+                self.assertEqual(preview.stat(), before)
+        preview.unlink()
+        self.store.prepare_review("COMMENT", "Summary", {"1": self.comment()})
+        self.assertEqual(preview.read_bytes(), payload)
+        preview.unlink()
+        preview.symlink_to(self.root / "missing.json")
+        self.store.prepare_review("COMMENT", "Summary", {"1": self.comment()})
+        self.assertTrue(preview.is_symlink())
+
+    def test_verify_intent_payload_file_refuses_unsafe_or_unbounded_files(self):
+        self.accept(1)
+        prepared = self.store.prepare_review("COMMENT", "Summary", {"1": self.comment()})
+        preview = self.root / "review.fixed.json"
+        payload = preview.read_bytes()
+        other = self.root / "other.json"
+        other.write_bytes(payload)
+        for kind in ("symlink", "hardlink", "fifo", "oversized"):
+            with self.subTest(kind=kind):
+                preview.unlink()
+                if kind == "symlink":
+                    preview.symlink_to(other)
+                elif kind == "hardlink":
+                    os.link(other, preview)
+                elif kind == "fifo":
+                    os.mkfifo(preview)
+                else:
+                    preview.write_bytes(payload + b" " * 100_000)
+                with self.assertRaises(session_store.Conflict):
+                    self.store.verify_intent_payload_file(prepared["intent_id"])
+        preview.write_bytes(payload)
+        self.assertEqual(self.store.verify_intent_payload_file(prepared["intent_id"]), payload)
+
+    def test_prepare_review_requires_exact_pending_accepted_beat_coverage(self):
+        self.accept(1)
+        self.accept(2)
+
+        with self.assertRaisesRegex(
+            session_store.Conflict, "missing beats 2"
+        ):
+            self.store.prepare_review("COMMENT", "Summary", {"1": self.comment()})
+
+        with self.assertRaisesRegex(
+            session_store.Conflict, "extra beats 3"
+        ):
+            self.store.prepare_review(
+                "COMMENT",
+                "Summary",
+                {"1": self.comment(), "2": self.comment(line=12), "3": self.comment()},
+            )
+
+        with self.assertRaisesRegex(
+            session_store.Conflict, "missing beats 2; extra beats 3"
+        ):
+            self.store.prepare_review(
+                "COMMENT",
+                "Summary",
+                {"1": self.comment(), "3": self.comment()},
+            )
+        self.assertEqual(self.store.review_intents(), [])
+
+    def test_prepare_review_covers_failed_review_deliveries_and_excludes_landed_ones(self):
+        first = self.accept(1)
+        prepared_one = self.store.prepare_review(
+            "COMMENT", "Round one", {"1": self.comment()}
+        )
+        self.store.land_intent(prepared_one["intent_id"], "https://example.test/r/1")
+
+        second = self.accept(2)
+        self.store.fail(second["seq"], "rejected", "retry review")
+
+        with self.assertRaisesRegex(session_store.Conflict, "extra beats 1"):
+            self.store.prepare_review(
+                "COMMENT", "Round two", {"1": self.comment(), "2": self.comment(line=12)}
+            )
+
+        prepared_two = self.store.prepare_review(
+            "COMMENT", "Round two", {"2": self.comment(line=12)}
+        )
+        self.assertEqual(
+            [(item["beat_n"], item["action_seq"]) for item in prepared_two["beats"]],
+            [(2, second["seq"])],
+        )
+        self.assertNotEqual(first["seq"], second["seq"])
+
+    def test_prepare_review_enforces_marker_neutralization_and_body_size_limit(self):
+        self.accept(1)
+        foreign = "<!-- underwrite-review:" + "0" * 32 + " -->"
+
+        with self.assertRaisesRegex(
+            session_store.StoreError, "conflicting delivery marker"
+        ):
+            self.store.prepare_review(
+                "COMMENT", f"Summary\n\n{foreign}", {"1": self.comment()}
+            )
+
+        with self.assertRaisesRegex(session_store.StoreError, "65,536"):
+            self.store.prepare_review(
+                "COMMENT", "x" * 65_530, {"1": self.comment()}
+            )
+
+        folded = self.store.prepare_review(
+            "COMMENT",
+            "Summary",
+            {"1": self.comment(path="outside.py", line=1, body=f"Quoted {foreign}")},
+        )
+        payload = json.loads(
+            self.store.review_intent(folded["intent_id"], include_payload=True)["payload"].decode("utf-8")
+        )
+        self.assertNotIn(foreign, payload["body"])
+        self.assertTrue(payload["body"].endswith(self.store.review_marker()))
+
+    def test_prepare_review_idempotency_single_nonterminal_and_replace_rules(self):
+        self.accept(1)
+        first = self.store.prepare_review(
+            "COMMENT", "Summary", {"1": self.comment()}
+        )
+        again = self.store.prepare_review(
+            "COMMENT", "Summary", {"1": self.comment()}
+        )
+        self.assertEqual(again["intent_id"], first["intent_id"])
+        self.assertEqual(len(self.store.review_intents()), 1)
+
+        with self.assertRaisesRegex(session_store.Conflict, "pass --replace"):
+            self.store.prepare_review(
+                "APPROVE", "Summary", {"1": self.comment()}
+            )
+
+        replaced = self.store.prepare_review(
+            "APPROVE", "Summary", {"1": self.comment()}, replace=True
+        )
+        self.assertNotEqual(replaced["intent_id"], first["intent_id"])
+        self.assertEqual(
+            self.store.review_intent(first["intent_id"])["state"], "replaced"
+        )
+        self.assertEqual(replaced["state"], "prepared")
+
+        with connected(str(self.root / "session.sqlite3")) as db:
+            db.execute(
+                "UPDATE review_intents SET state = 'submitting', submitting_at = '2026-01-01T00:00:00Z' "
+                "WHERE intent_id = ?",
+                (replaced["intent_id"],),
+            )
+        same_while_submitting = self.store.prepare_review(
+            "APPROVE", "Summary", {"1": self.comment()}
+        )
+        self.assertEqual(same_while_submitting["intent_id"], replaced["intent_id"])
+        self.assertEqual(same_while_submitting["state"], "submitting")
+
+        with self.assertRaisesRegex(
+            session_store.Conflict, "only a never-posted prepared intent can be replaced"
+        ):
+            self.store.prepare_review(
+                "REQUEST_CHANGES", "Summary", {"1": self.comment()}, replace=True
+            )
+
+    def test_land_intent_lands_only_covered_beats_atomically_and_leaves_later_accepts_pending(self):
+        self.accept(1)
+        prepared = self.store.prepare_review(
+            "COMMENT", "Summary", {"1": self.comment()}
+        )
+        later = self.accept(2)
+        entry = {
+            "state": "landed",
+            "what": "beat 1 review",
+            "where": "https://example.test/reviews/99",
+        }
+
+        landed = self.store.land_intent(
+            prepared["intent_id"], "https://example.test/reviews/99", entry=entry
+        )
+
+        self.assertEqual(landed["state"], "landed")
+        self.assertEqual(landed["review_url"], "https://example.test/reviews/99")
+        self.assertEqual(len(landed["deliveries"]), 1)
+        self.assertEqual(landed["deliveries"][0]["beat_n"], 1)
+
+        idempotent = self.store.land_intent(
+            prepared["intent_id"], "https://example.test/reviews/99", entry=entry
+        )
+        self.assertEqual(idempotent["state"], "landed")
+        with self.assertRaisesRegex(session_store.Conflict, "already landed"):
+            self.store.land_intent(
+                prepared["intent_id"], "https://example.test/reviews/other"
+            )
+
+        session, beats = self.store.snapshot()
+        by_n = {beat["n"]: beat for beat in beats}
+        self.assertEqual(by_n[1]["landed"], "https://example.test/reviews/99")
+        self.assertEqual(by_n[1]["delivery_kind"], "review")
+        self.assertNotIn("landed", by_n[2])
+        self.assertEqual(session["lands"], [entry])
+
+        reconciled = self.store.reconcile()
+        self.assertEqual(
+            [(item["beat_n"], item["cause_seq"]) for item in reconciled["pending_deliveries"]],
+            [(2, later["seq"])],
+        )
+
+    def test_land_intent_rolls_back_atomically_on_fault(self):
+        self.accept(1)
+        self.accept(2)
+        prepared = self.store.prepare_review(
+            "COMMENT",
+            "Summary",
+            {"1": self.comment(), "2": self.comment(line=12)},
+        )
+
+        with (
+            mock.patch.object(
+                self.store, "_save_session", side_effect=OSError("disk full")
+            ),
+            self.assertRaises(OSError),
+        ):
+            self.store.land_intent(
+                prepared["intent_id"], "https://example.test/reviews/5"
+            )
+
+        self.assertEqual(
+            self.store.review_intent(prepared["intent_id"])["state"], "prepared"
+        )
+        session, beats = self.store.snapshot()
+        self.assertEqual(session.get("lands", []), [])
+        for beat in beats:
+            self.assertNotIn("landed", beat)
+        self.assertEqual(
+            [item["beat_n"] for item in self.store.reconcile()["pending_deliveries"]],
+            [1, 2],
+        )
+
+    def assert_zero_beat_review_blocks_reprepare(self, intent_id):
+        self.assert_unresolved_zero_beat_review(intent_id, self.store.review_intent(intent_id)["state"])
+        for replace in (False, True):
+            with self.subTest(replace=replace), self.assertRaisesRegex(
+                session_store.Conflict, "stop for supervised handling without reposting"
+            ):
+                self.store.prepare_review("APPROVE", "Looks clean.", {}, replace=replace)
+        self.assertEqual([item["intent_id"] for item in self.store.review_intents()], [intent_id])
+
+    def test_dismissed_zero_beat_intent_blocks_identical_reprepare(self):
+        intent_id = self.store.prepare_review("APPROVE", "Looks clean.", {})["intent_id"]
+        self.store.bind_review_id(intent_id, 17)
+        revision = self.store.delivery_state()["render_revision"]
+        receipt = {
+            "state": "DISMISSED", "review_id": 17, "url": "https://example.test/reviews/17",
+        }
+        self.store.record_dismissed_intent(intent_id, receipt)
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision + 1)
+        self.store.record_dismissed_intent(intent_id, receipt)
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision + 1)
+        self.assert_zero_beat_review_blocks_reprepare(intent_id)
+
+    def test_orphaned_zero_beat_intent_blocks_identical_reprepare(self):
+        intent_id = self.store.prepare_review("APPROVE", "Looks clean.", {})["intent_id"]
+        self.store.bind_review_id(intent_id, 17)
+        revision = self.store.delivery_state()["render_revision"]
+        with self.store.review_submission_lock():
+            for _ in range(2):
+                self.store.orphan_review_intent(
+                    intent_id, "cannot verify body", "https://example.test/reviews/17", "review_object"
+                )
+                self.assertEqual(self.store.delivery_state()["render_revision"], revision + 1)
+        self.assert_zero_beat_review_blocks_reprepare(intent_id)
+
+    def assert_unresolved_zero_beat_review(self, intent_id, state):
+        projected = self.store.presentation_snapshot()[0]["review_intents"]
+        self.assertEqual([(item["intent_id"], item["state"]) for item in projected], [(intent_id, state)])
+        self.assertEqual(projected[0]["beats"], [])
+        recovery = self.store.reconcile()
+        self.assertEqual(recovery["review_intents"], projected)
+        self.assertEqual(recovery["pending_deliveries"], [])
+        self.assertEqual(recovery["failed_deliveries"], [])
+        self.assertTrue(recovery["recovery"])
+        self.assertTrue(self.store.delivery_state()["recovery"])
+
+    def test_zero_beat_prepared_intent_needs_stored_id_before_recovery(self):
+        intent_id = self.store.prepare_review("APPROVE", "Looks clean.", {})["intent_id"]
+        self.assertEqual(self.store.presentation_snapshot()[0]["review_intents"], [])
+        self.assertFalse(self.store.reconcile()["recovery"])
+        self.assertFalse(self.store.delivery_state()["recovery"])
+        self.store.bind_review_id(intent_id, 17)
+        self.assert_unresolved_zero_beat_review(intent_id, "prepared")
+
+    def test_zero_beat_submitting_and_retired_intents_remain_in_recovery_until_later_landing(self):
+        intent_id = self.store.prepare_review("APPROVE", "Looks clean.", {})["intent_id"]
+        with self.store.review_submission_lock():
+            self.store.begin_submit_intent(intent_id, posting_actor="reviewer")
+            self.assert_unresolved_zero_beat_review(intent_id, "submitting")
+            revision = self.store.delivery_state()["render_revision"]
+            self.store.retire_review_intent(
+                intent_id, reconcile=lambda _: {"candidates_examined": 0, "match": None},
+                reconcile_delay=0,
+            )
+            self.assertEqual(self.store.delivery_state()["render_revision"], revision + 1)
+        self.assert_unresolved_zero_beat_review(intent_id, "retired")
+        replacement = self.store.prepare_review("APPROVE", "Looks clean.", {})
+        self.store.land_intent(replacement["intent_id"], "https://example.test/reviews/18")
+        self.assertEqual(self.store.presentation_snapshot()[0]["review_intents"], [])
+        self.assertFalse(self.store.reconcile()["recovery"])
+        self.assertFalse(self.store.delivery_state()["recovery"])
+
+    def test_zero_beat_failed_intent_stays_in_recovery_until_later_zero_beat_landing(self):
+        earlier = self.store.prepare_review("APPROVE", "Earlier approval.", {})
+        self.store.land_intent(earlier["intent_id"], "https://example.test/reviews/16")
+        intent_id = self.store.prepare_review("APPROVE", "Looks clean.", {})["intent_id"]
+        with self.store.review_submission_lock():
+            self.store.begin_submit_intent(intent_id, posting_actor="reviewer")
+        revision = self.store.delivery_state()["render_revision"]
+        self.store.fail_intent(intent_id, "HTTP 403")
+        self.assertGreater(self.store.delivery_state()["render_revision"], revision)
+        self.assert_unresolved_zero_beat_review(intent_id, "failed")
+        replacement = self.store.prepare_review("APPROVE", "Looks clean.", {})
+        self.store.land_intent(replacement["intent_id"], "https://example.test/reviews/18")
+        self.assertEqual(self.store.presentation_snapshot()[0]["review_intents"], [])
+        self.assertFalse(self.store.reconcile()["recovery"])
+        self.assertFalse(self.store.delivery_state()["recovery"])
+
+    def test_zero_beat_review_prepare_submit_bind_and_land_advance_revision_once(self):
+        revision = self.store.delivery_state()["render_revision"]
+        prepared = self.store.prepare_review("APPROVE", "Looks clean.", {})
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision + 1)
+        self.assertEqual(prepared["beats"], [])
+        self.assertEqual(prepared["comment_count"], 0)
+        intent_id = prepared["intent_id"]
+        self.store.prepare_review("APPROVE", "Looks clean.", {})
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision + 1)
+        with self.store.review_submission_lock():
+            self.store.begin_submit_intent(intent_id, posting_actor="reviewer")
+            self.assertEqual(self.store.delivery_state()["render_revision"], revision + 2)
+            self.store.begin_submit_intent(intent_id, posting_actor="reviewer", retry=True)
+            self.assertEqual(self.store.delivery_state()["render_revision"], revision + 2)
+        self.store.bind_review_id(intent_id, 17)
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision + 3)
+        self.store.bind_review_id(intent_id, 17)
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision + 3)
+
+        review_url = "https://example.test/reviews/clean"
+        landed = self.store.land_intent(intent_id, review_url)
+        self.assertEqual(landed["state"], "landed")
+        self.assertEqual(landed["deliveries"], [])
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision + 4)
+        self.assertEqual(self.store.snapshot()[0]["lands"], [{
+            "state": "landed", "what": "GitHub review", "where": review_url,
+        }])
+        self.assertEqual(self.store.land_intent(intent_id, review_url), landed)
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision + 4)
+        self.assertEqual(len(self.store.snapshot()[0]["lands"]), 1)
+
+    def test_zero_beat_landing_advances_revision_even_when_shared_entry_already_exists(self):
+        review_url = "https://example.test/reviews/clean"
+        earlier = self.store.prepare_review("APPROVE", "Looks clean.", {})
+        self.store.land_intent(earlier["intent_id"], review_url)
+        later = self.store.prepare_review("APPROVE", "Still clean.", {})
+        revision = self.store.delivery_state()["render_revision"]
+
+        self.store.land_intent(later["intent_id"], review_url)
+
+        self.assertEqual(self.store.delivery_state()["render_revision"], revision + 1)
+        self.assertEqual(len(self.store.snapshot()[0]["lands"]), 1)
+
+    def test_land_intent_refuses_if_covered_beat_changed_after_prepare(self):
+        self.accept(1)
+        prepared = self.store.prepare_review(
+            "COMMENT", "Summary", {"1": self.comment()}
+        )
+        changed = dict(self.store.snapshot()[1][0], claim="rewritten claim")
+        self.store.put_beat(changed)
+
+        with self.assertRaisesRegex(
+            session_store.Conflict, "content changed since review intent"
+        ):
+            self.store.land_intent(
+                prepared["intent_id"], "https://example.test/reviews/99"
+            )
+        self.assertEqual(
+            self.store.review_intent(prepared["intent_id"])["state"], "prepared"
+        )
 
 
 if __name__ == "__main__":

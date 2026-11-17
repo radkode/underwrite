@@ -18,6 +18,9 @@ if str(HERE) not in sys.path:
 from session_store import DROP_REASONS, FLAG_STATES, SessionStore, StoreError  # noqa: E402
 from diff_lines import LOCATION_LINE, resolve_path  # noqa: E402
 from pr_snapshot import (  # noqa: E402
+    ReviewPrePostCheckFailed,
+    ReviewSubmissionUncertain,
+    ReviewTargetMovedBeforePost,
     TargetMoved,
     capture,
     check,
@@ -25,10 +28,14 @@ from pr_snapshot import (  # noqa: E402
     check_controller,
     check_worktree,
     context_log,
+    gh_runner,
     moved_lines,
+    orphan_review,
     read_blob,
     review_identity,
     review_receipt,
+    retire_review,
+    submit_review,
 )
 
 
@@ -292,6 +299,30 @@ def parser():
     marker = commands.add_parser("review-marker")
     marker.add_argument("session")
 
+    prepare = commands.add_parser("prepare-review")
+    prepare.add_argument("session")
+    prepare.add_argument(
+        "--event", choices=("COMMENT", "REQUEST_CHANGES", "APPROVE"), required=True
+    )
+    prepare.add_argument("--body-file", required=True)
+    prepare.add_argument("--comments-file", required=True)
+    prepare.add_argument("--replace", action="store_true")
+
+    submit = commands.add_parser("submit-review")
+    submit.add_argument("session")
+    submit.add_argument("--intent", required=True)
+    submit.add_argument("--retry", action="store_true")
+
+    retire = commands.add_parser("retire-review")
+    retire.add_argument("session")
+    retire.add_argument("--intent", required=True)
+    retire.add_argument("--reconcile-delay", type=float, default=30)
+
+    orphan = commands.add_parser("orphan-review")
+    orphan.add_argument("session")
+    orphan.add_argument("--intent", required=True)
+    orphan.add_argument("--reason", required=True)
+
     receipt = commands.add_parser("review-receipt")
     receipt.add_argument("session")
     receipt.add_argument("source")
@@ -369,16 +400,19 @@ def confine(args):
     if not root:
         return
     boundary = Path(root).resolve()
-    for name in ("session", "predecessor", "reviews"):
+    for name in ("session", "predecessor", "reviews", "body_file", "comments_file", "source", "entry"):
         value = getattr(args, name, None)
-        if value is None:
+        if value is None or (
+            value == "-"
+            and (name in ("entry", "comments_file") or (name == "source" and args.command != "review-receipt"))
+        ):
             continue
         target = Path(value).expanduser().resolve()
         if target != boundary and boundary not in target.parents:
             raise StoreError(f"{name} {value} is outside UNDERWRITE_CONFINE {boundary}")
 
 
-def run(args):
+def run(args, *, runner=gh_runner):
     confine(args)
     if args.command == "init":
         store = SessionStore(
@@ -426,6 +460,29 @@ def run(args):
     elif args.command == "review-marker":
         store = SessionStore(args.session)
         return review_identity(store)
+    elif args.command == "prepare-review":
+        body = Path(args.body_file).read_text(encoding="utf-8")
+        comments = object_input(args.comments_file, "review comments")
+        store = SessionStore(args.session)
+        result = store.prepare_review(
+            args.event, body, comments, replace=args.replace
+        )
+    elif args.command in ("submit-review", "retire-review", "orphan-review"):
+        store = SessionStore(args.session)
+        try:
+            if args.command == "retire-review":
+                result = retire_review(
+                    store, args.intent, runner=runner, reconcile_delay=args.reconcile_delay
+                )
+            elif args.command == "orphan-review":
+                result = orphan_review(store, args.intent, args.reason, runner=runner)
+            else:
+                result = submit_review(
+                    store, args.intent, retry=args.retry, runner=runner
+                )
+        except BaseException:
+            store.export_json()
+            raise
     elif args.command == "review-receipt":
         store = SessionStore(args.session)
         return review_receipt(store, args.source, args.actor)
@@ -515,12 +572,21 @@ def run(args):
     return result
 
 
-def main(argv=None):
+def main(argv=None, *, runner=gh_runner):
     try:
         args = parser().parse_args(argv)
-        result = run(args)
+        result = run(args, runner=runner)
         print(json.dumps(result, ensure_ascii=False, sort_keys=True))
         return 0
+    except ReviewSubmissionUncertain as error:
+        print(f"sessionctl: {error}", file=sys.stderr)
+        return 3
+    except ReviewTargetMovedBeforePost as error:
+        print(f"sessionctl: {error}", file=sys.stderr)
+        return 4
+    except ReviewPrePostCheckFailed as error:
+        print(f"sessionctl: {error}", file=sys.stderr)
+        return 5
     except TargetMoved as error:
         print(f"sessionctl: {error}", file=sys.stderr)
         return 2
