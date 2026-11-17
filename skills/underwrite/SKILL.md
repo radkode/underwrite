@@ -1013,11 +1013,16 @@ never reached with their tiers. A walk the reviewer left at 6 of 9 says so on it
 Do not describe a short walk as a finished review, in the terminal or in the report.
 
 Without `--final`, pending and failed delivery are valid live states and remain visibly
-unfinished. They are never shippable final states. A final render rejects either one, as
-well as every accepted branch or review delivery with no landing. In report mode,
+unfinished, as do unresolved review intents, including ones with no findings.
+They are never shippable final states. A final render rejects them, as well as every
+accepted branch or review delivery with no landing. In report mode,
 accepted report beats require no `landed` value. Exit 2 means the page rendered but a beat
-failed validation and carries an `UNPROVEN` chip. For an open beat, read the authoritative
-object with `get-beat`, fix the complete object through `put-beat`, and re-render. Report
+failed validation and carries an `UNPROVEN` chip, or `--final` found an unresolved review
+intent, even with no findings and no chip. For an outstanding review intent, follow the
+Review mode guidance below: `submit-review` to verify, supervised `orphan-review` for a stored review that cannot
+land, or `retire-review` before a supervised replacement when no review id is stored.
+For an open beat that failed validation, read the authoritative object with `get-beat`,
+fix the complete object through `put-beat`, and re-render. Report
 acceptance validates and freezes the agent-authored finding, so an accepted report beat
 that later fails validation is an integrity error. Stop instead of trying to mutate it.
 Do not ship an unproven page. The finished page is the local file `$R/report.html`; report
@@ -1134,8 +1139,9 @@ $S/scripts/render-report.py $R --final --standalone
 
 If write-back was interrupted, repeat `submit-review` for the same intent to reconcile or
 replay its durable landing, not to create another review. Repair session metadata through
-`patch-session` and render again. Pending or failed deliveries are not final. Once it
-passes, report the review URL and updated local page. Publishing that page remains the
+`patch-session` and render again. Pending or failed deliveries and unresolved review
+intents, including ones with no findings, are not final. Follow the outstanding-review
+recovery guidance above. Once it passes, report the review URL and updated local page. Publishing that page remains the
 separate opt-in above. If the reviewer already agreed to publish an earlier render,
 re-publish the updated artifact; otherwise make the publishing offer above now.
 

@@ -230,8 +230,21 @@ class ReviewModeContract(unittest.TestCase):
         text = " ".join(self.skill().split())
         self.assertIn("render-report.py $R --final", text)
         self.assertIn("one shared `lands[]` entry, atomically", text)
-        self.assertIn("Pending or failed deliveries are not final", text)
+        self.assertIn("Pending or failed deliveries and unresolved review intents, including ones with no findings, are not final", text)
+        self.assertIn("Follow the outstanding-review recovery guidance above", text)
         self.assertIn("re-publish the updated artifact", text)
+
+    def test_final_render_exit_2_includes_zero_finding_review_intents_and_their_recovery(self):
+        rule = self.skill().split("Without `--final`", 1)[1].split("**Publishing is opt-in.**", 1)[0]
+        prose = " ".join(rule.split())
+
+        self.assertIn("unresolved review intents, including ones with no findings", prose)
+        self.assertIn("Exit 2 means the page rendered but a beat failed validation and carries an `UNPROVEN` chip, or `--final` found an unresolved review intent, even with no findings and no chip", prose)
+        self.assertIn("For an outstanding review intent, follow the Review mode guidance below", prose)
+        self.assertIn("`submit-review` to verify", prose)
+        self.assertIn("supervised `orphan-review` for a stored review that cannot land", prose)
+        self.assertIn("`retire-review` before a supervised replacement when no review id is stored", prose)
+        self.assertIn("For an open beat that failed validation", prose)
 
     def test_the_audience_shape_is_explicit(self):
         text = self.skill()
