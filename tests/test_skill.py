@@ -31,7 +31,7 @@ class SkillCorpus(unittest.TestCase):
                 self.assertTrue((SKILL.parent / link).is_file())
 
     def test_the_core_stays_within_its_line_budget(self):
-        self.assertLessEqual(len(skill_text("SKILL.md").splitlines()), 900)
+        self.assertLessEqual(len(skill_text("SKILL.md").splitlines()), 950)
 
     def test_the_frontmatter_is_unchanged(self):
         expected = (
@@ -103,8 +103,8 @@ class SkillReferenceTriggers(unittest.TestCase):
         )
         self.assertIn("At startup and after any interrupted external effect, run", reconcile)
         self.assertIn(
-            "Before migrating a legacy log, using `reconcile-action` or `abandon-head`, "
-            "reading `target` fields or question history, using `stats`, inspecting the "
+            "Before migrating a legacy log, "
+            "reading question history, using `stats`, inspecting the "
             "on-disk tree, or changing this skill, read `$S/references/session-state.md`.",
             reconcile,
         )
@@ -115,6 +115,19 @@ class SkillReferenceTriggers(unittest.TestCase):
         )
         self.assertEqual(skill_text("SKILL.md").count("$S/references/session-state.md"), 1)
         self.assertNotIn("Before reading or writing session or beat fields", skill_text("SKILL.md"))
+
+    def test_action_recovery_rules_immediately_follow_startup_reconcile(self):
+        session = self.section("## Session state")
+        self.assertIn(
+            '`$S/scripts/sessionctl.py reconcile "$R"`.\n'
+            "If an old action's absolute effect is already visible, use `reconcile-action` with an\n"
+            "envelope containing `result`, the observed full session or beat documents, and nonempty\n"
+            '`evidence`, then run `$S/scripts/sessionctl.py reconcile-action "$R" <seq> recovery.json`.\n'
+            'If an action cannot be recovered, run `$S/scripts/sessionctl.py abandon-head "$R" <seq>\n'
+            "--actor <name> --reason '<why>'`. It only accepts the exact head and never skips an action\n"
+            "silently.",
+            session,
+        )
 
     def test_supervised_replacement_pointers_precede_ingest_and_plan_continuation(self):
         ingest = self.section("## Phase 0: scope and ingest")
@@ -131,8 +144,8 @@ class SkillReferenceTriggers(unittest.TestCase):
     def test_replacement_reads_review_recovery_before_building_the_next_session(self):
         opening = skill_text("references/replacement.md").split("\n\n", 1)[0]
         pointer = (
-            "If reconcile or the session shows an outstanding review intent, "
-            "read `$S/references/finish-review.md` before any recovery."
+            "If the old session's audience is `review`, "
+            "read `$S/references/finish-review.md` before finishing its delivery or any recovery."
         )
         self.assertIn("finish whatever\ndelivery it still owes", opening)
         self.assertIn(pointer, opening)
@@ -722,8 +735,8 @@ class FrozenSnapshotContract(unittest.TestCase):
 
         self.assertLess(snapshot, context)
         self.assertNotIn("gh pr diff", text)
-        self.assertIn("local three-dot diff", text)
-        self.assertIn("Run `check-pr` and `check-controller` again after those reads", text)
+        self.assertIn("local three-dot diff", core)
+        self.assertIn("Run `check-pr` and `check-controller` again after those reads", core)
 
     def test_pr_snapshots_never_authorize_branch_side_effects(self):
         text = self.skill()

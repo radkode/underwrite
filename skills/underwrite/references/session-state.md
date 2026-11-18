@@ -47,13 +47,6 @@ ack refuses automatic migration. Inspect the log and external effects, then run
 `$S/scripts/sessionctl.py init "$R" --handled-seq <known-boundary>`. Never guess that
 boundary.
 
-If an old action's absolute effect is already visible, use `reconcile-action` with an
-envelope containing `result`, the observed full session or beat documents, and nonempty
-`evidence`, then run `$S/scripts/sessionctl.py reconcile-action "$R" <seq> recovery.json`.
-If an action cannot be recovered, run `$S/scripts/sessionctl.py abandon-head "$R" <seq>
---actor <name> --reason '<why>'`. It only accepts the exact head and never skips an action
-silently.
-
 `second_read` holds exactly `verdict` and `evidence`. `confirmed` and `unread` sit only on a
 flag or what a flag became; `disputed` sits only on an `unverified` beat, the demoted flag.
 The evidence is at most 25 words. Beats from before the field carry none.

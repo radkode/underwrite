@@ -887,7 +887,13 @@ mode is different: acceptance itself is the terminal durable outcome, with deliv
 
 At startup and after any interrupted external effect, run
 `$S/scripts/sessionctl.py reconcile "$R"`.
-Before migrating a legacy log, using `reconcile-action` or `abandon-head`, reading `target` fields or question history, using `stats`, inspecting the on-disk tree, or changing this skill, read `$S/references/session-state.md`.
+If an old action's absolute effect is already visible, use `reconcile-action` with an
+envelope containing `result`, the observed full session or beat documents, and nonempty
+`evidence`, then run `$S/scripts/sessionctl.py reconcile-action "$R" <seq> recovery.json`.
+If an action cannot be recovered, run `$S/scripts/sessionctl.py abandon-head "$R" <seq>
+--actor <name> --reason '<why>'`. It only accepts the exact head and never skips an action
+silently.
+Before migrating a legacy log, reading question history, using `stats`, inspecting the on-disk tree, or changing this skill, read `$S/references/session-state.md`.
 If reconcile or the session shows an outstanding review intent, read `$S/references/finish-review.md` before any recovery.
 
 ## Formatting
