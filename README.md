@@ -394,8 +394,9 @@ are the median of its scored runs. A run that does not pass keeps its transcript
 the report records the skill commit and settings it ran with, and `--work-root` collects both
 with a `report.json`. `--baseline evals/baseline.json` fails only on a regression: a case
 that passed and now fails, or more misses or false alarms than the committed baseline. Keep a
-change to `SKILL.md` only when it passes that, and commit a new baseline when it improves. The
-`evals` workflow runs this on pull requests that touch the skill or the evals, but only once
+change to the skill (`SKILL.md` or `references/`) only when it passes that, and commit a new
+baseline when it improves. The `evals` workflow runs this on pull requests that touch the
+skill (`SKILL.md` or `references/`) or the evals, but only once
 an `ANTHROPIC_API_KEY` secret is set, because each run spends model budget, and uploads every
 walk that did not pass; CI checks the cases and the scorer either way. `--bare` keeps hooks and personal
 instructions out of the run and needs `ANTHROPIC_API_KEY`. `docs/misses.md` records what each

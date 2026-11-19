@@ -13,9 +13,9 @@ and the walk plan.
 - **The frozen target drifts.** Anything that reads `pr.diff`, `pr.bundle` or
   `trusted-context.json` outside the store's hash verification, or that lets head
   content act as policy, breaks the one promise the tool makes.
-- **The skill and the scripts disagree.** `SKILL.md` names a command, a field or a rule
-  the scripts do not implement, or the other way round. `tests/test_skill.py` pins the
-  wording for a reason.
+- **The skill and the scripts disagree.** The skill (`SKILL.md` or `references/`) names
+  a command, a field or a rule the scripts do not implement, or the other way round.
+  `tests/test_skill.py` pins the wording for a reason.
 - **The page says less than the store knows.** A new state or field with no rendering,
   or wording a cold reader cannot act on. Judge the page by whether a reader who did not
   write it understands what to do next, not by how it looks.

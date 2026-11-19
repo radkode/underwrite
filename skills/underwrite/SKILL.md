@@ -23,17 +23,7 @@ installed plugin lags whatever you just committed until it is reinstalled, and r
 walk against a stale copy is how you spend a session debugging a bug you already fixed.
 Say which one you are using when it is not the installed one.
 
-**Eval mode.** An argument carrying `--eval` is a scored replay, not a review:
-`evals/run.py` drives it headlessly and nobody is at the keyboard. Every rule here still
-holds, the second read included. At each of the two decisions take the option you would
-recommend and record it in your own words as the call, marked as eval mode. Do not serve
-the page, post status, or park: write each beat and go straight to the next. Leave every
-flag open, deliver nothing, skip Phase 4, and end with the recommendation and the count of
-flags raised. The last write is one `patch-session` carrying the final `recommendation` and
-`eval_complete: true`; the scorer counts a walk without that marker as unfinished, because
-a provisional recommendation exists from Phase 1 onward. The runner allows writes only under `$UNDERWRITE_REVIEWS`, so
-write each document for `sessionctl.py` to a file in `$R` and pass its path instead of
-piping it.
+If the argument carries `--eval`, read `$S/references/eval-mode.md` first.
 
 ## The six rules
 
@@ -78,7 +68,7 @@ in `proof_kind`: `ran`, `read`, `inferred`, or `attested`. `ran` means the comma
 output would have read differently were the claim false, and `PROOF` quotes what it
 printed. `read` means you looked and it looked right. `inferred` is a legal value and an
 honest one. `attested` is a command the execution gateway ran on the frozen PR head and
-signed for, described under **Attested proof**. A claim with none of them is not
+signed for, described in `$S/references/attested-proof.md`. A claim with none of them is not
 shippable. Only `ran` and `attested` earn `CLEAN`: a read or inferred proof opens the beat
 `UNVERIFIED`, and the store refuses the other spelling. `UNVERIFIED` is not a failure. It
 is the state most beats of a no-exec PR session open with when the host runs no proof
@@ -171,20 +161,7 @@ target moved: exit 2 for the wrong revision, exit 1 for a local change, and eith
 follow the printed command as above. Any other failure exits 1 and also blocks resumption
 until it is understood.
 
-**A replacement walks only what moved.** Reconcile the old session and finish whatever
-delivery it still owes. Then build the replacement beside it, never in it: with `$P` the
-old session, the new `$R` is `$P` with `-r<k>` appended, `k` the next free round. Initialize
-and snapshot it as below, and link it before the first beat:
-
-```bash
-$S/scripts/sessionctl.py link-predecessor "$R" "$P"
-```
-
-The link is written once. It records the round, the lines this PR's diff touches whose
-content changed since the walked head (`moved`), and every flag from any earlier round with
-its state and call (`carried`). A pure deletion counts the head lines on either side of it;
-a binary or mode-only change moves the whole file, listed with no lines. Report it as one more ingest line, such as
-`round 2   3 lines moved in 2 files, 4 findings carried`.
+Before starting a supervised replacement, read `$S/references/replacement.md`.
 
 Otherwise say what is about to happen before it does: you are freezing the target,
 fetching its objects, and reading the context around it, and then two decisions stand
@@ -245,8 +222,8 @@ The standalone gateway, `docs/host-execution-protocol.md`, and
 `scripts/execution_receipt.py` define the host trust boundary. The gateway can enforce and
 persist a signed execution, but its receipt does not authorize a review effect or mutate a
 source session. Never invoke it as review authorization. Every PR source remains `no_exec`:
-this machine never executes the head, and an attested proof under **Attested proof** runs
-only inside the gateway. Only the separate linked implementation flow below may create a
+this machine never executes the head, and an attested proof in `$S/references/attested-proof.md` runs
+only inside the gateway. Only the separate linked implementation flow in `$S/references/linked-implementation.md` may create a
 `gateway_attested` child after a distinct implementation approval.
 
 After the snapshot is frozen, run these contextual reads in parallel:
@@ -276,6 +253,13 @@ After the snapshot is frozen, run these contextual reads in parallel:
   this PR touches with the reviewer's calls and drop reasons. That is context the reviewer
   already paid for: reuse a fact rather than re-deriving it, cite findings in `PRIOR`, and do
   not re-raise them as new.
+
+  Sessions accumulate into a review history, and `history` is how a later session reads it:
+  for every other session on the same repository, its facts, its recommendation, and the
+  findings it left on the paths this one touches. Where the filesystem records when a store
+  was created, only earlier sessions appear, marked `order: earlier`; elsewhere every other
+  session appears marked `order: unknown`, so weigh it as context, not as the record. Sessions
+  it cannot read are listed as unreadable, never skipped silently.
 
 Run `check-pr` and `check-controller` again after those reads. The contextual data is
 usable only while the frozen target and trusted-base controller still match.
@@ -401,12 +385,7 @@ reconstruction, with its own named options:
 - **Skip a tier** usually follow-through, when it is not worth walking
 - **Move a file to another tier** you tiered something wrong
 
-**A replacement plans only what moved.** Tier only the files in `predecessor.moved`, and
-plan beats over those lines alone. Everything else was walked last round: say so in the
-plan with the count, and the page carries the settled findings with their calls. An
-accepted finding that landed in an earlier round already reached that round's review, so it
-is not included again. A flag the earlier round left open, or accepted without delivering,
-is walked again wherever it sits, because nobody settled it.
+Before planning a supervised replacement walk, read `$S/references/replacement.md`.
 
 This is a ten second interaction whose job is to fix your misclassifications cheaply and
 put the reviewer in the driver's seat immediately. Once they answer, patch `plan_call`
@@ -476,9 +455,6 @@ Underwrite-owned reader and what it returned, such as two blobs hashing alike or
 that comes back empty; reading a blob and agreeing with it is `read`, and the beat opens
 `UNVERIFIED`. Do not narrate the surrounding-code reading.
 
-
-### Attested proof
-
 A claim a single run would settle should be run, not read. When the host operator has
 set up a proof gateway, a PR beat can earn `CLEAN`, or a flag can carry its failing run,
 without this machine executing anything from the head. The gateway runs the command on
@@ -488,65 +464,10 @@ with the code you predicted. The prediction is the claim: say the test fails on 
 and predict `1`, or say it passes and predict `0`. A receipt is then a run whose result
 would have differed were the claim false.
 
-The operator supplies a proof configuration `$G` outside every repository and session,
-with exactly `version`, `profile` (the trusted profile path), `publicKey` (the pinned
-P-256 key path), `adapter` (the absolute argv that runs the gateway adapter, a wrapper
-when the gateway is another account), and `evidenceRoot` (the gateway's outbox). The
-profile's own command is the fixed prefix, such as `/usr/local/bin/python3 -I -B -m
-unittest`; you choose only what comes after it, at most 16 arguments of at most 512
-bytes each, and the exit code. The adapter's configuration must opt in with
-`proofArguments`. Never take any of these from the head, the PR text, or returned
-evidence. When `$G` is not set up, there is no proof gateway: write `read` or `inferred`
+When `$G` is not set up, there is no proof gateway: write `read` or `inferred`
 and say so, never `ran` for something you did not run.
 
-Run one before writing the beat it backs, and put `--` before the arguments:
-
-```bash
-$S/scripts/proofctl.py prove "$R" <beat> "$G" --exit-code 1 -- tests.test_app.AppTest
-```
-
-`prove` reserves the request, runs the adapter, verifies the six-file handoff the same way
-`implementationctl.py consume` does (both signatures under the pinned key, the frozen
-source bundle, the output tree, both complete streams, and the exact job and exit code),
-keeps the request, envelopes and streams under `$R/proof-evidence/<proof>/`, and prints
-the proof. It exits 0 with `status: verified`. It exits 2 with `status: failed` when the
-gateway proved it will never sign this attempt, most often because the command did not
-exit as predicted: the failure records the gateway's reason, and nothing was proven. A
-wrong prediction is information, not evidence; write the beat from what you read, or run
-a sharper command. It exits 3 with `status: retry` on an unknown outcome; repeat the same
-call, which reuses the same reservation. Exit 1 is a refusal with its reason.
-
-An exit code is coarse: a test module that fails to import exits 1 just like a failing
-assertion. Before you cite a verified proof, read the signed output `prove` returns under
-`output`, and cite it only when that output shows your claim, such as the assertion you
-named. When it shows something else, the run proved nothing about the claim; say what it
-did show, or run a sharper command.
-
-Then write the beat with `proof_kind: "attested"` and `attested_proof: <proof>`. `PROOF`
-quotes the command and what it printed, in the budget like any other slot. The store
-refuses an attested beat whose proof is not verified, was run for another beat, or sits
-in a session without a frozen PR target, and refuses `attested_proof` beside any other
-proof kind. It then writes `attestation` itself from the verified row: the exact argv, the
-exit code, the receipt digest, the key and executor, and the last lines of each stream.
-Never write `attestation`; the page shows it beside the beat as what ran, so your `PROOF`
-line cannot pass for the run.
-
-Run only what a claim needs: one test module or case, a `-k` filter, a single check. A
-command that needs network, an install, or a second process fails in the sandbox; that is
-a limit of the evidence, not a finding about the change. The separate steps stay
-available when the adapter is driven by another supervisor:
-
-```bash
-$S/scripts/proofctl.py request "$R" <beat> "$P" --exit-code 1 -- tests.test_app
-$S/scripts/proofctl.py consume "$R" <proof> "$P" "$K" "$E"
-$S/scripts/proofctl.py fail "$R" <proof> --reason '<the gateway reason>'
-$S/scripts/proofctl.py proofs "$R"
-```
-
-`request` prints the exact gateway request; the adapter's `request.json` must be its
-canonical bytes. Use `fail` only for an adapter `status: failed`, as with implementation
-attempts. A proof does not change the session's `no_exec` policy, its audience, or any
-delivery, and it never authorizes an effect.
+Before running it, read `$S/references/attested-proof.md`.
 
 **Read the comments, then write what they do not say.** A well-commented diff hands you a
 `WHY` for every hunk, and rule 5 is the one you will break without noticing. The tell is a
@@ -749,7 +670,7 @@ when their words do not say.
 For a PR source, the page and store always refuse branch acceptance. Include in review,
 Include in report, Drop, notes, questions, navigation, and decision-only answers remain available
 because they do not execute the head. Direct PR execution is not supported. The only PR
-implementation path is the separately approved linked child described below; it never
+implementation path is the separately approved linked child described in `$S/references/linked-implementation.md`; it never
 changes the source audience or `no_exec` policy. Local branch and working-tree targets
 retain their existing execution behavior.
 
@@ -815,141 +736,7 @@ session. Do not call `land`, create a `lands[]` entry, or use `report.html` as a
 receipt. Acceptance freezes the agent-authored finding text and evidence. Refine them
 before presenting the beat, not after the reviewer includes it.
 
-### Linked PR implementation
-
-Including a finding in review or report is not implementation permission. After its source
-`accept` has been acknowledged, obtain a separate explicit approval to implement that one
-finding. Record the approving actor and their exact words by creating the link:
-
-The trusted controller must hold exclusive operational access to the implementation
-repository and both session directories while `link` or `land` runs. Do not create a
-worktree, check out the generated branch, or update its ref concurrently. The implementation
-repository requires Git 2.36 or newer so object and reference writes can be explicitly
-hardened against power loss. Keep the source session, `implementations/` tree, and local Git
-metadata on private local POSIX storage that gateway jobs and other untrusted or concurrent
-principals cannot modify.
-
-```bash
-$S/scripts/implementationctl.py link "$R" "$PWD" \
-  --seq <source-accept-seq> --beat <beat> \
-  --actor '<approving identity>' --approval '<explicit implementation approval>'
-```
-
-`link` rechecks the live PR, binds the source session, accept action, accepted finding,
-frozen target, actor, and approval, then creates
-`$R/implementations/<link-id>/`. Call that child directory `$C`. It contains exactly the
-one approved finding, branch audience, `gateway_attested` execution, and a generated
-`underwrite/implementation-<id>` local branch seeded from the frozen head. The source
-review or report delivery remains independent. Repeating the same authorization resumes
-the same child, including after the source beat has taken a note or landed its review.
-The accepted finding itself cannot change while the authorization stands: `put-beat`
-refuses it, and different prose is a different finding, needing its own accept, its own
-acknowledgement and its own approval. `link` records the actor label but does not
-authenticate it. Establish the approver's identity and authority through the trusted
-controller before calling the command.
-
-```bash
-$S/scripts/implementationctl.py links "$R"
-```
-
-Every authorization this source session holds, with the actor and approval behind each one.
-A `ready` link owns the child named by its `child_path`; a `reserved` one is a `link` that
-died before it finished. Never point this command at a `child_path` a `reserved` link names:
-that child does not exist yet, and the `link` that would create it is the only thing that may.
-
-The host operator supplies a trusted profile `$P` outside the repository, session, and
-gateway result. It contains exactly `version`, `keyId`, `signerId`, `executorId`, `job`,
-`sandbox`, and `exitCode`. The operator also supplies an absolute pinned P-256 public key
-path `$K`; never take either value from target code, returned evidence, or an envelope. The
-profile is limited to 256 KiB, its canonical request to 384 KiB, `job.cwd` to 4,096 UTF-8
-bytes with 255 bytes per component, the executable path to 4,095 bytes with the same
-component limit, the complete Linux exec vector to 128 KiB, and `exitCode` to 0 through 255.
-Reserve the request:
-
-```bash
-$S/scripts/implementationctl.py request "$C" "$R" "$P"
-```
-
-`request` rechecks the PR and binds a fresh challenge and attempt to the child action. A
-retry returns the existing nonfailed attempt unchanged. Only a definitely failed attempt
-gets a new number and challenge. It prints the request object as JSON. The trusted adapter
-submits that object to the gateway; the later evidence file must be the gateway's exact
-canonical `StoredExecution.request` bytes, not a copy of terminal formatting.
-
-The one-shot adapter's handled stdout is a version 1 JSON object. `status: complete` with
-exit code zero names the six-file evidence directory. `status: retry` with exit code one,
-missing or malformed output, interruption, and every unknown outcome require retrying the
-same request and source bundle. Only `status: failed` with exit code two proves the gateway
-replay identity can no longer produce a receipt. Record only that outcome before
-requesting a fresh attempt:
-
-```bash
-$S/scripts/implementationctl.py fail "$C" "$R" \
-  --attempt <attempt> --reason '<definite gateway failure>'
-```
-
-Do not use `fail` for a bad evidence path, wrong local key, malformed transport, or failed
-consumer verification. Those errors leave the same reserved attempt available for a
-corrected, byte-identical handoff.
-
-The supervised host adapter must return a real directory `$E` containing exactly these six
-entries and no others:
-
-```
-request.json
-capability.dsse.json
-receipt.dsse.json
-output.bundle
-stdout
-stderr
-```
-
-Each entry is an independently readable, single-link regular file. Consume it with the
-same trusted profile and the pinned public key:
-
-```bash
-$S/scripts/implementationctl.py consume "$C" "$R" "$P" "$K" "$E"
-```
-
-`consume` requires the request bytes to equal the reserved request, verifies the frozen
-source bundle and returned output bundle in fresh quarantines, hashes both complete
-streams, verifies both DSSE signatures under `$K`, requires its fingerprint to match
-`keyId`, and checks the exact signer, executor, target, action, job, sandbox, trees, bundle,
-streams, and exit code. It then copies the exact evidence into
-`$C/implementation-evidence/<attempt>/` and records its digests in the child database.
-Neither the gateway's own validation record nor a conforming envelope substitutes for
-these checks.
-After `consume` durably succeeds, tell the gateway-owner supervisor it may delete the
-handoff directory. The consumer account cannot delete it through the non-writable outbox.
-
-Land only an attempt reported as verified:
-
-```bash
-$S/scripts/implementationctl.py land "$C" "$R" "$PWD" \
-  --attempt <attempt> --message '<commit message>'
-```
-
-`land` materializes the verified output, creates a local SHA-1 commit whose only parent is
-the frozen PR head, and remeasures that commit against the signed synthetic SHA-256 output
-tree. It persists the exact commit plan before changing a ref, refuses a branch checked out
-in any worktree, rechecks the live PR, and compare-and-swap updates the generated branch
-only when it still names the frozen head. Git object, pack-metadata, and reference writes
-use explicit `fsync` durability. Landing permits at most 20,000 output entries and has one
-180-second deadline across verification, materialization, Git object creation, measurement,
-live PR checks, and the ref update. It does not check out the branch, alter the working tree,
-run hooks or filters, or push.
-
-All five commands are recoverable. An identical `consume` pins the same profile and public
-key, then compares all six incoming files with the persisted verified evidence. That exact
-replay remains valid after the original capability window closes. An identical `land`
-resumes its persisted commit plan and can finish the SQLite receipt if the ref already
-names that commit. A reserved attempt rejects a changed profile, verified evidence is
-immutable, and a prepared landing rejects a changed message, commit, branch, or ref
-position. Exit 2 from `link`, `request`, or the pre-update `land` check means the PR moved
-and requires a replacement source snapshot. If the PR moves only after the local
-compare-and-swap, `land` preserves the commit and receipt and returns
-`replacement_required: true`. Report that stale landing and stop. Never refresh either
-session in place or cause another effect.
+Before creating or driving a linked PR implementation, read `$S/references/linked-implementation.md`.
 
 When the flag itself is a decision whose words complete the work and do not need to reach
 the PR audience as a finding, set top-level `resolution_kind: "decision"` before presenting
@@ -981,6 +768,8 @@ a `FLAG` beat, advance only when the reviewer asks to move on; past a
 `CLEAN` or `UNVERIFIED` beat, advance on your own.
 
 ## Phase 4: finish
+
+If the audience is `review`, read `$S/references/finish-review.md` now, before rendering.
 
 Refresh `recommendation` against the evidence before rendering, then lead the terminal
 handoff with the same assessment and count of decisions owed as the page. Say what was not
@@ -1018,11 +807,7 @@ They are never shippable final states. A final render rejects them, as well as e
 accepted branch or review delivery with no landing. In report mode,
 accepted report beats require no `landed` value. Exit 2 means the page rendered but a beat
 failed validation and carries an `UNPROVEN` chip, or `--final` found an unresolved review
-intent, even with no findings and no chip. For an outstanding review intent, follow the
-Review mode guidance below. For a `prepared` or `submitting` intent, use `submit-review` to
-verify, supervised `orphan-review` for a stored review that cannot land, or `retire-review`
-before a supervised replacement when no review id is stored. For a `failed` or `retired`
-intent, prepare and preview a replacement, then get explicit approval before submitting it.
+intent, even with no findings and no chip.
 For an open beat that failed validation, read the authoritative object with `get-beat`,
 fix the complete object through `put-beat`, and re-render. Report
 acceptance validates and freezes the agent-authored finding, so an accepted report beat
@@ -1044,7 +829,7 @@ on an explicit yes, and publish that same `$R/report.html`.
 with no requested implementations leaves no branch at all, which is correct. This
 implementation path is only for local branch and working-tree targets. A PR in branch
 mode is a static audit and cannot have accepted commit deliveries. A linked
-`gateway_attested` child is the separate exception described above. Report its generated
+`gateway_attested` child is the separate exception described in `$S/references/linked-implementation.md`. Report its generated
 local branch and exact commit, but do not push or open a PR as part of that flow. Any later
 publication is a new operation with its own explicit authorization.
 
@@ -1054,137 +839,12 @@ or reconcile. Report mode does not create a GitHub effect and does not add a `la
 entry. `report.html` is a regenerable projection of the authoritative store, not a receipt
 and not a delivery target.
 
-**Review mode.** Write the review body to `$R/review-body.md` and per-beat comments to
-`$R/review-comments.json`, never inside the repo being reviewed. Use `sessionctl.py
-reconcile "$R"` to find the accepted beats still owed review delivery, including failed
-ones. The comments object must have exactly one entry per such beat, keyed by beat number:
-
-```json
-{
-  "1": {"path": "src/auth/session.go", "line": 88, "side": "RIGHT", "body": "..."}
-}
-```
-
-The verdict, approve versus request changes, is the reviewer's. Give your evidence-backed
-recommendation first, then ask for it. Use `COMMENT`, `APPROVE`, or `REQUEST_CHANGES` as
-chosen. A pull request author cannot approve their own PR, so use `COMMENT` for self-review.
-Prepare the store-owned intent:
-
-```bash
-$S/scripts/sessionctl.py prepare-review "$R" --event COMMENT \
-  --body-file "$R/review-body.md" --comments-file "$R/review-comments.json"
-```
-
-Preparation binds the covered beats and full frozen head to immutable payload bytes,
-validates anchors against the hash-verified diff, and adds the stable hidden delivery
-marker. It writes `$R/review.fixed.json` and returns the intent id, event, covered beats,
-anchor changes, and digest. Report snapped or folded anchors in one line. Show the preview:
-event, covered beats, and the complete `$R/review.fixed.json` payload. Get one explicit yes
-for that intent before submitting. If the reviewer changes it, prepare and preview again;
-`--replace` can replace only a never-posted prepared intent with no stored review id.
-With a stored id, use `submit-review` to verify or supervised `orphan-review`, not `--replace`.
-
-```bash
-$S/scripts/sessionctl.py submit-review "$R" --intent <intent-id>
-```
-
-`submit-review` refuses changed preview bytes, runs `check-pr --require-open`, and durably
-marks the intent submitting before the POST, storing the posting actor in the same transition.
-It verifies the frozen commit, marker, stored actor, event/state, the validated body including
-folded findings, and inline comment content including multiline ranges. Only CRLF line endings
-and trailing body whitespace are normalized. Reconciliation uses the stored actor even after
-an account switch; a different current actor cannot POST (exit 1, naming both logins).
-A verified receipt lands exactly the intent's beats and adds one shared `lands[]` entry, atomically. Beats
-accepted later stay pending and need a separate approved intent. Never POST or land review
-beats by hand.
-
-Transport failures, 408, 429, 5xx, and 422 are uncertain. The command reconciles every page of
-reviews: one verified match lands, more than one is a conflict. Exit 3 means a POST may exist;
-the intent stays submitting or keeps its stored review id, not failed.
-Repeat the same `submit-review` command to read again; it does not
-POST again without `--retry`. Allow for API visibility and repeat the read before seeking
-explicit approval for `--retry`; retry only after reconciliation finds no review. A retry
-rechecks the open target. A stored review id is verified without reposting, even with
-`--retry`. Never blindly post twice or infer a new audience from a 422.
-`DISMISSED` records a receipt without landing: stop for supervised handling and do not
-retry. Only an initial POST from a prepared intent can treat a definite other 4xx with no
-match as publication failure for every covered beat, preserving the accepted findings.
-A retry after an uncertain attempt stays submitting even on 4xx.
-An unknown outcome must never be marked failed.
-
-Exit 5 means could not check GitHub before posting: nothing posted, intent unchanged; rerun
-`submit-review`. This is a prepared intent's pre-POST read failure, with no stored review id.
-Exit 4 means the target moved before POST: this invocation did not post, intent unchanged.
-For a submitting intent, an earlier POST may still surface. Stop and use
-`sessionctl.py retire-review "$R" --intent <intent-id>` before a supervised replacement.
-Retirement accepts a prepared intent, or a submitting one only after two zero-match
-reconciliations under the submission lock, at least 30 seconds apart by default
-(`--reconcile-delay` configures seconds); it refuses any stored review id.
-A matching review lands with exit 0 and prints its receipt; follow the landing steps below.
-For a stored review that cannot land, use supervised `sessionctl.py orphan-review "$R"
---intent <intent-id> --reason <text>`: records URL and reason, leaves beats pending, blocks repost.
-
-After landing, persist the outcome, review URL, and `status` as one `patch-session` object.
-Recheck the target after posting:
-
-```bash
-$S/scripts/sessionctl.py check-pr "$R"
-```
-
-Exit 2 now means posted but stale: report that the PR moved during submission, preserve
-the durable receipt, and stop before any new effect. Do not retry the review. Then render
-with final delivery checks:
-
-```bash
-$S/scripts/render-report.py $R --final --standalone
-```
-
-If write-back was interrupted, repeat `submit-review` for the same intent to reconcile or
-replay its durable landing, not to create another review. Repair session metadata through
-`patch-session` and render again. Pending or failed deliveries and unresolved review
-intents, including ones with no findings, are not final. Follow the outstanding-review
-recovery guidance above. Once it passes, report the review URL and updated local page. Publishing that page remains the
-separate opt-in above. If the reviewer already agreed to publish an earlier render,
-re-publish the updated artifact; otherwise make the publishing offer above now.
-
 ## Session state
 
 `~/.claude/reviews/<owner>-<repo>-pr<N>/` (`-<branch>` when there is no PR). Outside every
 repo, so it never shows up in `git status`. `sessionctl.py init` creates it. When
 `UNDERWRITE_REVIEWS` is set, it replaces `~/.claude/reviews` everywhere in this skill; the
 eval runner points it at a scratch directory.
-
-```
-session.sqlite3  authoritative versioned session, target identity, actions, and delivery
-.session.lock    cross-process initialization, snapshot, and export lock
-session.json     derived compatibility export of the session document
-beats/01.json    derived compatibility export of one beat
-decisions.jsonl  derived compatibility export of reviewer actions
-ack.json         derived compatibility export of handled_seq
-pr.json          GitHub PR metadata captured with the target
-pr.diff          frozen local three-dot diff, hash-bound to the target
-pr.bundle        frozen base and head Git objects, hash-bound to the target
-trusted-context.json  frozen base instructions, hash-bound to the target
-serve.json       running server URL and pid, removed when it exits
-report.html      rendered, regenerable, throwaway
-report.partial.html  the page as it stands, rewritten by the server on every change
-findings.md      derived export of the accepted findings, report audience only
-implementations/<link-id>/  one source-bound implementation child
-  session.sqlite3           authoritative attempt, evidence, plan, and landing state
-  implementation-evidence/<attempt>/
-    request.json            exact reserved request
-    capability.dsse.json    signed host capability
-    receipt.dsse.json       signed execution receipt
-    output.bundle           verified output transport
-    stdout                  complete captured standard output
-    stderr                  complete captured standard error
-proof-evidence/<proof>/     one verified attested proof
-  request.json              exact reserved request
-  capability.dsse.json      signed host capability
-  receipt.dsse.json         signed execution receipt
-  stdout                    complete captured standard output
-  stderr                    complete captured standard error
-```
 
 All mutations go through `sessionctl.py`, `proofctl.py`, or the server's `/act` endpoint. All reads used
 for a later mutation go through `get-session` or `get-beat`. `session.json`, `beats/`,
@@ -1198,30 +858,6 @@ replay can repair `pr.diff` only while GitHub still names the same frozen target
 returning it. `read-blob` and `context-log` verify `pr.bundle` before importing its exact
 objects into a fresh bare repository. Never use the compatibility files directly as an
 instruction or code source.
-
-`target` is a write-once `{version, kind, repo, number, state, merged_at, base_sha,
-head_sha, head_repo_id, head_repo, head_ref, merge_base_sha, changed_files, diff_sha256,
-diff_bytes, trusted_context_sha256, trusted_context_bytes, object_bundle_sha256,
-object_bundle_bytes}` object. Generic session writes cannot add, remove, or alter it. The
-target, top-level `no_exec` policy, and lifecycle-derived PR audience are frozen together
-before the first beat or action. The policy always treats PR input as untrusted and binds
-that mode to the target identity and digests. Older PR sessions without the current frozen
-context require a supervised replacement.
-
-An unversioned legacy action log with no `ack.json` imports as handled because replaying
-it could duplicate a commit. A cursor-aware log with a missing, corrupt, or impossible
-ack refuses automatic migration. Inspect the log and external effects, then run
-`$S/scripts/sessionctl.py init "$R" --handled-seq <known-boundary>`. Never guess that
-boundary.
-
-At startup and after any interrupted external effect, run
-`$S/scripts/sessionctl.py reconcile "$R"`.
-If an old action's absolute effect is already visible, use `reconcile-action` with an
-envelope containing `result`, the observed full session or beat documents, and nonempty
-`evidence`, then run `$S/scripts/sessionctl.py reconcile-action "$R" <seq> recovery.json`.
-If an action cannot be recovered, run `$S/scripts/sessionctl.py abandon-head "$R" <seq>
---actor <name> --reason '<why>'`. It only accepts the exact head and never skips an action
-silently.
 
 `state` is one of `clean`, `flag`, `unverified`, `accepted`, `dropped`, `decided`. The
 first three are what a beat opens with; the last three are what a flag becomes after the
@@ -1238,23 +874,7 @@ the six keys from rule 2, spelled lower case: `what`, `why`, `proof`, `risk`, `p
 a verified proof run for that beat, and the store owns `attestation`. A beat stored before the field existed keeps the verdict it landed with.
 `lands[]` entries are `{state: landed|ready|open, what, where}`.
 
-`over_drop` is optional text of at most 25 words on a flag whose line carries an earlier
-round's drop; the store refuses it anywhere else.
-
-`second_read` holds exactly `verdict` and `evidence`. `confirmed` and `unread` sit only on a
-flag or what a flag became; `disputed` sits only on an `unverified` beat, the demoted flag.
-The evidence is at most 25 words. Beats from before the field carry none.
-
-`recommendation` is nonempty session text. A flag's `decision` is an object with exactly
-two nonempty text fields, `question` and `recommendation`. These describe existing choices,
-not new actions. Write both for every new review; older sessions without them stay readable
-and visibly say the recommendation was not recorded. An accepted report freezes its
-decision wording with the finding.
-
-Question history is a read-only projection of ordered action receipts, separate from
-`call` and finding text. Each entry has `seq`, `question`, `state`, `answer`, and
-`evidence`; unanswered entries have no answer or evidence. Never write a beat's
-`questions` by hand. Older sessions without question actions show no question history.
+`recommendation` is nonempty session text.
 
 `landed` names what an accepted beat became: a commit SHA in `branch` mode, the review URL
 in `review` mode, with `branch` beside it when there is one. A frozen PR records the full
@@ -1265,26 +885,16 @@ mode is different: acceptance itself is the terminal durable outcome, with deliv
 `none`, no `landed` value, and no `lands[]` entry. A `decided` beat never carries one; its
 `call` is what it became.
 
-`$S/scripts/sessionctl.py stats ~/.claude/reviews` counts what every stored session raised
-and how the reviewer answered it, reading each one from a backup copy. Run it before and
-after a change to this skill: a change that raises the dropped share is a regression even
-when it finds more.
-
-A replacement lives at `$P-r<k>/` beside the session it replaces, and its write-once
-`predecessor` holds `{session, round, base_sha, head_sha, moved, carried}`: `moved` maps
-each path to the head lines that changed since `head_sha`, and `carried` lists every
-flag from earlier rounds with its round, state, call, reason, and the words on its line.
-A later round's call on the same line replaces an earlier one, except that a flag raised
-`over_drop` leaves the drop it overrode in place. An open or undelivered finding is never
-dropped from `carried`; once its line no longer reads the same it gains `line_changed`, the
-round whose head changed it, and the page says so without claiming anyone looked again. Only `link-predecessor` writes it.
-
-Sessions accumulate into a review history, and `history` is how a later session reads it:
-for every other session on the same repository, its facts, its recommendation, and the
-findings it left on the paths this one touches. Where the filesystem records when a store
-was created, only earlier sessions appear, marked `order: earlier`; elsewhere every other
-session appears marked `order: unknown`, so weigh it as context, not as the record. Sessions
-it cannot read are listed as unreadable, never skipped silently.
+At startup and after any interrupted external effect, run
+`$S/scripts/sessionctl.py reconcile "$R"`.
+If an old action's absolute effect is already visible, use `reconcile-action` with an
+envelope containing `result`, the observed full session or beat documents, and nonempty
+`evidence`, then run `$S/scripts/sessionctl.py reconcile-action "$R" <seq> recovery.json`.
+If an action cannot be recovered, run `$S/scripts/sessionctl.py abandon-head "$R" <seq>
+--actor <name> --reason '<why>'`. It only accepts the exact head and never skips an action
+silently.
+Before migrating a legacy log, reading question history, using `stats`, inspecting the on-disk tree, or changing this skill, read `$S/references/session-state.md`.
+If reconcile or the session shows an outstanding review intent, read `$S/references/finish-review.md` before any recovery.
 
 ## Formatting
 
